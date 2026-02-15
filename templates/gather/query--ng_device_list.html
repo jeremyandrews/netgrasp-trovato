@@ -1,0 +1,65 @@
+<div class="ng-device-list">
+    <h1>{{ query.label }}</h1>
+
+    {% if query.description %}
+    <p class="gather-query__description">{{ query.description }}</p>
+    {% endif %}
+
+    {% if rows | length == 0 %}
+    <p class="empty">No devices found.</p>
+    {% else %}
+    <table class="table ng-device-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>MAC</th>
+                <th>State</th>
+                <th>Type</th>
+                <th>Last IP</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr data-id="{{ row.id }}">
+                {% if row.fields is defined and row.fields is object %}
+                    <td>
+                        <a href="/item/{{ row.id }}">
+                            {{ row.fields.display_name | default(value=row.title) }}
+                        </a>
+                    </td>
+                    <td class="ng-mac">{{ row.fields.mac | default(value="-") }}</td>
+                    <td class="ng-state ng-state--{{ row.fields.state | default(value='unknown') }}">
+                        {{ row.fields.state | default(value="unknown") }}
+                    </td>
+                    <td>{{ row.fields.device_type | default(value="-") }}</td>
+                    <td class="ng-ip">{{ row.fields.last_ip | default(value="-") }}</td>
+                {% else %}
+                    <td><a href="/item/{{ row.id }}">{{ row.title }}</a></td>
+                    <td>-</td>
+                    <td>-</td>
+                    <td>-</td>
+                    <td>-</td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    {% if pager %}
+    {% include "gather/pager.html" %}
+    {% endif %}
+</div>
+
+<style>
+    .ng-device-table { width: 100%; border-collapse: collapse; }
+    .ng-device-table th,
+    .ng-device-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+    .ng-device-table th { background: #f5f5f5; font-weight: 600; }
+    .ng-mac { font-family: monospace; }
+    .ng-ip { font-family: monospace; }
+    .ng-state { font-weight: 500; }
+    .ng-state--online { color: #16a34a; }
+    .ng-state--offline { color: #9ca3af; }
+    .ng-state--unknown { color: #d97706; }
+</style>

@@ -1,0 +1,52 @@
+<div class="ng-event-log">
+    <h1>{{ query.label }}</h1>
+
+    {% if query.description %}
+    <p class="gather-query__description">{{ query.description }}</p>
+    {% endif %}
+
+    {% if rows | length == 0 %}
+    <p class="empty">No events recorded.</p>
+    {% else %}
+    <table class="table ng-event-table">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Device</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr data-id="{{ row.id }}">
+                {% if row.fields is defined and row.fields is object %}
+                    <td class="ng-timestamp">{{ row.fields.timestamp | default(value="-") }}</td>
+                    <td class="ng-event-type">{{ row.fields.event_type | default(value="-") }}</td>
+                    <td>{{ row.fields.device_id | default(value="-") }}</td>
+                    <td>{{ row.fields.details | default(value="") }}</td>
+                {% else %}
+                    <td>-</td>
+                    <td>-</td>
+                    <td>-</td>
+                    <td>-</td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    {% if pager %}
+    {% include "gather/pager.html" %}
+    {% endif %}
+</div>
+
+<style>
+    .ng-event-table { width: 100%; border-collapse: collapse; }
+    .ng-event-table th,
+    .ng-event-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+    .ng-event-table th { background: #f5f5f5; font-weight: 600; }
+    .ng-timestamp { font-family: monospace; white-space: nowrap; }
+    .ng-event-type { font-weight: 500; }
+</style>
