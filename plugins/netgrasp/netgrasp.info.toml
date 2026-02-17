@@ -1,0 +1,23 @@
+name = "netgrasp"
+description = "Network monitoring: devices, events, presence tracking"
+version = "1.0.0"
+dependencies = []
+
+[taps]
+implements = [
+    "tap_item_info",
+    "tap_menu",
+    "tap_perm",
+]
+weight = 0
+
+# Migrations are forward-only (no rollback). Each file runs once, tracked in the
+# plugin_migration table. Kernel tables (item, gather_query, url_alias, roles,
+# role_permissions) are guaranteed to exist before plugin migrations run.
+[migrations]
+files = [
+    "migrations/001_gather_queries.sql",
+    "migrations/002_roles.sql",
+    "migrations/003_url_aliases.sql",
+    "migrations/004_cleanup_stale_permissions.sql",
+]
