@@ -1,6 +1,7 @@
 name = "netgrasp"
 description = "Network monitoring: devices, events, presence tracking"
 version = "1.0.0"
+default_enabled = false
 dependencies = []
 
 [taps]
