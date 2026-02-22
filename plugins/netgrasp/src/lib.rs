@@ -27,6 +27,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_device".into(),
             label: "Device".into(),
             description: "Network device tracked by Netgrasp".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("mac", FieldType::Text { max_length: None })
                     .required()
@@ -57,6 +58,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_person".into(),
             label: "Person".into(),
             description: "Person associated with network devices".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("name", FieldType::Text { max_length: None })
                     .required()
@@ -70,6 +72,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_event".into(),
             label: "Event".into(),
             description: "Network event (device seen, new device, etc.)".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("device_id", FieldType::RecordReference("ng_device".into()))
                     .required()
@@ -87,6 +90,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_presence".into(),
             label: "Presence Session".into(),
             description: "Device presence session (online period)".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("device_id", FieldType::RecordReference("ng_device".into()))
                     .required()
@@ -101,6 +105,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_ip_history".into(),
             label: "IP History".into(),
             description: "Historical IP address assignments for devices".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("device_id", FieldType::RecordReference("ng_device".into()))
                     .required()
@@ -118,6 +123,7 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
             machine_name: "ng_location".into(),
             label: "Location History".into(),
             description: "Device location history".into(),
+            title_label: None,
             fields: vec![
                 FieldDefinition::new("device_id", FieldType::RecordReference("ng_device".into()))
                     .required()
