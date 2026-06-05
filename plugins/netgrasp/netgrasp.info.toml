@@ -23,3 +23,10 @@ files = [
     "migrations/003_url_aliases.sql",
     "migrations/004_cleanup_stale_permissions.sql",
 ]
+
+# Declared plugin capabilities (WASM-1, deny-unless-declared). The kernel
+# builds this plugin's WASM linker from host_interfaces — it receives exactly
+# the host interfaces named here (plus baseline WASI). Derived from the
+# compiled .wasm import section.
+[capabilities]
+host_interfaces = []
