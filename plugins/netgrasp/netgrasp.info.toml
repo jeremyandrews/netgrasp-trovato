@@ -1,32 +1,180 @@
 name = "netgrasp"
-description = "Network monitoring: devices, events, presence tracking"
+description = "Network monitoring: devices, people, events and presence from the netgrasp daemon"
 version = "1.0.0"
 api_version = "1.0"
 default_enabled = false
 dependencies = []
 
 [taps]
+# tap_item_info declares the two Item types: ng_device (a device's user-owned
+# overlay) and ng_person. The daemon-owned device state, the event log and the
+# presence/location/IP timelines are record types, not Items — DESIGN.md
+# Decisions 1 and 2.
+#
+# tap_cron is the daemon→kernel direction: it creates a device Item for each
+# dirty ng_devices row, refreshes derived titles, prunes expired events, and
+# clears sync_state.
+#
+# tap_item_update is the kernel→daemon direction: an admin's edit of a device
+# Item writes the user-owned columns of ng_devices, and nothing else. It also
+# mirrors an ng_person Item into ng_people for the daemon to read.
+# tap_item_insert covers a person created rather than edited; tap_item_delete
+# retires the mirror row and unlinks the device row.
+#
+# tap_item_view renders the device page: presence, location and address
+# timelines over the daemon's tables. There is no other surface for it — a
+# plugin cannot serve a request and cannot ship a template (G-NO-PLUGIN-HTTP).
+#
+# tap_item_presave coerces an admin's edit; it cannot refuse one
+# (G-NO-PRESAVE-VETO).
+#
+# Note what is absent: tap_queue_worker and tap_queue_info. Netgrasp's work is a
+# bounded sweep on a fixed cadence, not a per-item pipeline, so a queue would add
+# a hop and a retry policy to something that is already idempotent and retried by
+# the next cron tick.
 implements = [
     "tap_item_info",
-    "tap_menu",
+    "tap_item_view",
+    "tap_item_presave",
+    "tap_item_insert",
+    "tap_item_update",
+    "tap_item_delete",
     "tap_perm",
+    "tap_menu",
+    "tap_cron",
 ]
 weight = 0
 
 # Migrations are forward-only (no rollback). Each file runs once, tracked in the
 # plugin_migration table. Kernel tables (item, gather_query, url_alias, roles,
-# role_permissions) are guaranteed to exist before plugin migrations run.
+# role_permissions, tile) are guaranteed to exist before plugin migrations run.
 [migrations]
 files = [
-    "migrations/001_gather_queries.sql",
-    "migrations/002_roles.sql",
-    "migrations/003_url_aliases.sql",
-    "migrations/004_cleanup_stale_permissions.sql",
+    "migrations/001_netgrasp_schema.sql",
+    "migrations/002_netgrasp_gathers.sql",
+    "migrations/003_netgrasp_roles_tiles.sql",
 ]
 
-# Declared plugin capabilities (WASM-1, deny-unless-declared). The kernel
-# builds this plugin's WASM linker from host_interfaces — it receives exactly
-# the host interfaces named here (plus baseline WASI). Derived from the
-# compiled .wasm import section.
+# Declared plugin capabilities (WASM-1, deny-unless-declared).
+#   db        — execute_raw / query_raw against the ng_* tables (raw_sql).
+#   item-api  — save-item / get-item for the device and person Items. The SDK
+#               ships no binding for this interface; netgrasp declares the
+#               externs itself in item_host.rs (G-SDK-NO-ITEM, inherited).
+#   logging   — structured logging from the taps.
+#   variables — the event retention window, read from site config.
+#
+# No http, no ai-api, no queue, no user-api: Netgrasp reaches nothing outside the
+# database and does no AI work. The daemon does the network I/O.
 [capabilities]
-host_interfaces = []
+host_interfaces = [
+    "db",
+    "item-api",
+    "logging",
+    "variables",
+]
+raw_sql = true
+
+# The daemon owns these tables at runtime; 001_netgrasp_schema.sql creates them
+# idempotently so the plugin is installable without a daemon. They are named here
+# as well so the effective allowlist does not depend on how the kernel parses
+# CREATE statements. DESIGN.md Decision 8.
+db_tables = [
+    "ng_devices",
+    "ng_people",
+    "ng_events",
+    "ng_presence",
+    "ng_location_history",
+    "ng_ip_history",
+    "ng_state",
+]
+
+# Lightweight record types (P11g / D-53).
+#
+# `ng_device_state` is deliberately not called `ng_device`: a record type name
+# shares the gather `item_type` slot with content types and is rejected if it
+# collides with one (RecordTypeRegistry::admit). A device is two tiers, so it
+# needs two names.
+[[record_types]]
+name = "ng_device_state"
+table = "ng_devices"
+title_column = "mac"
+
+[record_types.fields]
+mac = "mac"
+hostname = "hostname"
+vendor = "vendor"
+device_type = "device_type"
+os_family = "os_family"
+state = "state"
+last_ip = "last_ip"
+current_location = "current_location"
+first_seen = "first_seen"
+last_seen = "last_seen"
+display_name = "display_name"
+owner_id = "owner_item_id"
+hidden = "hidden"
+notify = "notify"
+item_id = "trovato_item_id"
+
+# The event log. High-volume, never edited, deleted wholesale on a retention
+# timer — the case the record tier exists for (DESIGN.md Decision 2).
+[[record_types]]
+name = "ng_event"
+table = "ng_events"
+title_column = "event_type"
+
+[record_types.fields]
+device_id = "device_id"
+event_type = "event_type"
+timestamp = "timestamp"
+details = "details"
+
+# The device's history. Rendered onto the device page by tap_item_view; declared
+# here so an operator can inspect the raw spans in the read-only record admin
+# without a SQL client.
+[[record_types]]
+name = "ng_presence"
+table = "ng_presence"
+title_column = "device_id"
+
+[record_types.fields]
+device_id = "device_id"
+start_time = "start_time"
+end_time = "end_time"
+
+[[record_types]]
+name = "ng_location"
+table = "ng_location_history"
+title_column = "location"
+
+[record_types.fields]
+device_id = "device_id"
+location = "location"
+start_time = "start_time"
+end_time = "end_time"
+
+[[record_types]]
+name = "ng_ip_history"
+table = "ng_ip_history"
+title_column = "ip_address"
+
+[record_types.fields]
+device_id = "device_id"
+ip_address = "ip_address"
+first_seen = "first_seen"
+last_seen = "last_seen"
+
+# People are Items, and ng_people is their derived mirror for the daemon. It is
+# declared read-only so an operator can confirm the mirror is in step with the
+# Items without a SQL client.
+[[record_types]]
+name = "ng_person_mirror"
+table = "ng_people"
+title_column = "name"
+
+[record_types.fields]
+item_id = "item_id"
+name = "name"
+notes = "notes"
+notify_arrive = "notify_arrive"
+notify_depart = "notify_depart"

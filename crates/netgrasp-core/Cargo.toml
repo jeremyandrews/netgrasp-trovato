@@ -1,0 +1,19 @@
+[package]
+name = "netgrasp-core"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Host-agnostic sync, write-back and timeline core for the Netgrasp plugin"
+
+[lints]
+workspace = true
+
+[lib]
+# Plain rlib: this crate is host-agnostic pure logic. It is pulled into the
+# `plugins/netgrasp` cdylib (compiled to wasm32-wasip1) AND compiled natively for
+# its own unit tests, so every dependency must be wasm-safe (no net/fs/clock).
+crate-type = ["lib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

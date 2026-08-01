@@ -13,5 +13,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 trovato-sdk = { path = "../../crates/plugin-sdk" }
+netgrasp-core = { path = "../../crates/netgrasp-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
