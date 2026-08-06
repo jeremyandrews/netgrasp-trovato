@@ -28,16 +28,39 @@
 
 /// Columns of `ng_devices` the daemon writes and nothing else may.
 ///
+/// This is the daemon's landed schema as of its milestone 3, not the subset the
+/// plugin happens to read: a column the plugin has never heard of is still a
+/// column the write-back must be unable to name, and the list is what makes that
+/// checkable.
+///
+/// Three of these are unwritable by **anyone**. `first_seen_at_epoch`,
+/// `last_seen_at_epoch` and the timeline tables' twins are
+/// `GENERATED ALWAYS … STORED`, so Postgres refuses a write to them whoever
+/// sends it. They are listed here anyway, because "the daemon owns it" is the
+/// reason a reader may treat them as authoritative and the reason no writer
+/// should try.
+///
 /// Sorted, so the disjointness test and any diff of this list read cleanly.
 pub const DAEMON_OWNED: &[&str] = &[
+    "baseline",
+    "current_ap",
     "current_location",
     "device_type",
-    "first_seen",
+    "device_type_confidence",
+    "first_seen_at",
+    "first_seen_at_epoch",
     "hostname",
+    "identity_confidence",
+    "identity_source",
+    "last_interface",
     "last_ip",
-    "last_seen",
+    "last_ipv6",
+    "last_seen_at",
+    "last_seen_at_epoch",
     "mac",
+    "mdns_name",
     "os_family",
+    "resolved_name",
     "state",
     "sync_state",
     "vendor",
@@ -48,10 +71,25 @@ pub const DAEMON_OWNED: &[&str] = &[
 /// `display_name` carries the Item's **title**, not a field: the title is what
 /// an admin actually edits on the content form, and duplicating it into a field
 /// would give one value two editable homes.
+///
+/// `owner_item_id` is a `UUID` — it holds an `ng_person` **Item** id, and the
+/// kernel's `item.id` is a uuid. It is the one column in this set that is not
+/// text or boolean, and [`crate::writeback::build_update`] casts its placeholder
+/// `::uuid` for exactly that reason. Device ids, by contrast, are `bigint`;
+/// nothing in this set is one.
 pub const USER_OWNED: &[&str] = &["display_name", "hidden", "notes", "notify", "owner_item_id"];
 
 /// Columns this plugin owns: the link from a device row to its Item.
+///
+/// `UUID`, for the same reason `owner_item_id` is.
 pub const LINK_OWNED: &[&str] = &["trovato_item_id"];
+
+/// Columns of `ng_devices` that hold a kernel Item id and are therefore `UUID`.
+///
+/// Named as a set because getting one of them wrong is a cast error two layers
+/// from where it was written: every statement binding one casts `::uuid`, and
+/// every statement binding a device id casts `::bigint`.
+pub const UUID_TYPED: &[&str] = &["owner_item_id", "trovato_item_id"];
 
 /// Whether `column` is one an admin edit is allowed to write.
 #[must_use]
@@ -139,7 +177,56 @@ mod tests {
         assert!(is_user_owned("owner_item_id"));
         assert!(!is_user_owned("mac"));
         assert!(!is_user_owned("trovato_item_id"));
-        assert!(is_daemon_owned("last_seen"));
+        assert!(is_daemon_owned("last_seen_at"));
         assert!(!is_daemon_owned("notes"));
+    }
+
+    /// The columns the plugin was written against before it was reconciled with
+    /// the daemon's landed schema. Naming one here would put a column that does
+    /// not exist into a list whose whole job is to be exhaustive.
+    #[test]
+    fn no_set_names_a_column_the_daemon_dropped_or_never_had() {
+        for absent in [
+            "first_seen",
+            "last_seen",
+            "start_time",
+            "end_time",
+            "ip_address",
+        ] {
+            for (name, cols) in [
+                ("daemon", DAEMON_OWNED),
+                ("user", USER_OWNED),
+                ("link", LINK_OWNED),
+            ] {
+                assert!(
+                    !cols.contains(&absent),
+                    "{name} set names '{absent}', which is not a column of ng_devices"
+                );
+            }
+        }
+    }
+
+    /// The generated twins are the daemon's, so the write-back cannot name one.
+    /// Postgres would refuse the write anyway; this is the layer that says why.
+    #[test]
+    fn the_generated_epoch_twins_are_daemon_owned() {
+        for twin in ["first_seen_at_epoch", "last_seen_at_epoch"] {
+            assert!(is_daemon_owned(twin), "{twin} is not in the daemon's set");
+            assert!(!is_user_owned(twin));
+        }
+    }
+
+    /// A device id is a `bigint` and every Item link is a `uuid`. Confusing the
+    /// two is a cast error at runtime and nothing at compile time.
+    #[test]
+    fn the_uuid_typed_columns_are_exactly_the_item_links() {
+        assert_eq!(UUID_TYPED, ["owner_item_id", "trovato_item_id"]);
+        for column in UUID_TYPED {
+            assert!(
+                is_user_owned(column) || LINK_OWNED.contains(column),
+                "{column} is uuid-typed but owned by nobody"
+            );
+        }
+        assert!(!UUID_TYPED.contains(&"id"), "a device id is a bigint");
     }
 }

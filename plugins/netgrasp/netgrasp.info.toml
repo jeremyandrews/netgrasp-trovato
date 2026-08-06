@@ -94,22 +94,45 @@ db_tables = [
 # shares the gather `item_type` slot with content types and is rejected if it
 # collides with one (RecordTypeRegistry::admit). A device is two tiers, so it
 # needs two names.
+#
+# Every field below names a real column of the daemon's schema, and every field
+# that renders a time names the generated `<column>_epoch` twin rather than the
+# `timestamptz` it is derived from. The two paths that read these columns
+# disagree about timestamps and neither produces the integer a record list wants:
+# the structured `db` host decodes a fixed type list and falls through to a
+# string decode, which a `timestamptz` fails, so it arrives as null; the gather
+# path wraps the query in Postgres' `row_to_json`, so it arrives as an ISO 8601
+# string. The epoch twin is the same integer on both.
+#
+# `id_column`, `created_column` and `changed_column` are declared on every record
+# type below rather than defaulted. Their defaults are `id`, `created` and
+# `changed`, and no daemon table has a `created` or a `changed`: the record
+# admin's listing is `ORDER BY {changed_column}`
+# (crates/kernel/src/routes/admin_record_type.rs), so a defaulted declaration is
+# not a cosmetic wrong label but a 500 on every record list.
 [[record_types]]
 name = "ng_device_state"
 table = "ng_devices"
+id_column = "id"
 title_column = "mac"
+created_column = "first_seen_at_epoch"
+changed_column = "last_seen_at_epoch"
 
 [record_types.fields]
 mac = "mac"
+resolved_name = "resolved_name"
 hostname = "hostname"
+mdns_name = "mdns_name"
 vendor = "vendor"
 device_type = "device_type"
 os_family = "os_family"
 state = "state"
 last_ip = "last_ip"
+last_ipv6 = "last_ipv6"
+current_ap = "current_ap"
 current_location = "current_location"
-first_seen = "first_seen"
-last_seen = "last_seen"
+first_seen = "first_seen_at_epoch"
+last_seen = "last_seen_at_epoch"
 display_name = "display_name"
 owner_id = "owner_item_id"
 hidden = "hidden"
@@ -121,56 +144,95 @@ item_id = "trovato_item_id"
 [[record_types]]
 name = "ng_event"
 table = "ng_events"
+id_column = "id"
 title_column = "event_type"
+created_column = "timestamp_epoch"
+changed_column = "timestamp_epoch"
 
 [record_types.fields]
 device_id = "device_id"
 event_type = "event_type"
-timestamp = "timestamp"
+timestamp = "timestamp_epoch"
 details = "details"
+notified = "notified"
 
 # The device's history. Rendered onto the device page by tap_item_view; declared
 # here so an operator can inspect the raw spans in the read-only record admin
 # without a SQL client.
+#
+# `is_summary` is exposed on the two timelines that have it, because a record
+# list that mixed compacted days with observed sessions without saying which is
+# which would be actively misleading. The device page excludes summary rows
+# outright.
 [[record_types]]
 name = "ng_presence"
 table = "ng_presence"
-title_column = "device_id"
+id_column = "id"
+title_column = "ip"
+created_column = "started_at_epoch"
+changed_column = "started_at_epoch"
 
 [record_types.fields]
 device_id = "device_id"
-start_time = "start_time"
-end_time = "end_time"
+interface = "interface"
+ip = "ip"
+start_time = "started_at_epoch"
+end_time = "ended_at_epoch"
+is_summary = "is_summary"
+observation_count = "observation_count"
 
 [[record_types]]
 name = "ng_location"
 table = "ng_location_history"
+id_column = "id"
 title_column = "location"
+created_column = "started_at_epoch"
+changed_column = "started_at_epoch"
 
 [record_types.fields]
 device_id = "device_id"
+ap_name = "ap_name"
 location = "location"
-start_time = "start_time"
-end_time = "end_time"
+start_time = "started_at_epoch"
+end_time = "ended_at_epoch"
+is_summary = "is_summary"
 
 [[record_types]]
 name = "ng_ip_history"
 table = "ng_ip_history"
-title_column = "ip_address"
+id_column = "id"
+title_column = "ip"
+created_column = "first_seen_epoch"
+changed_column = "last_seen_epoch"
 
 [record_types.fields]
 device_id = "device_id"
-ip_address = "ip_address"
-first_seen = "first_seen"
-last_seen = "last_seen"
+ip = "ip"
+interface = "interface"
+first_seen = "first_seen_epoch"
+last_seen = "last_seen_epoch"
 
 # People are Items, and ng_people is their derived mirror for the daemon. It is
 # declared read-only so an operator can confirm the mirror is in step with the
 # Items without a SQL client.
+#
+# The primary key is item_id, not id. ng_people is the one daemon table with no
+# timestamp the plugin can read — its last_arrived_at / last_departed_at are
+# timestamptz with no epoch twin — so created and changed both name
+# last_arrived_at. That is honest for `changed` (an arrival is the only thing
+# that changes a mirror row daemon-side) and approximate for `created`, and the
+# only consumer of either is the admin listing's ORDER BY.
+#
+# state, current_location and the two arrival timestamps are daemon-written and
+# are not in the field map: a gather over them would render the timestamps as an
+# ISO string through row_to_json, which is not what any other field here does.
 [[record_types]]
 name = "ng_person_mirror"
 table = "ng_people"
+id_column = "item_id"
 title_column = "name"
+created_column = "last_arrived_at"
+changed_column = "last_arrived_at"
 
 [record_types.fields]
 item_id = "item_id"
@@ -178,3 +240,5 @@ name = "name"
 notes = "notes"
 notify_arrive = "notify_arrive"
 notify_depart = "notify_depart"
+state = "state"
+current_location = "current_location"

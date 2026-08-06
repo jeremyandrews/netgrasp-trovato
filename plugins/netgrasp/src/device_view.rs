@@ -124,7 +124,7 @@ pub fn render(
         "No addresses recorded.",
         true,
     );
-    render_events_link(&mut out, &state.id);
+    render_events_link(&mut out, state.id);
     out.push_str("</section>");
     out
 }
@@ -277,13 +277,15 @@ fn render_span_row(out: &mut String, r: &TimelineRow, labelled: bool, now: i64) 
 
 /// The link to this device's event log.
 ///
-/// The href is built from the device row's uuid, which the plugin read out of
-/// its own table — but it is escaped anyway. A value being trusted at the moment
-/// it is written is not a reason to render it unescaped: the next person to
-/// change where `state.id` comes from should not have to notice this line.
-fn render_events_link(out: &mut String, device_id: &str) {
+/// The href is built from the device row's id, which is an `i64` — a type with
+/// no character in it that HTML or JSON could care about, so this is the one
+/// interpolation in the module that does not go through [`escape`]. It is not
+/// escaped because it *cannot* carry a hostile character, not because it is
+/// trusted; the day `state.id` becomes a string again, that reasoning stops
+/// holding and the compiler says so.
+fn render_events_link(out: &mut String, device_id: i64) {
     out.push_str("<p class='ng-device__events'><a href='/events/device?device=");
-    out.push_str(&escape(device_id));
+    out.push_str(&device_id.to_string());
     out.push_str("'>Event history for this device</a></p>");
 }
 
@@ -299,11 +301,11 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_000_000;
-    const DEVICE_ID: &str = "44444444-4444-4444-8444-444444444444";
+    const DEVICE_ID: i64 = 4_444;
 
     fn state() -> DeviceState {
         DeviceState {
-            id: DEVICE_ID.to_string(),
+            id: DEVICE_ID,
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             hostname: Some("jeremys-phone".to_string()),
             vendor: Some("Apple".to_string()),

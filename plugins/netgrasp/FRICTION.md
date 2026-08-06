@@ -17,6 +17,14 @@ Verified at `KERNEL_API_VERSION (1,0)` (`crates/kernel/src/plugin/mod.rs:51`)
 with **no kernel, WIT, SDK or kernel-migration change** in the build session. The
 design decisions these findings forced are argued in `DESIGN.md`.
 
+The last three findings (`G-DB-HOST-TYPE-COVERAGE`, `G-RECORD-ID-MUST-BE-UUID`,
+`G-RECORD-STRUCTURAL-COLUMNS-UNVALIDATED`) were added by a later pass that
+pointed the plugin at the daemon's **landed** schema for the first time, rather
+than at the design record it had been built from. They are the findings a second
+writer only meets once it has actually met the other writer, and the first of
+them is load-bearing: it is why every timestamp in this plugin is read from a
+generated companion column rather than from the column it belongs to.
+
 Three findings are load-bearing rather than cosmetic. **G-SAVE-ITEM-BYPASSES-SERVICE**
 is why plugin-written Items are never embedded and, by accident, why this
 plugin's sync loop cannot start. **G-EMBED-OPTOUT-IS-NOT-AN-OPTOUT** is why the
@@ -254,6 +262,130 @@ pins the kernel behaviour.
 Recorded again only to note that the mitigation is now being copied between
 plugins, which is how a workaround becomes a convention.
 
+### G-DB-HOST-TYPE-COVERAGE — **[High, NEW]** the `db` host decodes nine Postgres types and silently nulls everything else, and the gather path disagrees with it
+
+Added after pointing the plugin at the daemon's landed schema for the first time.
+The plugin had been built from the design record rather than from the daemon's
+migrations, and reconciling the two turned up a defect underneath the column
+names that decided the shape of the whole fix.
+
+`row_to_json` in `crates/kernel/src/host/db.rs:104-161` matches on the column's
+Postgres type name and handles nine: `BOOL`, `INT2`, `INT4`, `INT8`, `FLOAT4`,
+`FLOAT8`, `UUID`, `JSON`, `JSONB`. Everything else falls through to
+`row.try_get::<String, _>(name).ok()`. For `TEXT` and `VARCHAR` — the comment's
+stated intent — that is right. For every other type it is a **silent null**:
+`.ok()` discards the decode error, so a `timestamptz`, a `numeric`, a `date`, an
+`inet`, a `bytea` or any array arrives at the plugin as `null` and is
+indistinguishable from a column that is genuinely null. That path serves the
+structured `select` and `query_raw` alike.
+
+The gather path is not better, it is **different**: it wraps the query in
+Postgres' own `row_to_json` (`crates/kernel/src/gather/gather_service.rs`,
+`crates/kernel/src/routes/admin_record_type.rs:78-88`), so the same
+`timestamptz` column arrives there as an ISO 8601 string. So one column has three
+renderings depending on which door you came through — `null`, `"2026-08-06T…"`,
+and unreachable — and none of them is the integer a plugin renders a duration
+from.
+
+**What it cost this plugin.** Everything the daemon records about *when* is a
+`timestamptz`: six columns across five tables. A plugin over a schema it does not
+own cannot change those columns, and the two workarounds available on the plugin
+side both fail:
+
+- `SELECT last_seen_at::text` returns a string the plugin would have to parse,
+  and a wasm guest has no timezone database to parse it with;
+- `SELECT EXTRACT(EPOCH FROM last_seen_at)::bigint` works and is what a
+  `raw_sql` plugin can do — but the record tier's field map and the gather
+  definitions take **column names**, not expressions, so the gathers, the record
+  admin and the facets cannot use it. Only the plugin's own hand-written SQL
+  could.
+
+The answer landed on was a schema change on the **daemon's** side: every
+`timestamptz` gains a generated `<column>_epoch` twin,
+`BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (col AT TIME ZONE 'UTC'))::bigint)
+STORED`. The plugin reads the twin and aliases it back to the name its row struct
+expects; the record field maps name the twin; the gathers sort on it.
+
+**Is the epoch-companion pattern a reasonable general answer?** For this plugin,
+yes, and it is better than it sounds: the twin is `GENERATED ALWAYS … STORED`, so
+no writer on either side can put a wrong value in one, it is indexable, and it
+costs 8 bytes a row. It is also the only shape that makes the structured host and
+the gather path agree, which no expression-level workaround does.
+
+As a **general** answer it is not reasonable, for one reason: it requires the
+plugin to be able to change the other process's schema. Netgrasp could, because
+the daemon and the plugin ship together. A plugin over a schema it genuinely does
+not control — a vendor's table, a replica, a view — has no such move, and for it
+the finding is simply "the kernel cannot read your timestamps". Six extra columns
+in someone else's migration is a workaround with a co-author, not a pattern.
+
+**Recommendation (post-1.0):** extend `row_to_json`'s match with the types
+Postgres actually returns — `TIMESTAMPTZ`/`TIMESTAMP` as unix seconds (an
+integer, matching how the kernel stores its own `created`/`changed`), `DATE`,
+`NUMERIC` as a string, `INET`/`CIDR`/`MACADDR` as strings, `BYTEA` as base64 —
+and make the fall-through **loud**: a type the host cannot decode should return
+`ERR_SQL_FAILED` or a typed error rather than a null that reads as data. The
+silent null is the worse half of this finding by some distance. It is also worth
+deciding that the gather path and the `db` host render a column the same way;
+today a plugin author has to know which door a value came through to know what
+type it will be.
+
+`crates/netgrasp-core/tests/daemon_schema_test.rs::a_timestamptz_is_null_through_the_db_host_and_its_epoch_twin_is_not`
+pins the behaviour with a failure message naming this finding, so the day the
+host grows a `TIMESTAMPTZ` arm, a test says the companion columns can go.
+
+### G-RECORD-ID-MUST-BE-UUID — **[Medium, NEW]** the record tier assumes a uuid primary key, so a record over a native writer's `bigint` table can be listed but never viewed
+
+`ng_devices.id` is `BIGINT GENERATED ALWAYS AS IDENTITY`, because the daemon's
+tables were designed before Trovato was in the picture and a bigint identity is
+what a native process watching a LAN reaches for. Nothing in the record-type
+declaration objects: `RecordTypeRegistry::admit`
+(`crates/kernel/src/content/record_type.rs:172-200`) checks the table allowlist
+and the name collision, and nothing else. The listing works, because it projects
+`{id_column}::text`.
+
+The per-row view does not. `view_record` takes
+`Path<(String, uuid::Uuid)>` (`crates/kernel/src/routes/admin_record_type.rs`),
+so `/admin/structure/records/ng_device_state/42` fails to match the route and
+404s. Four of this plugin's six record types are bigint-keyed and none of their
+rows can be opened; the declaration's own doc comment says "Primary-key column
+(UUID)" (`crates/kernel/src/plugin/info_parser.rs:106`), so the assumption is
+documented — it is just not enforced anywhere a plugin author would meet it.
+
+**Impact.** Mild for Netgrasp: the device page is an Item page, and the record
+admin is an inspection surface. It is a real limit on the record tier's stated
+purpose, though — "a table this plugin did not create" is exactly the case where
+the primary key is not the kernel's choice to make.
+
+**Recommendation (post-1.0):** accept a `String` in the path and let the record
+type's own id column decide the cast, or — cheaper and honest — reject a record
+type at registry build whose `id_column` is not a uuid, so the failure is a
+startup error naming the plugin instead of a 404 nobody attributes.
+
+### G-RECORD-STRUCTURAL-COLUMNS-UNVALIDATED — **[Low, NEW]** `created_column` / `changed_column` default to columns most tables do not have, and the listing orders by one of them
+
+`RecordTypeDecl` defaults `id_column` to `id`, `created_column` to `created` and
+`changed_column` to `changed` (`crates/kernel/src/plugin/info_parser.rs:106-119`).
+No daemon table has a `created` or a `changed`, and the record admin's listing is
+`ORDER BY {changed_column} DESC` interpolated straight into the SQL
+(`crates/kernel/src/routes/admin_record_type.rs:78-88`). A record type that
+simply omits the field — which is the natural thing to do when the concept does
+not apply — therefore registers cleanly and 500s the moment an operator opens its
+list. Netgrasp's six record types did exactly that until this pass; they now name
+real columns explicitly, and `ng_person_mirror` has to point `created` at a
+last-arrival timestamp because `ng_people` records no creation time at all.
+
+Nothing validates that a declared column exists, either — not the structural
+columns and not the field map. The registry has no database handle at build time,
+which is a fair reason, but the consequence is that a typo in a field map is a
+runtime SQL error inside a gather rather than a startup error naming the plugin.
+
+**Recommendation (post-1.0):** make the structural columns `Option` with no
+default and skip the `ORDER BY` when `changed_column` is absent; and validate
+declared columns against `information_schema` once at startup, after migrations,
+where the answer is cheap and the error can name the plugin, the record type and
+the column.
+
 ---
 
 ## Residual findings re-confirmed from this consumer's side
@@ -350,6 +482,16 @@ plugins, which is how a workaround becomes a convention.
   shape. Netgrasp needs no `http`, no `ai-api`, no `queue` and no `user-api`, and
   saying so in four lines is worth more than any amount of documentation about
   what a plugin does not do.
+- **`raw_sql` as the shock absorber between two schemas.** When the plugin's
+  idea of the daemon's schema turned out to be wrong in every dimension that
+  matters — the primary key type, every timestamp, four column names, and one
+  column's type — the plugin absorbed all of it by projecting and renaming on
+  read (`SELECT started_at_epoch AS start`, `SELECT ip AS label`), so the
+  rendering code and every row struct stayed where they were. A structured-only
+  plugin would have had no such move and the daemon would have had to rename its
+  columns to suit the kernel. That `raw_sql` is a separate, explicit, auditable
+  switch rather than an implication of `db` is what makes it usable for this:
+  the manifest says out loud which plugins can do it.
 - **The host-agnostic core split.** `netgrasp-core` holds the sync plan, the
   column discipline, the retention window and the timeline arithmetic behind no
   host at all: 65 unit tests, no database, no wasm. The two properties this

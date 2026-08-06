@@ -13,10 +13,16 @@ use serde::{Deserialize, Serialize};
 /// learns them: a device is first seen as a MAC and an IP, and acquires a
 /// hostname, a vendor and an OS guess later (or never). `mac` is the one
 /// non-optional column — a device with no MAC is not a device.
+///
+/// The two timestamps are `i64` and are read from the daemon's generated
+/// `<column>_epoch` companions, aliased back to these names in
+/// [`crate::queries::SELECT_DIRTY_DEVICES`]. Reading `first_seen_at` itself
+/// would deserialize as `null`: the `db` host has no `timestamptz` decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRow {
-    /// Primary key of the `ng_devices` row.
-    pub id: String,
+    /// Primary key of the `ng_devices` row. A `bigint` identity, not a uuid —
+    /// the uuids on this row are the Item links.
+    pub id: i64,
     /// Hardware address. The daemon's identity for the device.
     pub mac: String,
     /// Reverse-DNS or mDNS name, when one resolves.
@@ -57,9 +63,9 @@ pub struct DeviceRow {
 impl DeviceRow {
     /// A minimal row, for tests and for building one field at a time.
     #[must_use]
-    pub fn new(id: impl Into<String>, mac: impl Into<String>) -> Self {
+    pub fn new(id: i64, mac: impl Into<String>) -> Self {
         Self {
-            id: id.into(),
+            id,
             mac: mac.into(),
             hostname: None,
             vendor: None,
@@ -109,15 +115,38 @@ pub struct PersonFields {
 }
 
 /// A row of `ng_events`, as the event log and the device page read it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `details` is arbitrary JSON, and [`serde_json::Value`] is only
+/// `PartialEq` because a float can be `NaN`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRow {
     /// `device_seen`, `device_new`, `device_offline`, `mac_conflict`, …
     pub event_type: String,
-    /// Unix seconds.
+    /// Unix seconds, read from `timestamp_epoch`.
     pub timestamp: i64,
-    /// Human-readable detail, may be empty.
+    /// The daemon's structured detail for the event.
+    ///
+    /// `ng_events.details` is `JSONB NOT NULL DEFAULT '{}'`, and the `db` host
+    /// decodes JSONB, so this arrives already parsed — an object, not a string
+    /// containing JSON. An event with nothing to add carries `{}`.
     #[serde(default)]
-    pub details: Option<String>,
+    pub details: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EventRow {
+    /// One key of `details` as a string.
+    ///
+    /// Strings are unwrapped; anything else is rendered as its JSON form, so a
+    /// numeric or boolean detail reads as `42` rather than as nothing. A key the
+    /// daemon did not write is `None`.
+    #[must_use]
+    pub fn detail(&self, key: &str) -> Option<String> {
+        match self.details.get(key)? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Null => None,
+            other => Some(other.to_string()),
+        }
+    }
 }
 
 /// Event types the UI treats as security-relevant.
@@ -136,6 +165,76 @@ pub const SECURITY_EVENT_TYPES: &[&str] = &[
 #[must_use]
 pub fn is_security_event(event_type: &str) -> bool {
     SECURITY_EVENT_TYPES.contains(&event_type)
+}
+
+/// The daemon-owned state a device page shows above its timelines.
+///
+/// The projection is [`crate::queries::SELECT_DEVICE_STATE`]; the two times are
+/// the epoch twins, aliased. Lives here rather than in the plugin so the test
+/// that runs that query against the daemon's own DDL decodes it with the same
+/// struct the plugin does, rather than with a restatement of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceState {
+    /// `ng_devices.id`, used to link the per-device event route. A `bigint`
+    /// identity — the per-device event gather filters `ng_events.device_id`,
+    /// which is the same type.
+    pub id: i64,
+    /// Hardware address.
+    pub mac: String,
+    /// Resolved name, if any.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// OUI lookup result.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    /// Daemon classification.
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// Daemon OS guess.
+    #[serde(default)]
+    pub os_family: Option<String>,
+    /// `online` / `offline` / `new`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Most recent address.
+    #[serde(default)]
+    pub last_ip: Option<String>,
+    /// Access point or segment.
+    #[serde(default)]
+    pub current_location: Option<String>,
+    /// First observation, unix seconds — `first_seen_at_epoch`, aliased.
+    #[serde(default)]
+    pub first_seen: Option<i64>,
+    /// Most recent observation, unix seconds — `last_seen_at_epoch`, aliased.
+    #[serde(default)]
+    pub last_seen: Option<i64>,
+}
+
+/// Row shape shared by the three timeline queries, so one decode serves all.
+///
+/// `start` and `end` are the epoch twins of the interval's `timestamptz`
+/// columns, aliased. `end` is `None` only for a genuinely open interval:
+/// `ended_at_epoch` is generated from a null `ended_at` and is null with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpanRow {
+    /// The span's label: an access point, an IP, or empty for bare presence.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Unix seconds the interval opened.
+    pub start: i64,
+    /// Unix seconds it closed, or `None` while it is still open.
+    #[serde(default)]
+    pub end: Option<i64>,
+}
+
+impl From<SpanRow> for Span {
+    fn from(r: SpanRow) -> Self {
+        Span {
+            label: r.label.unwrap_or_default(),
+            start: r.start,
+            end: r.end,
+        }
+    }
 }
 
 /// A half-open interval on a device's history: a presence session, a location
@@ -205,14 +304,66 @@ mod tests {
     #[test]
     fn a_device_row_deserializes_from_a_sparse_db_host_row() {
         // What `query_raw` returns for a device the daemon has only just seen:
-        // an id, a mac, and nothing else resolved yet.
-        let row: DeviceRow = serde_json::from_str(
-            r#"{"id":"11111111-1111-4111-8111-111111111111","mac":"aa:bb:cc:dd:ee:ff"}"#,
-        )
-        .unwrap();
+        // an id, a mac, and nothing else resolved yet. The id is a JSON number,
+        // because `ng_devices.id` is a bigint identity and the host decodes INT8
+        // as a number.
+        let row: DeviceRow =
+            serde_json::from_str(r#"{"id":41,"mac":"aa:bb:cc:dd:ee:ff"}"#).unwrap();
+        assert_eq!(row.id, 41);
         assert_eq!(row.mac, "aa:bb:cc:dd:ee:ff");
         assert!(row.hostname.is_none());
         assert!(row.trovato_item_id.is_none());
+    }
+
+    /// The row shape the sync pass actually decodes: a bigint id, epoch twins
+    /// aliased onto the timestamp names, and a uuid Item link.
+    #[test]
+    fn a_device_row_decodes_the_epoch_twins_as_the_timestamps() {
+        let row: DeviceRow = serde_json::from_str(
+            r#"{"id":7,"mac":"aa:bb:cc:dd:ee:ff","first_seen":1000,"last_seen":2000,
+                "trovato_item_id":"22222222-2222-4222-8222-222222222222"}"#,
+        )
+        .unwrap();
+        assert_eq!(row.first_seen, Some(1_000));
+        assert_eq!(row.last_seen, Some(2_000));
+        assert_eq!(
+            row.trovato_item_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+    }
+
+    /// `details` is JSONB, and the host decodes JSONB. A row that arrives with a
+    /// string there — which is what the plugin used to expect — no longer
+    /// deserializes, and that is the point.
+    #[test]
+    fn an_event_rows_details_decode_as_an_object_not_as_a_string() {
+        let row: EventRow = serde_json::from_str(
+            r#"{"event_type":"mac_spoof","timestamp":1000,
+                "details":{"claimed_mac":"aa:bb:cc:dd:ee:ff","seen":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            row.detail("claimed_mac").as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(row.detail("seen").as_deref(), Some("3"));
+        assert!(row.detail("absent").is_none());
+
+        assert!(
+            serde_json::from_str::<EventRow>(
+                r#"{"event_type":"x","timestamp":1,"details":"a string"}"#
+            )
+            .is_err(),
+            "details decoded as a string — the JSONB column would silently lose its shape"
+        );
+    }
+
+    #[test]
+    fn an_event_with_no_detail_carries_an_empty_object() {
+        let row: EventRow =
+            serde_json::from_str(r#"{"event_type":"device_seen","timestamp":1000}"#).unwrap();
+        assert!(row.details.is_empty());
+        assert!(row.detail("anything").is_none());
     }
 
     #[test]

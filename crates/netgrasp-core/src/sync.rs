@@ -207,7 +207,7 @@ mod tests {
     const ITEM: &str = "22222222-2222-4222-8222-222222222222";
 
     fn row() -> DeviceRow {
-        DeviceRow::new("11111111-1111-4111-8111-111111111111", "aa:bb:cc:dd:ee:ff")
+        DeviceRow::new(11, "aa:bb:cc:dd:ee:ff")
     }
 
     // --- derive_title -----------------------------------------------------

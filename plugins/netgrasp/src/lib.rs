@@ -413,7 +413,7 @@ pub fn tap_item_view(input: serde_json::Value) -> String {
     };
 
     let history = match state.as_ref() {
-        Some(s) => sync_host::load_device_history(&s.id).unwrap_or_else(|e| {
+        Some(s) => sync_host::load_device_history(s.id).unwrap_or_else(|e| {
             host::log(
                 "warning",
                 "netgrasp",

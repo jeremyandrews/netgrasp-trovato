@@ -4,6 +4,14 @@
 //! [`netgrasp_core::writeback`]; this module is the part that cannot be tested
 //! without a host, kept as thin as it can be for exactly that reason.
 //!
+//! The **statements** live in [`netgrasp_core::queries`] for the same reason,
+//! and it is a stronger one than tidiness: the SQL here is written against a
+//! schema the netgrasp daemon owns, nothing on this side type-checks it, and a
+//! wrong column name is invisible until a real daemon database is in front of
+//! it. Hoisting the statements into the core is what lets
+//! `crates/netgrasp-core/tests/daemon_schema_test.rs` run *these* statements —
+//! not restatements of them — against the daemon's own DDL.
+//!
 //! # Chunking
 //!
 //! Two ceilings bound a sync pass and neither is the one the scope names.
@@ -23,7 +31,8 @@
 //! The **150 s background epoch** is the third bound, and the same page size
 //! serves it: one `get-item` plus at most one `save-item` per row.
 
-use netgrasp_core::model::{DeviceRow, Span};
+use netgrasp_core::model::{DeviceRow, Span, SpanRow};
+use netgrasp_core::queries;
 use netgrasp_core::sync::{SyncAction, daemon_title, plan};
 use netgrasp_core::writeback::{Statement, build_person_upsert, build_update, overlay_from_item};
 use netgrasp_core::{CoreError, CoreResult, DEVICE_TYPE, retention};
@@ -43,12 +52,6 @@ pub const MAX_DEVICES_PER_TICK: i64 = 200;
 
 /// Site variable naming the event retention window, in days.
 pub const VAR_RETENTION_DAYS: &str = "netgrasp_event_retention_days";
-
-/// The columns a sync pass reads. Named explicitly rather than `SELECT *` so a
-/// daemon adding a column cannot change what this plugin decodes.
-const DEVICE_COLUMNS: &str = "id::text AS id, mac, hostname, vendor, device_type, os_family, \
-     state, last_ip, current_location, first_seen, last_seen, display_name, \
-     trovato_item_id::text AS trovato_item_id";
 
 /// What one sync pass did. Small by construction: this is the value that crosses
 /// the 64 KB tap boundary.
@@ -82,10 +85,7 @@ pub struct SyncReport {
 /// failure that makes the whole pass meaningless.
 pub fn sync_devices() -> CoreResult<SyncReport> {
     let rows: Vec<DeviceRow> = query_rows(
-        &format!(
-            "SELECT {DEVICE_COLUMNS} FROM ng_devices \
-             WHERE sync_state = 'dirty' ORDER BY last_seen DESC NULLS LAST LIMIT $1"
-        ),
+        queries::SELECT_DIRTY_DEVICES,
         &[json!(MAX_DEVICES_PER_TICK)],
     )?;
 
@@ -139,13 +139,13 @@ fn sync_one(row: &DeviceRow) -> CoreResult<SyncAction> {
     match &action {
         SyncAction::Create { title } | SyncAction::Relink { title, .. } => {
             let item_id = create_device_item(&row.mac, title)?;
-            link_item(&row.id, &item_id)?;
+            link_item(row.id, &item_id)?;
         }
         SyncAction::Refresh { item_id, title } => refresh_title(item_id, title)?,
         SyncAction::Skip { .. } => {}
     }
 
-    mark_clean(&row.id)?;
+    mark_clean(row.id)?;
     Ok(action)
 }
 
@@ -197,10 +197,11 @@ fn refresh_title(item_id: &str, title: &str) -> CoreResult<()> {
 /// Point a device row at its Item.
 ///
 /// Writes `trovato_item_id` only — a link-owned column, so this touches neither
-/// the daemon's nor the user's set.
-fn link_item(device_id: &str, item_id: &str) -> CoreResult<()> {
+/// the daemon's nor the user's set. The two ids are different types and both
+/// casts matter: the Item id is a uuid, the device id is a bigint.
+fn link_item(device_id: i64, item_id: &str) -> CoreResult<()> {
     exec(
-        "UPDATE ng_devices SET trovato_item_id = $1::uuid WHERE id = $2::uuid",
+        queries::UPDATE_LINK_ITEM,
         &[json!(item_id), json!(device_id)],
     )?;
     Ok(())
@@ -212,11 +213,8 @@ fn link_item(device_id: &str, item_id: &str) -> CoreResult<()> {
 /// deliberately its own function so that the write-back cannot reach it: the
 /// write-back builds its statement from
 /// [`netgrasp_core::columns::USER_OWNED`] and `sync_state` is not in that set.
-fn mark_clean(device_id: &str) -> CoreResult<()> {
-    exec(
-        "UPDATE ng_devices SET sync_state = 'clean' WHERE id = $1::uuid",
-        &[json!(device_id)],
-    )?;
+fn mark_clean(device_id: i64) -> CoreResult<()> {
+    exec(queries::UPDATE_MARK_CLEAN, &[json!(device_id)])?;
     Ok(())
 }
 
@@ -272,12 +270,12 @@ fn daemon_fallback_title(item_id: &str) -> CoreResult<Option<String>> {
         hostname: Option<String>,
         vendor: Option<String>,
     }
-    let rows: Vec<FallbackRow> = query_rows(
-        "SELECT mac, hostname, vendor FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1",
-        &[json!(item_id)],
-    )?;
+    let rows: Vec<FallbackRow> =
+        query_rows(queries::SELECT_DAEMON_TITLE_FIELDS, &[json!(item_id)])?;
     Ok(rows.into_iter().next().map(|r| {
-        let mut probe = DeviceRow::new(String::new(), r.mac);
+        // Id 0 is never a real identity value; nothing derived from this probe
+        // reads it, and `daemon_title` looks only at mac, hostname and vendor.
+        let mut probe = DeviceRow::new(0, r.mac);
         probe.hostname = r.hostname;
         probe.vendor = r.vendor;
         daemon_title(&probe)
@@ -307,14 +305,8 @@ pub fn mirror_person(item: &Value) -> CoreResult<u64> {
 ///
 /// [`CoreError::Store`] when either statement fails.
 pub fn retire_person(item_id: &str) -> CoreResult<()> {
-    exec(
-        "UPDATE ng_devices SET owner_item_id = NULL WHERE owner_item_id = $1::uuid",
-        &[json!(item_id)],
-    )?;
-    exec(
-        "DELETE FROM ng_people WHERE item_id = $1::uuid",
-        &[json!(item_id)],
-    )?;
+    exec(queries::UPDATE_CLEAR_OWNER, &[json!(item_id)])?;
+    exec(queries::DELETE_PERSON_MIRROR, &[json!(item_id)])?;
     Ok(())
 }
 
@@ -335,11 +327,7 @@ pub fn retire_person(item_id: &str) -> CoreResult<()> {
 ///
 /// [`CoreError::Store`] when the update fails.
 pub fn unlink_device(item_id: &str) -> CoreResult<u64> {
-    exec(
-        "UPDATE ng_devices SET trovato_item_id = NULL, sync_state = 'dirty' \
-         WHERE trovato_item_id = $1::uuid",
-        &[json!(item_id)],
-    )
+    exec(queries::UPDATE_UNLINK_DEVICE, &[json!(item_id)])
 }
 
 // ===========================================================================
@@ -359,8 +347,7 @@ pub fn prune_events(now: i64) -> CoreResult<u64> {
     let days = configured_retention_days();
     let cutoff = retention::cutoff(now, days);
     exec(
-        "DELETE FROM ng_events WHERE id IN (\
-             SELECT id FROM ng_events WHERE timestamp < $1::bigint LIMIT $2::bigint)",
+        queries::DELETE_EXPIRED_EVENTS,
         &[json!(cutoff), json!(retention::PRUNE_BATCH)],
     )
 }
@@ -388,31 +375,10 @@ fn configured_retention_days() -> i64 {
 // ===========================================================================
 
 /// The daemon-owned state a device page shows above its timelines.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeviceState {
-    /// `ng_devices.id`, used to link the per-device event route.
-    pub id: String,
-    /// Hardware address.
-    pub mac: String,
-    /// Resolved name, if any.
-    pub hostname: Option<String>,
-    /// OUI lookup result.
-    pub vendor: Option<String>,
-    /// Daemon classification.
-    pub device_type: Option<String>,
-    /// Daemon OS guess.
-    pub os_family: Option<String>,
-    /// `online` / `offline` / `new`.
-    pub state: Option<String>,
-    /// Most recent address.
-    pub last_ip: Option<String>,
-    /// Access point or segment.
-    pub current_location: Option<String>,
-    /// First observation.
-    pub first_seen: Option<i64>,
-    /// Most recent observation.
-    pub last_seen: Option<i64>,
-}
+///
+/// Defined in [`netgrasp_core::model`] with the query that fills it, and
+/// re-exported here because this is where the plugin reads it.
+pub use netgrasp_core::model::DeviceState;
 
 /// Load the daemon's row for a device Item, if the sync has linked one.
 ///
@@ -420,33 +386,8 @@ pub struct DeviceState {
 ///
 /// [`CoreError::Store`] when the query fails.
 pub fn load_device_state(item_id: &str) -> CoreResult<Option<DeviceState>> {
-    let rows: Vec<DeviceState> = query_rows(
-        "SELECT id::text AS id, mac, hostname, vendor, device_type, os_family, state, \
-                last_ip, current_location, first_seen, last_seen \
-         FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1",
-        &[json!(item_id)],
-    )?;
+    let rows: Vec<DeviceState> = query_rows(queries::SELECT_DEVICE_STATE, &[json!(item_id)])?;
     Ok(rows.into_iter().next())
-}
-
-/// Row shape shared by the three timeline queries, so one decode serves all.
-#[derive(Deserialize)]
-struct SpanRow {
-    #[serde(default)]
-    label: Option<String>,
-    start: i64,
-    #[serde(default)]
-    end: Option<i64>,
-}
-
-impl From<SpanRow> for Span {
-    fn from(r: SpanRow) -> Self {
-        Span {
-            label: r.label.unwrap_or_default(),
-            start: r.start,
-            end: r.end,
-        }
-    }
 }
 
 /// The rows a device page's three timelines are built from.
@@ -469,26 +410,25 @@ const HISTORY_LIMIT: i64 = 100;
 /// Load a device's presence, location and address history.
 ///
 /// Three queries rather than one union: they are three tables with three
-/// indexes, and a union would defeat all three.
+/// indexes, and a union would defeat all three. Each reads the epoch twins of
+/// its interval columns, because a `timestamptz` decodes as `null` through the
+/// `db` host — the reason every one of these timelines was empty against a real
+/// daemon database before the schemas were reconciled.
 ///
 /// # Errors
 ///
 /// [`CoreError::Store`] when any of the three queries fails.
-pub fn load_device_history(device_id: &str) -> CoreResult<DeviceHistory> {
+pub fn load_device_history(device_id: i64) -> CoreResult<DeviceHistory> {
     let presence: Vec<SpanRow> = query_rows(
-        "SELECT ''::text AS label, start_time AS start, end_time AS end FROM ng_presence \
-         WHERE device_id = $1::uuid ORDER BY start_time DESC LIMIT $2::bigint",
+        queries::SELECT_PRESENCE_SPANS,
         &[json!(device_id), json!(HISTORY_LIMIT)],
     )?;
     let locations: Vec<SpanRow> = query_rows(
-        "SELECT location AS label, start_time AS start, end_time AS end \
-         FROM ng_location_history \
-         WHERE device_id = $1::uuid ORDER BY start_time DESC LIMIT $2::bigint",
+        queries::SELECT_LOCATION_SPANS,
         &[json!(device_id), json!(HISTORY_LIMIT)],
     )?;
     let addresses: Vec<SpanRow> = query_rows(
-        "SELECT ip_address AS label, first_seen AS start, last_seen AS end FROM ng_ip_history \
-         WHERE device_id = $1::uuid ORDER BY first_seen DESC LIMIT $2::bigint",
+        queries::SELECT_ADDRESS_SPANS,
         &[json!(device_id), json!(HISTORY_LIMIT)],
     )?;
 
@@ -512,9 +452,6 @@ pub fn load_owner_name(owner_item_id: &str) -> CoreResult<Option<String>> {
     struct NameRow {
         name: String,
     }
-    let rows: Vec<NameRow> = query_rows(
-        "SELECT name FROM ng_people WHERE item_id = $1::uuid LIMIT 1",
-        &[json!(owner_item_id)],
-    )?;
+    let rows: Vec<NameRow> = query_rows(queries::SELECT_OWNER_NAME, &[json!(owner_item_id)])?;
     Ok(rows.into_iter().next().map(|r| r.name))
 }

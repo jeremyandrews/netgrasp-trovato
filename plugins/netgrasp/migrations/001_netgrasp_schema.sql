@@ -1,8 +1,21 @@
 -- Netgrasp schema. Forward-only; no rollback.
 --
--- These tables are owned by the native netgrasp daemon at runtime — it is the
--- process that watches the LAN and writes what it sees. This migration exists
--- anyway, for two reasons (DESIGN.md Decision 8):
+-- THIS FILE IS A COPY. The native netgrasp daemon owns every `ng_` table below:
+-- it creates them, it migrates them, and it is the only writer of the columns
+-- marked daemon-owned. What is reproduced here is the daemon's landed schema
+-- (milestones 1 through 3) with `IF NOT EXISTS` guards added and nothing else
+-- changed — same columns, same types, same order.
+--
+-- On a shared install the daemon must migrate FIRST. This file cannot converge a
+-- daemon-created table onto the shape below: `CREATE TABLE IF NOT EXISTS` on an
+-- existing table is a silent no-op whatever its columns are, so a stale daemon
+-- schema stays stale and this migration will not say so. (An earlier version of
+-- this file claimed convergence and shipped a set of `ADD COLUMN IF NOT EXISTS`
+-- statements to achieve it. It never did: the two schemas disagreed on the
+-- primary key type, on every timestamp, and on four column names, none of which
+-- an `ADD COLUMN` can fix.)
+--
+-- It exists anyway, for two reasons (DESIGN.md Decision 8):
 --
 --   1. A plugin's effective DB allowlist is (migration-owned ∪ db_tables), and a
 --      record type is only admitted over a table inside it. Declaring the tables
@@ -11,112 +24,79 @@
 --   2. An install with no daemon yet must still be able to enable the plugin and
 --      show empty pages rather than error.
 --
--- Everything below is additive and idempotent — CREATE TABLE IF NOT EXISTS plus
--- ADD COLUMN IF NOT EXISTS — so it converges to the same schema whether the
--- daemon or this migration got there first, and re-running it is a no-op.
+-- Two shapes below are load-bearing for the plugin and are worth naming:
+--
+--   * Device ids are `BIGINT GENERATED ALWAYS AS IDENTITY`, not uuids. Every
+--     query this plugin binds a device id into casts `::bigint`.
+--   * Every `timestamptz` carries a generated `<column>_epoch` twin. The `db`
+--     host decodes a fixed list of Postgres types and falls through to a string
+--     decode for the rest (crates/kernel/src/host/db.rs), and a `timestamptz`
+--     cannot decode as a string — it arrives as `null`. The plugin therefore
+--     never reads a `timestamptz` column; it reads the twin, which is a
+--     `BIGINT`. The twins are `GENERATED ALWAYS … STORED`, so no writer on
+--     either side can put a value in one.
 --
 -- Column ownership is the load-bearing part and is enforced in code, not here:
 -- netgrasp_core::columns names the three disjoint sets, and the write-back
 -- statement builder generates its SET list from one of them so it cannot name a
 -- column from another.
+--
+-- Indexes are the daemon's business. Only what the plugin needs to install
+-- cleanly on a database with no daemon is copied: primary keys, unique
+-- constraints, and the partial unique index that allows at most one open row
+-- per device on ng_presence and on ng_location_history.
 
 -- ---------------------------------------------------------------------------
 -- Devices
 -- ---------------------------------------------------------------------------
 -- Three writers, three column groups:
---   daemon-owned : mac, hostname, vendor, device_type, os_family, state,
---                  last_ip, current_location, first_seen, last_seen, sync_state
---   user-owned   : display_name, owner_item_id, notes, hidden, notify
+--   daemon-owned : mac, resolved_name, identity_*, hostname, mdns_name, vendor,
+--                  device_type*, os_family, state, last_ip, last_ipv6,
+--                  last_interface, first_seen_at, last_seen_at, baseline,
+--                  current_ap, current_location, sync_state
+--   user-owned   : display_name, notes, hidden, notify, owner_item_id
 --   plugin-owned : trovato_item_id
 CREATE TABLE IF NOT EXISTS ng_devices (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    mac               TEXT NOT NULL,
-    hostname          TEXT,
-    vendor            TEXT,
-    device_type       TEXT,
-    os_family         TEXT,
-    state             TEXT NOT NULL DEFAULT 'new',
-    last_ip           TEXT,
-    current_location  TEXT,
-    first_seen        BIGINT,
-    last_seen         BIGINT,
-    -- The daemon raises this to 'dirty' on create or change; the plugin's cron
-    -- sync lowers it to 'clean'. Nothing else may write it — in particular the
-    -- kernel→daemon write-back may not, which is what stops an admin edit from
+    id                     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    mac                    TEXT        NOT NULL UNIQUE,
+    -- user owned: the plugin writes these, the daemon never does
+    display_name           TEXT,
+    notes                  TEXT,
+    hidden                 BOOLEAN     NOT NULL DEFAULT FALSE,
+    notify                 BOOLEAN     NOT NULL DEFAULT TRUE,
+    owner_item_id          UUID,
+    -- daemon owned identity
+    resolved_name          TEXT,
+    identity_source        TEXT,
+    identity_confidence    REAL,
+    hostname               TEXT,
+    mdns_name              TEXT,
+    vendor                 TEXT,
+    device_type            TEXT,
+    device_type_confidence REAL,
+    os_family              TEXT,
+    -- daemon owned state
+    state                  TEXT        NOT NULL DEFAULT 'online',
+    last_ip                TEXT,
+    last_ipv6              TEXT,
+    last_interface         TEXT,
+    first_seen_at          TIMESTAMPTZ NOT NULL,
+    last_seen_at           TIMESTAMPTZ NOT NULL,
+    baseline               BOOLEAN     NOT NULL DEFAULT FALSE,
+    current_ap             TEXT,
+    current_location       TEXT,
+    -- the sync contract: the daemon raises sync_state to 'dirty' on create or
+    -- change and the plugin's cron sync lowers it to 'clean'. The kernel→daemon
+    -- write-back may not write it, which is what stops an admin edit from
     -- triggering a sync pass (DESIGN.md Decision 4).
-    sync_state        TEXT NOT NULL DEFAULT 'dirty',
-    display_name      TEXT,
-    owner_item_id     UUID,
-    notes             TEXT,
-    hidden            BOOLEAN NOT NULL DEFAULT FALSE,
-    notify            BOOLEAN NOT NULL DEFAULT FALSE,
-    trovato_item_id   UUID
+    sync_state             TEXT        NOT NULL DEFAULT 'dirty',
+    trovato_item_id        UUID,
+    -- epoch twins, generated and unwritable
+    first_seen_at_epoch    BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (first_seen_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    last_seen_at_epoch     BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_seen_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
-
--- Added separately so a daemon-created table converges to the same shape. A
--- daemon that predates the plugin has the observation columns and none of the
--- user-owned or link columns.
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS display_name     TEXT;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS owner_item_id    UUID;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS notes            TEXT;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS hidden           BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS notify           BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS trovato_item_id  UUID;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS sync_state       TEXT NOT NULL DEFAULT 'dirty';
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS current_location TEXT;
-ALTER TABLE ng_devices ADD COLUMN IF NOT EXISTS os_family        TEXT;
-
--- A MAC is the daemon's device identity, so it must be unique. Created as a
--- unique INDEX rather than a table constraint because it has to be addable to a
--- table the daemon may already have created without one.
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_devices_mac ON ng_devices (mac);
-
--- The sync pass's access path: only dirty rows, newest first. Partial, because
--- the steady state is that almost every row is clean.
-CREATE INDEX IF NOT EXISTS idx_ng_devices_dirty
-    ON ng_devices (last_seen DESC) WHERE sync_state = 'dirty';
--- The write-back's access path, and the device page's Item→row lookup.
-CREATE INDEX IF NOT EXISTS idx_ng_devices_item ON ng_devices (trovato_item_id);
--- The online-devices gather and the by-type / by-owner facets.
-CREATE INDEX IF NOT EXISTS idx_ng_devices_state ON ng_devices (state);
-CREATE INDEX IF NOT EXISTS idx_ng_devices_type ON ng_devices (device_type);
-CREATE INDEX IF NOT EXISTS idx_ng_devices_owner ON ng_devices (owner_item_id);
-
--- ---------------------------------------------------------------------------
--- People
--- ---------------------------------------------------------------------------
--- Derived, one-directional: an ng_person Item is the source of truth and
--- tap_item_insert / tap_item_update / tap_item_delete mirror it here. The daemon
--- reads this table (and ng_devices.owner_item_id) to answer "whose device is
--- this" without ever touching the kernel's `item` table (DESIGN.md Decision 3).
-CREATE TABLE IF NOT EXISTS ng_people (
-    item_id        UUID PRIMARY KEY,
-    name           TEXT NOT NULL,
-    notes          TEXT,
-    notify_arrive  BOOLEAN NOT NULL DEFAULT FALSE,
-    notify_depart  BOOLEAN NOT NULL DEFAULT FALSE
-);
-
--- ---------------------------------------------------------------------------
--- Events
--- ---------------------------------------------------------------------------
--- A lightweight record, not an Item (DESIGN.md Decision 2): ~300 rows a day for
--- 90 days, never edited, deleted wholesale on a retention timer. Items would
--- mean 27,000 revisioned rows and 300 delete-item host calls a day.
-CREATE TABLE IF NOT EXISTS ng_events (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id   UUID,
-    event_type  TEXT NOT NULL,
-    timestamp   BIGINT NOT NULL,
-    details     TEXT
-);
-
--- The event log's default order, and the retention pass's access path.
-CREATE INDEX IF NOT EXISTS idx_ng_events_time ON ng_events (timestamp DESC);
--- The per-device event list on a device page.
-CREATE INDEX IF NOT EXISTS idx_ng_events_device ON ng_events (device_id, timestamp DESC);
--- The security-events view.
-CREATE INDEX IF NOT EXISTS idx_ng_events_type ON ng_events (event_type, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
 -- Timelines
@@ -125,40 +105,111 @@ CREATE INDEX IF NOT EXISTS idx_ng_events_type ON ng_events (event_type, timestam
 -- entities: they are rendered onto the device page by tap_item_view and are
 -- never Items. Declared as read-only record types so an operator can still
 -- inspect them without a SQL client.
+--
+-- `is_summary` marks a compacted day rather than an observed session. The
+-- device page's timelines exclude those rows: the page counts sessions and
+-- reports a longest session, and a compacted day is neither.
 
 CREATE TABLE IF NOT EXISTS ng_presence (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id   UUID NOT NULL,
-    start_time  BIGINT NOT NULL,
-    end_time    BIGINT
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    device_id         BIGINT      NOT NULL REFERENCES ng_devices (id) ON DELETE CASCADE,
+    interface         TEXT,
+    ip                TEXT,
+    started_at        TIMESTAMPTZ NOT NULL,
+    ended_at          TIMESTAMPTZ,
+    is_summary        BOOLEAN     NOT NULL DEFAULT FALSE,
+    observation_count BIGINT      NOT NULL DEFAULT 1,
+    started_at_epoch  BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (started_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    ended_at_epoch    BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (ended_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
-CREATE INDEX IF NOT EXISTS idx_ng_presence_device ON ng_presence (device_id, start_time DESC);
+
+-- At most one open session per device.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_presence_open
+    ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
 
 CREATE TABLE IF NOT EXISTS ng_location_history (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id   UUID NOT NULL,
-    location    TEXT NOT NULL,
-    start_time  BIGINT NOT NULL,
-    end_time    BIGINT
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    device_id        BIGINT      NOT NULL REFERENCES ng_devices (id) ON DELETE CASCADE,
+    ap_name          TEXT,
+    location         TEXT        NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL,
+    ended_at         TIMESTAMPTZ,
+    is_summary       BOOLEAN     NOT NULL DEFAULT FALSE,
+    started_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (started_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    ended_at_epoch   BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (ended_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
-CREATE INDEX IF NOT EXISTS idx_ng_location_device
-    ON ng_location_history (device_id, start_time DESC);
+
+-- At most one open stay per device.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_location_open
+    ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
 
 CREATE TABLE IF NOT EXISTS ng_ip_history (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id   UUID NOT NULL,
-    ip_address  TEXT NOT NULL,
-    first_seen  BIGINT NOT NULL,
-    last_seen   BIGINT
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    device_id        BIGINT      NOT NULL REFERENCES ng_devices (id) ON DELETE CASCADE,
+    ip               TEXT        NOT NULL,
+    interface        TEXT,
+    first_seen       TIMESTAMPTZ NOT NULL,
+    last_seen        TIMESTAMPTZ NOT NULL,
+    first_seen_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (first_seen AT TIME ZONE 'UTC'))::bigint) STORED,
+    last_seen_epoch  BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_seen AT TIME ZONE 'UTC'))::bigint) STORED,
+    UNIQUE (device_id, ip)
 );
-CREATE INDEX IF NOT EXISTS idx_ng_ip_device ON ng_ip_history (device_id, first_seen DESC);
+
+-- ---------------------------------------------------------------------------
+-- Events
+-- ---------------------------------------------------------------------------
+-- A lightweight record, not an Item (DESIGN.md Decision 2): ~300 rows a day for
+-- 90 days, never edited, deleted wholesale on a retention timer. Items would
+-- mean 27,000 revisioned rows and 300 delete-item host calls a day.
+--
+-- `details` is a JSONB object, not a string containing JSON: the `db` host
+-- decodes JSONB, so the plugin reads it as an object.
+CREATE TABLE IF NOT EXISTS ng_events (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    device_id       BIGINT      REFERENCES ng_devices (id) ON DELETE SET NULL,
+    event_type      TEXT        NOT NULL,
+    "timestamp"     TIMESTAMPTZ NOT NULL,
+    details         JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    notified        BOOLEAN     NOT NULL DEFAULT FALSE,
+    sync_state      TEXT        NOT NULL DEFAULT 'dirty',
+    timestamp_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM ("timestamp" AT TIME ZONE 'UTC'))::bigint) STORED
+);
+
+-- ---------------------------------------------------------------------------
+-- People
+-- ---------------------------------------------------------------------------
+-- Derived, one-directional: an ng_person Item is the source of truth and
+-- tap_item_insert / tap_item_update / tap_item_delete mirror it here. The daemon
+-- reads this table (and ng_devices.owner_item_id) to answer "whose device is
+-- this" without ever touching the kernel's `item` table (DESIGN.md Decision 3).
+-- The daemon writes the presence columns back: state, current_location and the
+-- two arrival timestamps are its, and the mirror upsert never names them.
+CREATE TABLE IF NOT EXISTS ng_people (
+    item_id          UUID PRIMARY KEY,
+    name             TEXT    NOT NULL,
+    notes            TEXT,
+    notify_arrive    BOOLEAN NOT NULL DEFAULT FALSE,
+    notify_depart    BOOLEAN NOT NULL DEFAULT FALSE,
+    state            TEXT    NOT NULL DEFAULT 'away',
+    current_location TEXT,
+    last_arrived_at  TIMESTAMPTZ,
+    last_departed_at TIMESTAMPTZ
+);
 
 -- ---------------------------------------------------------------------------
 -- Plugin state
 -- ---------------------------------------------------------------------------
 -- The plugin's own scratch space: the sync cursor and the retention setting.
--- Separate from every daemon table so a `DROP` of the daemon's schema during a
--- daemon upgrade cannot take the plugin's bookkeeping with it.
+-- The daemon does not know about this table. Separate from every daemon table so
+-- a `DROP` of the daemon's schema during a daemon upgrade cannot take the
+-- plugin's bookkeeping with it.
 CREATE TABLE IF NOT EXISTS ng_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL

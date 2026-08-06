@@ -13,6 +13,9 @@
 //!   [`model::Span`], [`model::EventRow`]).
 //! - [`columns`] — the three disjoint column sets that make "the two writers
 //!   never collide" a checkable property rather than a promise.
+//! - [`queries`] — every statement the plugin issues against the daemon's
+//!   tables, hoisted here so a test can run the real ones against the daemon's
+//!   own DDL.
 //! - [`sync`] — the daemon→kernel plan: create, relink, refresh or skip.
 //! - [`writeback`] — the kernel→daemon direction, including the loop-termination
 //!   argument and the statement builder that cannot name a foreign column.
@@ -31,6 +34,7 @@
 pub mod columns;
 pub mod error;
 pub mod model;
+pub mod queries;
 pub mod retention;
 pub mod sync;
 pub mod timeline;

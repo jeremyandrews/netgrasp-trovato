@@ -104,12 +104,25 @@ So:
 The two column sets are **fixed and disjoint**, which is what makes "the two
 writers never collide" a schema property rather than a promise:
 
-- **daemon-owned:** `mac`, `hostname`, `vendor`, `device_type`, `os_family`,
-  `state`, `last_ip`, `current_location`, `first_seen`, `last_seen`, `sync_state`
+- **daemon-owned:** `mac`, `resolved_name`, `identity_source`,
+  `identity_confidence`, `hostname`, `mdns_name`, `vendor`, `device_type`,
+  `device_type_confidence`, `os_family`, `state`, `last_ip`, `last_ipv6`,
+  `last_interface`, `first_seen_at`, `last_seen_at`, `baseline`, `current_ap`,
+  `current_location`, `sync_state`, and the generated `first_seen_at_epoch` /
+  `last_seen_at_epoch` twins
 - **user-owned:** `display_name`, `owner_item_id`, `notes`, `hidden`, `notify`
 - **link-owned (plugin):** `trovato_item_id`
 
-`netgrasp_core::sync::USER_OWNED_COLUMNS` names the second set once, the
+The daemon's schema is **canonical** for every `ng_` table: it is the only writer
+at runtime and its migrations are already applied, so where the two disagreed,
+this side moved. Two things moved on the daemon's side instead, both because the
+kernel leaves no alternative: the Item join columns are `UUID` because the
+kernel's `item.id` is, and every `timestamptz` carries a generated
+`<column>_epoch` companion because the `db` host cannot decode a `timestamptz` at
+all and returns it as `null` (`FRICTION.md`, `G-DB-HOST-TYPE-COVERAGE`). Every
+time the plugin reads is read from a twin.
+
+`netgrasp_core::columns::USER_OWNED` names the second set once, the
 write-back builds its `UPDATE` from that list and nothing else, and a test asserts
 the three sets are disjoint and that the write-back statement mentions no column
 outside its own set.
@@ -124,7 +137,7 @@ on what is left:
   on a retention timer. `item` is a revisioned, access-controlled, translatable,
   taxonomy-capable store; an event uses none of it.
 - **Pruning.** As records, the retention pass is one bounded
-  `DELETE FROM ng_events WHERE timestamp < $1` per cron tick. As Items it is one
+  `DELETE FROM ng_events WHERE timestamp_epoch < $1` per cron tick. As Items it is one
   `delete-item` host call per row, each dispatching `tap_item_delete` to every
   plugin, 300 times a day, inside a 150 s background epoch.
 - **Query shape.** The event log filters on `event_type`, `device_id` and
@@ -174,7 +187,7 @@ to say about an Item whose fields are otherwise all user-owned. This is why the
 update branch has real work and is not scaffolding.
 
 **Kernel → daemon** (`tap_item_update` on `ng_device`): writes exactly
-`USER_OWNED_COLUMNS` into `ng_devices WHERE trovato_item_id = $id`, and
+`USER_OWNED` into `ng_devices WHERE trovato_item_id = $id`, and
 `display_name` takes the Item's title. It does **not** write `sync_state`.
 
 One subtlety, found by the integration test rather than by design, and worth
@@ -245,7 +258,7 @@ projection and no tile type computes anything. "Online count" is therefore a
 and whose rows are what is behind it. Same for who-is-home, recent events and
 security alerts. The shape is imposed, not chosen.
 
-### Decision 8 — the plugin's migration creates the `ng_` schema, additively
+### Decision 8 — the plugin's migration is a **copy** of the daemon's schema
 
 The daemon owns these tables at runtime, but the plugin's effective DB allowlist
 is `migration-owned ∪ db_tables` (`crates/kernel/src/plugin/db_policy.rs`), and a
@@ -255,11 +268,28 @@ practically: an install with no daemon yet must still be able to enable the
 plugin, run its gathers and show empty pages rather than error.
 
 So `001_netgrasp_schema.sql` creates every `ng_` table with
-`CREATE TABLE IF NOT EXISTS` and adds the plugin-owned columns with
-`ALTER TABLE … ADD COLUMN IF NOT EXISTS`. It converges to the same schema whether
-the daemon or the plugin got there first, and re-running it is a no-op either way.
-`db_tables` names them all explicitly as well, so the allowlist does not depend on
-`extract_created_tables` parsing.
+`CREATE TABLE IF NOT EXISTS`, and what it creates is a **faithful copy of the
+daemon's DDL** — same columns, same types, same order — with the guards added and
+nothing else changed. `db_tables` names them all explicitly as well, so the
+allowlist does not depend on `extract_created_tables` parsing.
+
+It is a copy, not a convergence. An earlier version of this decision claimed the
+migration "converges to the same schema whether the daemon or the plugin got
+there first", achieved with a block of `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+That was wrong twice over: the two schemas disagreed on the primary key type, on
+every timestamp and on four column names, none of which an `ADD COLUMN` can
+reconcile — and `CREATE TABLE IF NOT EXISTS` over an existing table is a silent
+no-op whatever its shape, so nothing would have reported the difference. **On a
+shared install the daemon migrates first**, and the plugin's copy exists only for
+an install that has no daemon yet.
+
+Since nothing in the kernel can check that claim, the plugin checks it itself:
+`crates/netgrasp-core/tests/daemon_schema_test.rs::the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema`
+applies the daemon's DDL and the plugin's migration to two scratch schemas and
+compares `information_schema.columns` table by table. Every other test in that
+file runs the plugin's real statements — the constants in
+`netgrasp_core::queries` — against the daemon's DDL rather than against the
+plugin's copy of it.
 
 The `ng_` prefix is not renamed.
 
@@ -274,6 +304,6 @@ The `ng_` prefix is not renamed.
   `.git` directory and no working files, and no other copy is present. The
   daemon-side task ("verify the daemon tolerates user-owned columns being written
   by another process") could not be run. The plugin side of that contract is
-  specified in `netgrasp_core::sync::USER_OWNED_COLUMNS` and enforced by test, so
+  specified in `netgrasp_core::columns::USER_OWNED` and enforced by test, so
   the daemon-side check is a bounded follow-up rather than an open question.
 - **No enrichment / UniFi, no arrival-departure notification** (CLOSE 16), **no iOS.**

@@ -58,7 +58,7 @@ pub fn now() -> CoreResult<i64> {
     struct TsRow {
         ts: i64,
     }
-    let rows: Vec<TsRow> = query_rows("SELECT EXTRACT(EPOCH FROM NOW())::bigint AS ts", &[])?;
+    let rows: Vec<TsRow> = query_rows(netgrasp_core::queries::SELECT_CLOCK, &[])?;
     rows.into_iter()
         .next()
         .map(|r| r.ts)
