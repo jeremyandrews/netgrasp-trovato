@@ -153,12 +153,35 @@ impl EventRow {
 ///
 /// Kept here rather than in the migration's `IN (…)` list alone so the plugin
 /// and the gather cannot drift apart silently — a test asserts they match.
+///
+/// These are the daemon's own strings, and the set is the one the daemon's
+/// `recent_security_events` selects: `arp_scan`, `arp_spoof`, `rogue_dhcp`,
+/// `identity_change`, `ip_conflict`, `gratuitous_arp`. The daemon's
+/// `EventType::as_str` is the only source of a value that ever lands in
+/// `ng_events.event_type`, so a name absent from it can only ever match zero
+/// rows.
+///
+/// The first run of the plugin against a live daemon database found four of the
+/// five names here matched nothing: `device_new`, `mac_conflict`, `mac_spoof`
+/// and `unknown_device` were never in the daemon's vocabulary (`new_device` and
+/// `arp_spoof` are the two that were meant), so `/events/security` silently
+/// showed `ip_conflict` alone and looked like a working page. The in-tree test
+/// could not have caught it: it checks that the Rust list and the SQL list
+/// agree with each other, and they did — both were wrong in the same way.
+/// Nothing in this repository holds the daemon's vocabulary to compare against.
+///
+/// Note that `new_device` is deliberately *not* here. It is a routine event on
+/// any network with a visitor on it, the daemon does not count it as security
+/// relevant, and the event log at `/events` already carries it.
+///
+/// Sorted, because a test asserts it is.
 pub const SECURITY_EVENT_TYPES: &[&str] = &[
-    "device_new",
+    "arp_scan",
+    "arp_spoof",
+    "gratuitous_arp",
+    "identity_change",
     "ip_conflict",
-    "mac_conflict",
-    "mac_spoof",
-    "unknown_device",
+    "rogue_dhcp",
 ];
 
 /// Whether an event type is one the security views surface.
@@ -390,10 +413,31 @@ mod tests {
 
     #[test]
     fn security_event_membership_is_exactly_the_declared_list() {
-        assert!(is_security_event("mac_spoof"));
-        assert!(is_security_event("device_new"));
+        assert!(is_security_event("arp_spoof"));
+        assert!(is_security_event("ip_conflict"));
         assert!(!is_security_event("device_seen"));
         assert!(!is_security_event(""));
+    }
+
+    /// The names that were in this list before it was checked against a running
+    /// daemon. None of them is a value `EventType::as_str` can return, so each
+    /// one could only ever have matched zero rows.
+    #[test]
+    fn the_names_the_daemon_never_writes_are_gone() {
+        for stale in ["device_new", "mac_conflict", "mac_spoof", "unknown_device"] {
+            assert!(
+                !is_security_event(stale),
+                "{stale} is not a netgrasp daemon event type; it matches nothing"
+            );
+        }
+    }
+
+    /// `new_device` is a real daemon event and deliberately not a security one:
+    /// the daemon's own `recent_security_events` omits it, and `/events` lists
+    /// it already.
+    #[test]
+    fn new_device_is_a_real_event_but_not_a_security_one() {
+        assert!(!is_security_event("new_device"));
     }
 
     #[test]

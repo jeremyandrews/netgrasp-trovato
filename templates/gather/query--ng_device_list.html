@@ -1,3 +1,18 @@
+{#
+    Device list, rendered over the `ng_device_state` RECORD type.
+
+    A record gather yields one flat object per row, keyed by the PHYSICAL column
+    name of the base table — `row.mac`, `row.last_ip`. It does not yield the Item
+    row shape, so there is no `row.fields` and no `row.title` here: the record
+    field map rewrites filter and sort names on the way into the query, not the
+    keys on the way out.
+
+    Reaching for the Item shape is not a cosmetic error. `row.title` is not
+    merely empty, it is *undefined*, and an undefined variable aborts the whole
+    Tera render — the route then falls back to a built-in dump of every column of
+    ng_devices, daemon internals included. That is what this template rendered
+    before it was written against the shape it is actually handed.
+#}
 <div class="ng-device-list">
     <h1>{{ query.label }}</h1>
 
@@ -6,7 +21,7 @@
     {% endif %}
 
     {% if rows | length == 0 %}
-    <p class="empty">No devices found.</p>
+    <p class="empty">{{ query.display.empty_text | default(value="No devices found.") }}</p>
     {% else %}
     <table class="table ng-device-table">
         <thead>
@@ -16,30 +31,60 @@
                 <th>State</th>
                 <th>Type</th>
                 <th>Last IP</th>
+                <th>Last seen</th>
             </tr>
         </thead>
         <tbody>
             {% for row in rows %}
             <tr data-id="{{ row.id }}">
-                {% if row.fields is defined and row.fields is object %}
-                    <td>
-                        <a href="/item/{{ row.id }}">
-                            {{ row.fields.display_name | default(value=row.title) }}
-                        </a>
-                    </td>
-                    <td class="ng-mac">{{ row.fields.mac | default(value="-") }}</td>
-                    <td class="ng-state ng-state--{{ row.fields.state | default(value='unknown') }}">
-                        {{ row.fields.state | default(value="unknown") }}
-                    </td>
-                    <td>{{ row.fields.device_type | default(value="-") }}</td>
-                    <td class="ng-ip">{{ row.fields.last_ip | default(value="-") }}</td>
-                {% else %}
-                    <td><a href="/item/{{ row.id }}">{{ row.title }}</a></td>
-                    <td>-</td>
-                    <td>-</td>
-                    <td>-</td>
-                    <td>-</td>
-                {% endif %}
+                {#
+                    The daemon's naming ladder: an admin's label wins, then what
+                    the daemon resolved, then the raw hostname, then the MAC —
+                    which is never null.
+
+                    Written as an if-chain for two reasons. These columns arrive
+                    as JSON null, and the `default` filter only substitutes for
+                    an *undefined* value, so it would not fire. And Tera's `or`
+                    is a boolean operator, not a coalesce: `a or b` yields
+                    `true`, not `a` — a chain of them renders the literal word
+                    "true" in the column.
+                #}
+                {#
+                    Linked only once the cron sync has minted the device's Item.
+                    Until then trovato_item_id is null, and the record id is a
+                    bigint the uuid-keyed item route cannot open.
+
+                    The anchor is opened and closed around the name rather than
+                    binding the name to a variable first: `{% set %}` inside an
+                    `{% if %}` is not reliably visible after the `{% endif %}`,
+                    and an undefined variable does not render as blank here — it
+                    aborts the whole template.
+                #}
+                <td>
+                    {%- if row.trovato_item_id %}<a href="/item/{{ row.trovato_item_id }}">{% endif -%}
+                    {%- if row.display_name %}{{ row.display_name }}
+                    {%- elif row.resolved_name %}{{ row.resolved_name }}
+                    {%- elif row.hostname %}{{ row.hostname }}
+                    {%- else %}{{ row.mac }}{% endif -%}
+                    {%- if row.trovato_item_id %}</a>{% endif -%}
+                </td>
+                <td class="ng-mac">{{ row.mac }}</td>
+                <td class="ng-state ng-state--{{ row.state | default(value='unknown') }}">
+                    {{ row.state | default(value="unknown") }}
+                </td>
+                <td>{% if row.device_type %}{{ row.device_type }}{% else %}-{% endif %}</td>
+                <td class="ng-ip">{% if row.last_ip %}{{ row.last_ip }}{% else %}-{% endif %}</td>
+                {#
+                    The epoch twin, not `last_seen_at`. The timestamptz reaches a
+                    gather as an ISO 8601 string through row_to_json and reaches
+                    the plugin's db host as null; the twin is the same integer on
+                    both paths, and `date` takes it directly.
+                #}
+                <td class="ng-timestamp">
+                    {%- if row.last_seen_at_epoch -%}
+                    {{ row.last_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
+                    {%- else -%}-{%- endif -%}
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -58,6 +103,7 @@
     .ng-device-table th { background: #f5f5f5; font-weight: 600; }
     .ng-mac { font-family: monospace; }
     .ng-ip { font-family: monospace; }
+    .ng-timestamp { font-family: monospace; white-space: nowrap; }
     .ng-state { font-weight: 500; }
     .ng-state--online { color: #16a34a; }
     .ng-state--offline { color: #9ca3af; }

@@ -1,3 +1,12 @@
+{#
+    Event log, rendered over the `ng_event` RECORD type.
+
+    Same shape rule as the device list: a record gather hands each row over as a
+    flat object keyed by the base table's physical column names, so there is no
+    `row.fields` wrapper. This template's `row.fields is object` guard was always
+    false, and its else-branch dutifully rendered a dash in every cell of every
+    row — a full page of well-formed nothing, with no error anywhere to say so.
+#}
 <div class="ng-event-log">
     <h1>{{ query.label }}</h1>
 
@@ -6,7 +15,7 @@
     {% endif %}
 
     {% if rows | length == 0 %}
-    <p class="empty">No events recorded.</p>
+    <p class="empty">{{ query.display.empty_text | default(value="No events recorded.") }}</p>
     {% else %}
     <table class="table ng-event-table">
         <thead>
@@ -20,17 +29,27 @@
         <tbody>
             {% for row in rows %}
             <tr data-id="{{ row.id }}">
-                {% if row.fields is defined and row.fields is object %}
-                    <td class="ng-timestamp">{{ row.fields.timestamp | default(value="-") }}</td>
-                    <td class="ng-event-type">{{ row.fields.event_type | default(value="-") }}</td>
-                    <td>{{ row.fields.device_id | default(value="-") }}</td>
-                    <td>{{ row.fields.details | default(value="") }}</td>
-                {% else %}
-                    <td>-</td>
-                    <td>-</td>
-                    <td>-</td>
-                    <td>-</td>
-                {% endif %}
+                {# The epoch twin, for the reason given in the device list. #}
+                <td class="ng-timestamp">
+                    {%- if row.timestamp_epoch -%}
+                    {{ row.timestamp_epoch | date(format="%Y-%m-%d %H:%M:%S") }}
+                    {%- else -%}-{%- endif -%}
+                </td>
+                <td class="ng-event-type">{{ row.event_type | default(value="-") }}</td>
+                {#
+                    A gather reads one record type, so there is no device row to
+                    join a name out of here. The id links to that device's own
+                    event log, which is the route that exists for it.
+                #}
+                <td>
+                    {% if row.device_id %}
+                    <a href="/events/device?device={{ row.device_id }}">{{ row.device_id }}</a>
+                    {% else %}-{% endif %}
+                </td>
+                {# `details` is jsonb; json_encode keeps it one readable cell. #}
+                <td class="ng-details">
+                    {%- if row.details -%}{{ row.details | json_encode() }}{%- endif -%}
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -49,4 +68,5 @@
     .ng-event-table th { background: #f5f5f5; font-weight: 600; }
     .ng-timestamp { font-family: monospace; white-space: nowrap; }
     .ng-event-type { font-weight: 500; }
+    .ng-details { font-family: monospace; font-size: 0.85em; }
 </style>

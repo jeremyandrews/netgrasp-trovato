@@ -125,9 +125,23 @@ CREATE TABLE IF NOT EXISTS ng_presence (
         (EXTRACT(EPOCH FROM (ended_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
 
--- At most one open session per device.
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_presence_open
-    ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+-- At most one open session per device. Guarded on ownership: see the note above
+-- `ng_devices`. On a shared install the daemon owns this table and has already
+-- created its own equivalent index under its own name, and `CREATE INDEX IF NOT
+-- EXISTS` is not a way out — Postgres resolves the table and checks ownership
+-- before it looks at the index name, so the statement raises `must be owner of
+-- table ng_presence` whether or not the index exists.
+DO $$
+BEGIN
+    IF pg_catalog.pg_has_role(
+        current_user,
+        (SELECT relowner FROM pg_catalog.pg_class WHERE oid = 'ng_presence'::regclass),
+        'USAGE'
+    ) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_presence_open
+            ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS ng_location_history (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -143,9 +157,19 @@ CREATE TABLE IF NOT EXISTS ng_location_history (
         (EXTRACT(EPOCH FROM (ended_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
 
--- At most one open stay per device.
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_location_open
-    ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+-- At most one open stay per device. Guarded on ownership for the same reason as
+-- `uniq_ng_presence_open` above.
+DO $$
+BEGIN
+    IF pg_catalog.pg_has_role(
+        current_user,
+        (SELECT relowner FROM pg_catalog.pg_class WHERE oid = 'ng_location_history'::regclass),
+        'USAGE'
+    ) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_ng_location_open
+            ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS ng_ip_history (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

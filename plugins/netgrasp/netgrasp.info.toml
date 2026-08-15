@@ -53,6 +53,7 @@ files = [
     "migrations/001_netgrasp_schema.sql",
     "migrations/002_netgrasp_gathers.sql",
     "migrations/003_netgrasp_roles_tiles.sql",
+    "migrations/004_netgrasp_security_event_types.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).

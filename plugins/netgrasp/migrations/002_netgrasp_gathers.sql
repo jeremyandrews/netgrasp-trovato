@@ -325,6 +325,13 @@ ON CONFLICT (query_id) DO UPDATE SET
     plugin     = EXCLUDED.plugin,
     changed    = EXCLUDED.changed;
 
+-- The `in` list below holds the daemon's own event-type strings, and only names
+-- that `EventType::as_str` can actually produce match anything at all. It is
+-- also the daemon's own idea of which of them are security relevant, which is
+-- narrower than "anything alarming-sounding": it is the set the daemon's
+-- `recent_security_events` selects. See `SECURITY_EVENT_TYPES` for what this
+-- list was before a live daemon database was pointed at it.
+--
 -- Security events get their own route rather than a styled row in the main log,
 -- because "styled distinctly via display config" is not something the display
 -- JSON can express — it has format/pager/empty_text/header/footer and no
@@ -335,7 +342,7 @@ INSERT INTO gather_query (query_id, label, description, definition, display, plu
 VALUES (
     'ng_event_security',
     'Security events',
-    'New, unknown, spoofed and conflicting devices',
+    'Scans, spoofs, rogue DHCP, address conflicts and identity changes',
     '{
         "record_type": "ng_event",
         "fields": [],
@@ -343,7 +350,7 @@ VALUES (
             {
                 "field": "event_type",
                 "operator": "in",
-                "value": ["device_new", "ip_conflict", "mac_conflict", "mac_spoof", "unknown_device"],
+                "value": ["arp_scan", "arp_spoof", "gratuitous_arp", "identity_change", "ip_conflict", "rogue_dhcp"],
                 "exposed": false,
                 "exposed_label": null
             }
