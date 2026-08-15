@@ -138,22 +138,47 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 
 /// Navigation entries for the plugin's routes.
 ///
-/// Navigation is all these are. `MenuDefinition` carries a `callback` field in
-/// the SDK that the kernel's own type does not have, so it is dropped on
-/// deserialize and no handler is ever registered (`G-NO-PLUGIN-HTTP`). The paths
-/// below work because `002_netgrasp_gathers.sql` aliases each one onto a
+/// `MenuRoute`, not `MenuDefinition`, for one reason: **weight**.
+///
+/// The kernel sorts the navigation by weight and holds the entries in a
+/// `HashMap` (`crates/kernel/src/menu/registry.rs`), so six entries that all
+/// weigh the same come out in whatever order the map iterates — the navigation
+/// rendered in a different order on different requests to the same running
+/// server. `MenuDefinition` has no weight field to set: it is a frozen type and
+/// predates the weight, which is exactly why `MenuRoute` exists. The two
+/// serialize to the same shape the registry reads, so this is a change of SDK
+/// type and not of contract.
+///
+/// The order below is the order a person reads them in: what is here now, then
+/// everything, then who, then what happened.
+///
+/// Navigation is all these are. `callback` is left empty on every one: the
+/// kernel routes an entry only when `handler_type` is `"api"` and a callback is
+/// set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
+/// work because `002_netgrasp_gathers.sql` aliases each one onto a
 /// `/gather/<query_id>` route — the menu makes them findable, the URL aliases
-/// make them exist. Nothing here sets a callback, because a field that silently
-/// does nothing is worse than no field.
+/// make them exist.
 #[plugin_tap]
-pub fn tap_menu() -> Vec<MenuDefinition> {
+pub fn tap_menu() -> Vec<MenuRoute> {
     vec![
-        MenuDefinition::new("/devices/online", "Online now").permission(PERM_VIEW_DEVICES),
-        MenuDefinition::new("/devices", "All devices").permission(PERM_VIEW_DEVICES),
-        MenuDefinition::new("/who-is-home", "Who is home").permission(PERM_VIEW_DEVICES),
-        MenuDefinition::new("/events", "Events").permission(PERM_VIEW_DEVICES),
-        MenuDefinition::new("/events/security", "Security events").permission(PERM_VIEW_DEVICES),
-        MenuDefinition::new("/people", "People").permission(PERM_VIEW_DEVICES),
+        MenuRoute::page("/devices/online", "Online now")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(0),
+        MenuRoute::page("/devices", "All devices")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(1),
+        MenuRoute::page("/who-is-home", "Who is home")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(2),
+        MenuRoute::page("/people", "People")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(3),
+        MenuRoute::page("/events", "Events")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(4),
+        MenuRoute::page("/events/security", "Security events")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(5),
     ]
 }
 
@@ -625,6 +650,44 @@ mod tests {
         }
     }
 
+    /// The kernel sorts the navigation by weight out of a `HashMap`, so equal
+    /// weights mean an order that varies between requests. Distinct weights are
+    /// the only thing that makes the navigation stable, and the assertion is on
+    /// the rendered order rather than on "they differ" so that reordering the
+    /// vec without reordering the weights is caught too.
+    #[test]
+    fn the_navigation_has_one_stable_order() {
+        let mut menus = __inner_tap_menu();
+        menus.sort_by_key(|m| m.weight);
+        let ordered: Vec<&str> = menus.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(
+            ordered,
+            [
+                "/devices/online",
+                "/devices",
+                "/who-is-home",
+                "/people",
+                "/events",
+                "/events/security",
+            ]
+        );
+
+        let mut weights: Vec<i32> = __inner_tap_menu().iter().map(|m| m.weight).collect();
+        weights.sort_unstable();
+        weights.dedup();
+        assert_eq!(weights.len(), 6, "two menu entries share a weight");
+    }
+
+    /// Every entry must be visible, or it is filtered out of the navigation by
+    /// `root_menus()` before any permission is considered.
+    #[test]
+    fn every_menu_entry_is_visible_navigation_rather_than_a_route() {
+        for m in __inner_tap_menu() {
+            assert!(m.visible, "menu {} is not visible", m.path);
+            assert_eq!(m.handler_type, "page", "menu {} is not a page", m.path);
+        }
+    }
+
     /// Every menu path must be a route the gather migration actually aliases,
     /// or the navigation links to a 404.
     #[test]
@@ -650,6 +713,40 @@ mod tests {
                 "security event type {t} is missing from the ng_event_security gather"
             );
         }
+    }
+
+    /// The security-event list is written a third time, in the shared event
+    /// table template, which is what flags a spoof visually in the *middle* of
+    /// the ordinary event log rather than only on /events/security. A type the
+    /// gather selects but the template does not flag renders as an ordinary
+    /// row on the security page — correct data, invisible warning.
+    #[test]
+    fn the_event_template_flags_exactly_the_declared_security_event_types() {
+        let template = include_str!("../../../templates/gather/netgrasp/event-table.html");
+        for t in netgrasp_core::model::SECURITY_EVENT_TYPES {
+            assert!(
+                template.contains(&format!("\"{t}\"")),
+                "security event type {t} is not flagged by event-table.html"
+            );
+        }
+    }
+
+    /// Every menu path must also be a path the *web* interface can serve. The
+    /// alias test above proves the route exists; this one proves the migration
+    /// that makes the menu visible at all is still shipped, since a menu nobody
+    /// can see is the state this pass started from.
+    #[test]
+    fn the_manifest_ships_the_migration_that_reveals_the_menu() {
+        let manifest = include_str!("../netgrasp.info.toml");
+        let migration = include_str!("../migrations/005_netgrasp_web_interface.sql");
+        assert!(
+            manifest.contains("005_netgrasp_web_interface.sql"),
+            "005_netgrasp_web_interface.sql is not in the manifest's migration list"
+        );
+        assert!(
+            migration.contains(PERM_VIEW_DEVICES),
+            "the migration no longer grants {PERM_VIEW_DEVICES}"
+        );
     }
 
     /// The manifest's `db_tables` must name every table the plugin's SQL

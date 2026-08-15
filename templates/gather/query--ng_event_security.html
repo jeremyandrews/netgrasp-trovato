@@ -1,0 +1,34 @@
+{#
+    Scans, spoofs, rogue DHCP, address conflicts and identity changes.
+    /events/security
+
+    Every row on this page is a security event by construction — the gather's
+    `in` filter is the whole point of the route — so the flagging that marks one
+    row out of many in the main log marks every row here. What makes the page
+    read as security is the page-level treatment in netgrasp.css
+    (`.ng-page--ng_event_security`) plus the count line below, which is a
+    reading of the situation rather than a row count.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">security event{{ total | pluralize }} on record</span>
+    </span>
+    <span class="ng-summary__scope">
+        showing {{ rows | length }}, page {{ page }} of {{ total_pages }}
+        &middot; <a href="/events">full event log</a>
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/event-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    No scan, spoof, rogue DHCP server, address conflict or identity change has
+    been recorded. This is the good state.
+</span>
+{% endblock %}

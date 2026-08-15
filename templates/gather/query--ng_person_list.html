@@ -1,0 +1,86 @@
+{#
+    People devices can belong to. /people
+
+    The one netgrasp page whose rows are NOT records. People are Items
+    (DESIGN.md Decision 3), so this gather reads `item` and its rows really do
+    have `row.title` and `row.fields` — the shape every other template in this
+    directory is careful never to reach for. The `| default(value="")` on each
+    field lookup is what keeps a person with no notes from aborting the render
+    the way a missing key does.
+
+    Each card links to that person's devices, which is what makes
+    /devices/owner reachable by clicking.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">{{ total | pluralize(singular="person", plural="people") }}</span>
+    </span>
+    <span class="ng-summary__scope"><a href="/who-is-home">Who is home</a></span>
+</div>
+{% endblock %}
+
+{% block results %}
+<ul class="ng-people">
+    {% for row in rows %}
+    <li class="ng-person">
+        <h2 class="ng-person__name">
+            <a href="/devices/owner?owner={{ row.id }}">{{ row.title | default(value="(unnamed)") }}</a>
+        </h2>
+        {# No id chip here, unlike the device table and Who is home: those two
+           pages have only a uuid to label a person with, and this one has the
+           name. An id shown beside the name it identifies is noise. #}
+        {#
+            Two reads per field, because the kernel stores an Item field in TWO
+            shapes and both are live in the tree: plugin-written items use the
+            `{"value": …}` wrapper, admin-written items store the bare scalar
+            (`G-ITEM-FORM-MISMATCH`, and `raw_field_text` in
+            crates/kernel/src/content/form.rs reads either for the same reason).
+            Reading only `.value` renders a person's notes blank for every
+            person edited through the admin form.
+
+            `| default(value=<the raw>)` rather than a literal: the fallback
+            argument is a variable that is always defined by the line above, so
+            `.value` being undefined on a bare scalar resolves to the scalar
+            instead of aborting the render.
+
+            A Boolean is stored as a JSON `true`, never the string "1" the
+            checkbox posts — comparing against "1" here was a condition that
+            could not fire, which is the same silent-nothing this directory's
+            other templates carry warnings about.
+        #}
+        {% set ng_arrive_raw = row.fields.field_notify_arrive | default(value=false) %}
+        {% set ng_depart_raw = row.fields.field_notify_depart | default(value=false) %}
+        {% set ng_arrive = ng_arrive_raw.value | default(value=ng_arrive_raw) %}
+        {% set ng_depart = ng_depart_raw.value | default(value=ng_depart_raw) %}
+        {% if ng_arrive or ng_depart %}
+        <p class="ng-person__meta">
+            Notified when they
+            {%- if ng_arrive %} arrive{% endif -%}
+            {%- if ng_arrive and ng_depart %} or{% endif -%}
+            {%- if ng_depart %} leave{% endif -%}
+        </p>
+        {% endif %}
+        {% set ng_notes_raw = row.fields.field_notes | default(value="") %}
+        {% set ng_notes = ng_notes_raw.value | default(value=ng_notes_raw) %}
+        {% if ng_notes %}
+        <p class="ng-person__notes">{{ ng_notes }}</p>
+        {% endif %}
+        <p class="ng-person__meta">
+            <a href="/devices/owner?owner={{ row.id }}">Their devices</a>
+            &middot; <a href="/item/{{ row.id }}">Person page</a>
+        </p>
+    </li>
+    {% endfor %}
+</ul>
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    A person is an Item, created like any other content. Add one, then set it as
+    a device's owner to see them on <a href="/who-is-home">Who is home</a>.
+</span>
+{% endblock %}

@@ -54,6 +54,7 @@ files = [
     "migrations/002_netgrasp_gathers.sql",
     "migrations/003_netgrasp_roles_tiles.sql",
     "migrations/004_netgrasp_security_event_types.sql",
+    "migrations/005_netgrasp_web_interface.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).

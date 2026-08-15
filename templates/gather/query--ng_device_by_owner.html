@@ -1,0 +1,36 @@
+{#
+    One person's devices. /devices/owner?owner=<person item id>
+
+    Reached by clicking an owner chip in any device table, or a person on
+    /people. The owner is a uuid because that is what ng_devices stores and a
+    record gather cannot join ng_people to turn it into a name.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{# An unresolved `url_arg` filter is dropped rather than matched as empty, so
+   this route with no `owner` returns every device rather than none. #}
+{% block summary %}
+<p class="ng-page__description">
+    {%- if filter_values.owner -%}
+    Owner <span class="ng-id-chip">{{ filter_values.owner }}</span>
+    <a href="/people">All people</a>
+    {%- else -%}
+    No person given, so this is every device. Pick somebody on
+    <a href="/people">the people list</a>.
+    {%- endif -%}
+</p>
+{% include "gather/netgrasp/device-summary.html" %}
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    {% if filter_values.owner %}
+    Nobody owns this id, or they own no devices. Assign a device to a person by
+    editing the device and setting its owner.
+    {% else %}
+    This page needs a person: pick one on <a href="/people">the people list</a>.
+    {% endif %}
+</span>
+{% endblock %}

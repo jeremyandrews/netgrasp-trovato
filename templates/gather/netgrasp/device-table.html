@@ -1,0 +1,120 @@
+{#
+    The device table, shared by all four device gathers: ng_device_list,
+    ng_device_online, ng_device_by_type and ng_device_by_owner.
+
+    One table, four pages. The four differ only in which rows the gather
+    selects, so they have no business differing in how a row is drawn — and a
+    column added to one copy of four is a column missing from three.
+
+    Rows are `ng_device_state` records: flat objects keyed by the physical
+    column names of ng_devices. See gather/netgrasp/page.html for what happens
+    when a template forgets that.
+#}
+<div class="ng-table-scroll">
+    <table class="ng-table ng-device-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>State</th>
+                <th>Type</th>
+                <th>IP</th>
+                <th>MAC</th>
+                <th>Owner</th>
+                <th>Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr data-id="{{ row.id }}">
+                {#
+                    The daemon's naming ladder: an admin's label wins, then what
+                    the daemon resolved, then the raw hostname, then the MAC —
+                    which is never null.
+
+                    Written as an if-chain for two reasons. These columns arrive
+                    as JSON null, and the `default` filter only substitutes for
+                    an *undefined* value, so it would not fire. And Tera's `or`
+                    is a boolean operator, not a coalesce: `a or b` yields
+                    `true`, not `a` — a chain of them renders the literal word
+                    "true" in the column.
+
+                    Linked only once the cron sync has minted the device's Item.
+                    Until then trovato_item_id is null, and the record id is a
+                    bigint the uuid-keyed item route cannot open.
+
+                    The anchor is opened and closed around the name rather than
+                    binding the name to a variable first: `{% set %}` inside an
+                    `{% if %}` is not reliably visible after the `{% endif %}`,
+                    and an undefined variable does not render as blank here — it
+                    aborts the whole template.
+                #}
+                <td class="ng-name">
+                    {%- if row.trovato_item_id %}<a href="/item/{{ row.trovato_item_id }}">{% endif -%}
+                    {%- if row.display_name %}{{ row.display_name }}
+                    {%- elif row.resolved_name %}{{ row.resolved_name }}
+                    {%- elif row.hostname %}{{ row.hostname }}
+                    {%- else %}{{ row.mac }}{% endif -%}
+                    {%- if row.trovato_item_id %}</a>{% endif -%}
+                </td>
+
+                <td>
+                    <span class="ng-state ng-state--{{ row.state | default(value='unknown') }}">
+                        {{- row.state | default(value="unknown") -}}
+                    </span>
+                </td>
+
+                {# The type facet is a route, not an exposed filter (see
+                   002_netgrasp_gathers.sql), so this link is how a reader gets
+                   to /devices/type without typing a query string. #}
+                <td>
+                    {%- if row.device_type -%}
+                    <a href="/devices/type?device_type={{ row.device_type | urlencode }}">{{ row.device_type }}</a>
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                <td class="ng-mono">
+                    {%- if row.last_ip %}{{ row.last_ip }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                </td>
+
+                <td class="ng-mono">{{ row.mac }}</td>
+
+                {#
+                    The owner cell can only show the uuid it has. A gather reads
+                    one record type, so there is no ng_people row to take a name
+                    from here — the link goes to that person's device list,
+                    which is the page that exists for them.
+                #}
+                {#
+                    The *last* group of the uuid, not the first. These ids are
+                    UUIDv7: the leading bytes are a timestamp, so two people
+                    created in the same millisecond — which is what happens when
+                    they are seeded together — share the first eight characters
+                    exactly and the chip distinguishes nothing. The final group
+                    is the random one. The full id is in the title either way.
+                #}
+                <td>
+                    {%- if row.owner_item_id -%}
+                    <a class="ng-id-chip" href="/devices/owner?owner={{ row.owner_item_id }}"
+                       title="Person {{ row.owner_item_id }}">{{ row.owner_item_id | split(pat="-") | last }}</a>
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                {#
+                    The epoch twin, not `last_seen_at`. The timestamptz reaches a
+                    gather as an ISO 8601 string through row_to_json and reaches
+                    the plugin's db host as null; the twin is the same integer on
+                    both paths, and `date` takes it directly.
+
+                    `date` renders UTC. `data-ng-epoch` is what the script in
+                    page.html rewrites into the viewer's own timezone.
+                #}
+                <td class="ng-mono ng-nowrap" {% if row.last_seen_at_epoch %}data-ng-epoch="{{ row.last_seen_at_epoch }}"{% endif %}>
+                    {%- if row.last_seen_at_epoch -%}
+                    {{ row.last_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>

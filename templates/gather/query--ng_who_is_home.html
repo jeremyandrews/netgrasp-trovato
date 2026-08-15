@@ -1,0 +1,73 @@
+{#
+    Who is home. /who-is-home
+
+    A device gather read as a people page. The rows are online devices that
+    belong to somebody — with no grouping in QueryDefinition, a person with
+    three devices arrives as three rows (G-NO-GATHER-AGGREGATION), which is why
+    the gather sorts by owner: the repetition at least arrives adjacent.
+
+    `group_by` finishes the job in the template, turning those adjacent rows
+    into one card per person. It keys on `owner_item_id` — the physical column
+    name, because these are records — and the gather's `owner_id is_not_null`
+    filter is what guarantees every row has one to group on.
+
+    The card shows a uuid where a name belongs for the same reason the device
+    table's owner column does: one gather reads one record type, and ng_people
+    is a different table. The name is one click away on the person's own page.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+{% set ng_people = rows | group_by(attribute="owner_item_id") %}
+<div class="ng-summary">
+    <span class="ng-summary__item ng-summary__item--online">
+        <span class="ng-summary__count">{{ ng_people | length }}</span>
+        <span class="ng-summary__label">home</span>
+    </span>
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ rows | length }}</span>
+        <span class="ng-summary__label">of their devices online</span>
+    </span>
+    <span class="ng-summary__scope">
+        {%- if total_pages > 1 -%}page {{ page }} of {{ total_pages }}{%- endif -%}
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}
+{% set ng_home = rows | group_by(attribute="owner_item_id") %}
+<ul class="ng-people">
+    {% for owner_id, devices in ng_home %}
+    <li class="ng-person">
+        <h2 class="ng-person__name">
+            {# The last uuid group, for the reason given in device-table.html:
+               these are UUIDv7 and the leading characters are a timestamp. #}
+            <a href="/devices/owner?owner={{ owner_id }}" title="Person {{ owner_id }}">
+                <span class="ng-id-chip">{{ owner_id | split(pat="-") | last }}</span>
+            </a>
+        </h2>
+        <p class="ng-person__meta">{{ devices | length }} device{{ devices | length | pluralize }} online</p>
+        <ul class="ng-person__devices">
+            {% for row in devices %}
+            <li class="ng-device-chip">
+                {%- if row.trovato_item_id %}<a href="/item/{{ row.trovato_item_id }}">{% endif -%}
+                {%- if row.display_name %}{{ row.display_name }}
+                {%- elif row.resolved_name %}{{ row.resolved_name }}
+                {%- elif row.hostname %}{{ row.hostname }}
+                {%- else %}{{ row.mac }}{% endif -%}
+                {%- if row.trovato_item_id %}</a>{% endif -%}
+            </li>
+            {% endfor %}
+        </ul>
+    </li>
+    {% endfor %}
+</ul>
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    A device counts as somebody being home once it has an owner. Nothing here
+    means no owned device is online — or that no device has been given an owner
+    yet. <a href="/people">People</a>, <a href="/devices/online">online devices</a>.
+</span>
+{% endblock %}

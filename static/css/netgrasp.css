@@ -1,0 +1,321 @@
+/*
+ * Netgrasp page styles.
+ *
+ * One stylesheet for every netgrasp gather page, replacing the per-template
+ * <style> blocks the device list and event log each carried. Two templates with
+ * two private copies of the same table rules is how nine pages stop matching.
+ *
+ * Loaded by templates/gather/netgrasp/page.html rather than from base.html:
+ * gather content is rendered to a string and injected into the page body, so a
+ * content template has no way to reach <head>. Keeping the link here is what
+ * stops these rules from loading on every non-netgrasp page.
+ *
+ * Colours come from the theme's :root custom properties (base.html) so the
+ * pages sit inside the site rather than beside it.
+ */
+
+/* --------------------------------------------------------------------------
+ * Page chrome
+ * ------------------------------------------------------------------------ */
+
+.ng-page {
+    margin: 1.5rem 0;
+}
+
+.ng-page__title {
+    margin: 0 0 0.25rem 0;
+    font-size: 1.6rem;
+}
+
+.ng-page__description {
+    margin: 0 0 1rem 0;
+    color: var(--gray-500);
+    font-size: 0.9rem;
+}
+
+/* The summary line: counts by state, above the table. */
+.ng-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem 1.25rem;
+    margin: 0 0 1rem 0;
+    padding: 0.75rem 1rem;
+    background: white;
+    border: 1px solid var(--gray-200);
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.ng-summary__count {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.ng-summary__label {
+    color: var(--gray-500);
+}
+
+.ng-summary__scope {
+    margin-inline-start: auto;
+    color: var(--gray-500);
+    font-size: 0.8rem;
+}
+
+.ng-summary__item--online .ng-summary__count {
+    color: var(--success);
+}
+
+.ng-summary__item--idle .ng-summary__count {
+    color: var(--warning);
+}
+
+.ng-summary__item--offline .ng-summary__count {
+    color: var(--gray-500);
+}
+
+/* --------------------------------------------------------------------------
+ * Tables
+ * ------------------------------------------------------------------------ */
+
+.ng-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border-radius: 0.5rem;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    font-size: 0.9rem;
+}
+
+.ng-table th,
+.ng-table td {
+    padding: 0.6rem 0.85rem;
+    text-align: start;
+    border-bottom: 1px solid var(--gray-200);
+    vertical-align: top;
+}
+
+.ng-table th {
+    background: var(--gray-100);
+    font-weight: 600;
+    font-size: 0.8rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--gray-700);
+    white-space: nowrap;
+}
+
+.ng-table tr:last-child td {
+    border-bottom: none;
+}
+
+.ng-table tbody tr:hover td {
+    background: var(--gray-50);
+}
+
+/* A wide table on a narrow screen scrolls itself rather than the page. */
+.ng-table-scroll {
+    overflow-x: auto;
+}
+
+.ng-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em;
+}
+
+.ng-nowrap {
+    white-space: nowrap;
+}
+
+.ng-muted {
+    color: var(--gray-300);
+}
+
+.ng-name {
+    font-weight: 500;
+}
+
+/* --------------------------------------------------------------------------
+ * Device state
+ * ------------------------------------------------------------------------ */
+
+.ng-state {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+}
+
+.ng-state--online {
+    background: #dcfce7;
+    color: #15803d;
+}
+
+.ng-state--idle {
+    background: #fef3c7;
+    color: #b45309;
+}
+
+.ng-state--offline {
+    background: var(--gray-100);
+    color: var(--gray-500);
+}
+
+.ng-state--unknown {
+    background: var(--gray-100);
+    color: var(--gray-700);
+}
+
+/* An id shown where a name would go: the owner column has only a uuid to
+   work with, because a record gather reads one table and cannot join a name. */
+.ng-id-chip {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 0.25rem;
+    background: var(--gray-100);
+    white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+ * Events
+ * ------------------------------------------------------------------------ */
+
+.ng-event-type {
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.ng-details {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--gray-700);
+    word-break: break-word;
+    max-width: 42rem;
+}
+
+/*
+ * A security event is flagged wherever it appears, including in the middle of
+ * the ordinary event log. Being told about a spoof only on the page you have to
+ * go looking for is the failure mode this avoids.
+ */
+.ng-row--security td {
+    background: #fef2f2;
+}
+
+.ng-row--security:hover td {
+    background: #fee2e2;
+}
+
+.ng-row--security td:first-child {
+    box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.ng-row--security .ng-event-type {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.ng-flag {
+    margin-inline-end: 0.35rem;
+}
+
+/* The security page as a whole reads as an alert list, not a table that
+   happens to have red rows. */
+.ng-page--ng_event_security .ng-page__title::before {
+    content: "\26A0\FE0F";
+    margin-inline-end: 0.5rem;
+}
+
+/* --------------------------------------------------------------------------
+ * People
+ * ------------------------------------------------------------------------ */
+
+.ng-people {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.ng-person {
+    background: white;
+    border: 1px solid var(--gray-200);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.ng-person__name {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.05rem;
+}
+
+.ng-person__meta {
+    margin: 0 0 0.5rem 0;
+    color: var(--gray-500);
+    font-size: 0.8rem;
+}
+
+.ng-person__devices {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+}
+
+.ng-device-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    background: #dcfce7;
+    color: #15803d;
+    font-size: 0.8rem;
+    white-space: nowrap;
+}
+
+.ng-device-chip a {
+    color: inherit;
+}
+
+/* --------------------------------------------------------------------------
+ * Empty states
+ * ------------------------------------------------------------------------ */
+
+.ng-empty {
+    margin: 0;
+    padding: 2.5rem 1rem;
+    text-align: center;
+    background: white;
+    border: 1px dashed var(--gray-300);
+    border-radius: 0.5rem;
+    color: var(--gray-500);
+}
+
+.ng-empty__hint {
+    display: block;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+}
+
+/* --------------------------------------------------------------------------
+ * Refresh notice
+ * ------------------------------------------------------------------------ */
+
+.ng-refresh {
+    margin: 0.75rem 0 0 0;
+    color: var(--gray-500);
+    font-size: 0.75rem;
+    text-align: end;
+}

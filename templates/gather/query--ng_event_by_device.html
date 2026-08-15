@@ -1,0 +1,43 @@
+{#
+    One device's events. /events/device?device=<device row id>
+
+    Reached by clicking a device chip in any event table, and from the device
+    page, which knows the row id because it looked the row up to render the
+    timelines. The id is the ng_devices bigint, not the device Item's uuid.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{# An unresolved `url_arg` filter is dropped rather than matched as empty, so
+   this route with no `device` returns the whole event log rather than none. #}
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">
+            {%- if filter_values.device -%}
+            event{{ total | pluralize }} for device
+            <span class="ng-id-chip">#{{ filter_values.device }}</span>
+            {%- else -%}
+            events — no device given, so this is the whole log
+            {%- endif -%}
+        </span>
+    </span>
+    <span class="ng-summary__scope">
+        showing {{ rows | length }}, page {{ page }} of {{ total_pages }}
+        &middot; <a href="/events">full event log</a>
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/event-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    {% if filter_values.device %}
+    No event recorded against device #{{ filter_values.device }}.
+    {% else %}
+    This page needs a device: reach it by clicking a device in
+    <a href="/events">the event log</a>.
+    {% endif %}
+</span>
+{% endblock %}

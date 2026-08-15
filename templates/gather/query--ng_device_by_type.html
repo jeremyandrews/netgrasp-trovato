@@ -1,0 +1,41 @@
+{#
+    One device type. /devices/type?device_type=phone
+
+    Reached by clicking a type in any device table, which is what makes this a
+    page rather than a URL somebody has to know how to type. The facet is a
+    route rather than an exposed filter because a blank exposed filter binds ''
+    against a real Postgres column and raises rather than matching everything
+    (002_netgrasp_gathers.sql).
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{#
+    An unresolved `url_arg` filter is *dropped* rather than matched as empty, so
+    this route with no `device_type` returns every device rather than none. The
+    empty block below therefore never fires for a missing facet — the page has
+    to say what it is showing here, where there are rows.
+#}
+{% block summary %}
+<p class="ng-page__description">
+    {%- if filter_values.device_type -%}
+    Type <strong>{{ filter_values.device_type }}</strong>. <a href="/devices">All devices</a>
+    {%- else -%}
+    No type given, so this is every device. Pick a type from a device's Type
+    column, or go to <a href="/devices">all devices</a>.
+    {%- endif -%}
+</p>
+{% include "gather/netgrasp/device-summary.html" %}
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    {% if filter_values.device_type %}
+    No device is typed <strong>{{ filter_values.device_type }}</strong>.
+    {% else %}
+    This page needs a type: reach it by clicking a device's type in
+    <a href="/devices">the device list</a>.
+    {% endif %}
+</span>
+{% endblock %}

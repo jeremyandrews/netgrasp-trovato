@@ -1,0 +1,36 @@
+{#
+    The state summary above a device table, shared by all four device gathers.
+
+    Counted from `rows`, which is one page of results — there is no aggregate
+    projection in a gather definition, so a total by state is not something the
+    query can be asked for (G-NO-GATHER-AGGREGATION). Rather than quietly
+    present a page count as a total, the line says which it is: when the pager
+    shows more than one page, the counts are labelled as this page's.
+
+    At the default 50 rows a page this is the whole answer for a home network,
+    which is the case it is built for.
+#}
+{% set ng_online = rows | filter(attribute="state", value="online") | length %}
+{% set ng_idle = rows | filter(attribute="state", value="idle") | length %}
+{% set ng_offline = rows | filter(attribute="state", value="offline") | length %}
+<div class="ng-summary">
+    <span class="ng-summary__item ng-summary__item--online">
+        <span class="ng-summary__count">{{ ng_online }}</span>
+        <span class="ng-summary__label">online</span>
+    </span>
+    <span class="ng-summary__item ng-summary__item--idle">
+        <span class="ng-summary__count">{{ ng_idle }}</span>
+        <span class="ng-summary__label">idle</span>
+    </span>
+    <span class="ng-summary__item ng-summary__item--offline">
+        <span class="ng-summary__count">{{ ng_offline }}</span>
+        <span class="ng-summary__label">offline</span>
+    </span>
+    <span class="ng-summary__scope">
+        {%- if total_pages > 1 -%}
+        {{ rows | length }} of {{ total }} devices, page {{ page }} of {{ total_pages }}
+        {%- else -%}
+        {{ total }} device{{ total | pluralize }}
+        {%- endif -%}
+    </span>
+</div>

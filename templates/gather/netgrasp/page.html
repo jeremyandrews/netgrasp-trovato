@@ -1,0 +1,128 @@
+{#
+    The shared chrome for every netgrasp gather page.
+
+    All nine `gather/query--ng_*.html` templates extend this one. It owns the
+    heading, the empty state, the pager, the stylesheet and the two scripts, so
+    that the nine pages match each other by construction rather than by nine
+    people remembering to keep them the same.
+
+    ===========================================================================
+    The row shape, which every child depends on
+    ===========================================================================
+    Seven of these nine gathers read a RECORD type, and a record gather yields
+    one flat object per row keyed by the PHYSICAL column name of the base table
+    — `row.mac`, `row.last_ip`, `row.owner_item_id`. It is NOT the Item shape:
+    there is no `row.fields` and no `row.title`, and reaching for one is not a
+    cosmetic error. An undefined variable aborts the whole Tera render, and the
+    route then falls back to the kernel's built-in dump of every column of the
+    base table, daemon internals included. That is what seven of these pages
+    were before this file existed.
+
+    `gather/query--ng_person_list.html` is the exception: people are Items, so
+    that one page really does get `row.title`. It says so in its own comment.
+
+    ===========================================================================
+    Blocks a child fills
+    ===========================================================================
+    - `summary`  — an optional line above the table (the device pages count
+                   states here).
+    - `results`  — the table or list itself. Rendered only when there are rows;
+                   the empty state below covers the other case, so no child
+                   repeats it.
+    - `empty`    — an optional extra hint under the gather's own empty text.
+#}
+<link rel="stylesheet" href="/static/css/netgrasp.css">
+
+<div class="ng-page ng-page--{{ query.query_id }}" data-query-id="{{ query.query_id }}">
+    <h1 class="ng-page__title">{{ query.label }}</h1>
+
+    {% if query.description %}
+    <p class="ng-page__description">{{ query.description }}</p>
+    {% endif %}
+
+    {% if rows | length == 0 %}
+    <p class="ng-empty">
+        {{ query.display.empty_text | default(value="Nothing to show yet.") }}
+        {% block empty %}{% endblock %}
+    </p>
+    {% else %}
+    {% block summary %}{% endblock %}
+    {% block results %}{% endblock %}
+    {% endif %}
+
+    {% if pager %}
+    {% include "gather/pager.html" %}
+    {% endif %}
+
+    {#
+        The auto-reload interval, in seconds.
+
+        `refresh_seconds` is the one value the kernel injects into a gather
+        template's context (crates/kernel/src/routes/gather.rs). It resolves
+        `?refresh=<seconds>` first, then the `gather_refresh_seconds` site
+        setting, and is left *undefined* when neither supplies a number — which
+        is why `default` is the right filter here and works: it substitutes for
+        an undefined value only. A configured `0` is defined, so it reaches the
+        `if` below as 0 and switches the refresh off rather than falling back to
+        the default of ten seconds.
+
+        Scoped to this file deliberately. Putting a reload timer in base.html
+        would reload the admin screens and every editing form on the site.
+    #}
+    {% set ng_refresh = refresh_seconds | default(value=10) %}
+    {% if ng_refresh > 0 %}
+    <p class="ng-refresh">Reloading every {{ ng_refresh }}s</p>
+    {% endif %}
+</div>
+
+<script>
+    (function () {
+        "use strict";
+
+        /*
+         * Timestamps in the viewer's own timezone.
+         *
+         * The daemon stores timestamptz and the gather hands the template the
+         * `_epoch` twin; Tera's `date` filter renders that as UTC, because the
+         * site has no timezone setting to render it as anything else. Rather
+         * than invent one, each cell carries its epoch and the browser — which
+         * definitively knows where it is — rewrites it. The server-rendered UTC
+         * stays as the no-JavaScript fallback, and the `title` keeps it
+         * reachable either way.
+         */
+        var stamps = document.querySelectorAll(".ng-page [data-ng-epoch]");
+        for (var i = 0; i < stamps.length; i++) {
+            var epoch = parseInt(stamps[i].getAttribute("data-ng-epoch"), 10);
+            if (!isFinite(epoch)) {
+                continue;
+            }
+            var when = new Date(epoch * 1000);
+            stamps[i].title = stamps[i].textContent.trim() + " UTC";
+            stamps[i].textContent = when.getFullYear()
+                + "-" + String(when.getMonth() + 1).padStart(2, "0")
+                + "-" + String(when.getDate()).padStart(2, "0")
+                + " " + String(when.getHours()).padStart(2, "0")
+                + ":" + String(when.getMinutes()).padStart(2, "0")
+                + (stamps[i].hasAttribute("data-ng-seconds")
+                    ? ":" + String(when.getSeconds()).padStart(2, "0")
+                    : "");
+        }
+
+        {% if ng_refresh > 0 %}
+        /*
+         * Auto-reload. A whole-page reload rather than a fetch-and-replace:
+         * the page number lives in the URL, so reloading keeps the reader on
+         * the page of the pager they were looking at.
+         *
+         * The `if` is Tera's, not JavaScript's: at an interval of 0 the timer
+         * is not emitted at all. A `setTimeout` guarded by a runtime `seconds >
+         * 0` would behave identically and would still put the words "reload
+         * every" into a page somebody switched reloading off on, which is the
+         * kind of thing that gets debugged for an hour.
+         */
+        window.setTimeout(function () {
+            window.location.reload();
+        }, {{ ng_refresh }} * 1000);
+        {% endif %}
+    })();
+</script>

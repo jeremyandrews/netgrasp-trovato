@@ -1,0 +1,76 @@
+{#
+    The event table, shared by all three event gathers: ng_event_log,
+    ng_event_security and ng_event_by_device.
+
+    Rows are `ng_event` records — flat, keyed by the physical column names of
+    ng_events. The event log's `row.fields is object` guard was always false and
+    its else-branch dutifully rendered a dash in every cell of every row: a full
+    page of well-formed nothing, with no error anywhere to say so. Nothing here
+    reaches for the Item shape.
+
+    ===========================================================================
+    Security flagging
+    ===========================================================================
+    A security event is flagged wherever it appears, not only on
+    /events/security. A spoof scrolling past unmarked in the main log is the
+    thing this page exists to prevent, and the reader should not have to know to
+    go looking on a second page.
+
+    The list below is the daemon's own idea of which event types are security
+    relevant, and it is now written in three places: here, in the
+    `ng_event_security` gather's `in` filter (002_netgrasp_gathers.sql), and in
+    netgrasp_core::model::SECURITY_EVENT_TYPES. A unit test in the plugin
+    asserts this file lists every one of them, the same way another asserts it
+    of the migration. Adding a type to the daemon and to none of the three is
+    the drift those tests exist to catch.
+#}
+{% set ng_security_types = ["arp_scan", "arp_spoof", "gratuitous_arp", "identity_change", "ip_conflict", "rogue_dhcp"] %}
+<div class="ng-table-scroll">
+    <table class="ng-table ng-event-table">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Event</th>
+                <th>Device</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            {% set ng_is_security = row.event_type and row.event_type in ng_security_types %}
+            <tr data-id="{{ row.id }}"{% if ng_is_security %} class="ng-row--security"{% endif %}>
+                {# The epoch twin, for the reason given in the device table;
+                   `data-ng-seconds` asks the page script to keep the seconds,
+                   which matter when reading a burst of events. #}
+                <td class="ng-mono ng-nowrap" {% if row.timestamp_epoch %}data-ng-epoch="{{ row.timestamp_epoch }}" data-ng-seconds{% endif %}>
+                    {%- if row.timestamp_epoch -%}
+                    {{ row.timestamp_epoch | date(format="%Y-%m-%d %H:%M:%S") }}
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                <td class="ng-event-type">
+                    {%- if ng_is_security %}<span class="ng-flag" aria-label="Security event">&#9888;&#65039;</span>{% endif -%}
+                    {{ row.event_type | default(value="unknown") }}
+                </td>
+
+                {#
+                    A gather reads one record type, so there is no device row to
+                    join a name out of here. The id links to that device's own
+                    event log, which is the route that exists for it.
+                #}
+                <td>
+                    {%- if row.device_id -%}
+                    <a class="ng-id-chip" href="/events/device?device={{ row.device_id }}"
+                       title="All events for device {{ row.device_id }}">#{{ row.device_id }}</a>
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                {# `details` is jsonb; json_encode keeps it one readable cell. #}
+                <td class="ng-details">
+                    {%- if row.details -%}{{ row.details | json_encode() }}{%- endif -%}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>

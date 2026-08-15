@@ -1,0 +1,15 @@
+{#
+    What is on the network right now. /devices/online
+
+    The site's front page: site_front_page points here, and the kernel's front
+    page handler redirects `/` to it (crates/kernel/src/routes/front.rs).
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}{% include "gather/netgrasp/device-summary.html" %}{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">Every device is idle or offline. <a href="/devices">See all devices</a>.</span>
+{% endblock %}
