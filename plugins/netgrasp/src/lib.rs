@@ -774,6 +774,42 @@ mod tests {
         );
     }
 
+    /// The auto-reload is two files agreeing on one attribute name: the chrome
+    /// writes `data-ng-refresh` onto the page element, and the static script
+    /// reads it. Rename it in one of them and the pages stop reloading with no
+    /// error anywhere — a wall display that quietly freezes is the worst failure
+    /// this feature has.
+    #[test]
+    fn the_chrome_and_the_script_agree_on_the_refresh_attribute() {
+        let chrome = include_str!("../../../templates/gather/netgrasp/page.html");
+        let script = include_str!("../../../static/js/netgrasp.js");
+
+        assert!(
+            chrome.contains("data-ng-refresh=\"{{ ng_refresh }}\""),
+            "the chrome no longer publishes the interval as data-ng-refresh"
+        );
+        assert!(
+            chrome.contains("{% set ng_refresh = 10 %}"),
+            "the chrome's default interval is no longer 10 seconds"
+        );
+        assert!(
+            script.contains("getAttribute(\"data-ng-refresh\")"),
+            "the script no longer reads data-ng-refresh"
+        );
+        assert!(
+            script.contains("\"refresh\""),
+            "the script no longer honours the ?refresh= override"
+        );
+        assert!(
+            chrome.contains("data-ng-refresh-label"),
+            "the chrome no longer carries the label the script fills in"
+        );
+        assert!(
+            script.contains("data-ng-refresh-label"),
+            "the script no longer fills in the interval label"
+        );
+    }
+
     /// The manifest's `db_tables` must name every table the plugin's SQL
     /// touches, or a structured call is denied at runtime with
     /// `table-not-declared`.

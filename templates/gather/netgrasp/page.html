@@ -2,9 +2,14 @@
     The shared chrome for every netgrasp gather page.
 
     All nine `gather/query--ng_*.html` templates extend this one. It owns the
-    heading, the empty state, the pager, the stylesheet and the two scripts, so
-    that the nine pages match each other by construction rather than by nine
-    people remembering to keep them the same.
+    heading, the empty state, the pager, the stylesheet, the script and the
+    auto-reload interval, so that the nine pages match each other by
+    construction rather than by nine people remembering to keep them the same.
+
+    Everything here is served out of the netgrasp repository's own `templates/`
+    and `static/` directories, appended to Trovato's `TEMPLATES_DIR` and
+    `STATIC_DIR` search paths. Nothing in this directory is copied into a
+    Trovato checkout and nothing here requires a change to one.
 
     ===========================================================================
     The row shape, which every child depends on
@@ -31,9 +36,39 @@
                    repeats it.
     - `empty`    — an optional extra hint under the gather's own empty text.
 #}
+{#
+    ===========================================================================
+    The auto-reload interval, in seconds. THIS LINE IS THE KNOB.
+    ===========================================================================
+    Ten seconds by default. `0` switches the reload off. A `?refresh=<seconds>`
+    query string overrides it for one page load, which is how an interval gets
+    tried, and switched off, without editing anything.
+
+    Why the default lives in a netgrasp template rather than in site
+    configuration: a gather content template is rendered in its own Tera context
+    holding `query`, `rows`, `filter_values` and `base_path`. The site context
+    that carries site configuration is injected into the *page* template around
+    this one, not into this one. The three routes that could carry a number in
+    here instead are all closed:
+
+      - `query.display` deserializes into a typed kernel struct
+        (`QueryDisplay`), so an extra key written into that jsonb by a netgrasp
+        migration is dropped rather than reaching the template.
+      - the site-wide setting a `refresh_seconds` context variable would read
+        does not exist in the kernel, and inventing one is a change to Trovato.
+      - reusing an existing typed field (`header`, `empty_text`) to carry an
+        integer is a lie in the schema.
+
+    So the honest netgrasp-only answer is a literal in netgrasp's own chrome,
+    which the operator owns: this file lives in the netgrasp checkout that the
+    deployment's TEMPLATES_DIR points at.
+#}
+{% set ng_refresh = 10 %}
+
 <link rel="stylesheet" href="/static/css/netgrasp.css">
 
-<div class="ng-page ng-page--{{ query.query_id }}" data-query-id="{{ query.query_id }}">
+<div class="ng-page ng-page--{{ query.query_id }}" data-query-id="{{ query.query_id }}"
+     data-ng-refresh="{{ ng_refresh }}">
     <h1 class="ng-page__title">{{ query.label }}</h1>
 
     {% if query.description %}
@@ -55,74 +90,25 @@
     {% endif %}
 
     {#
-        The auto-reload interval, in seconds.
+        Written by the script, not by Tera, and hidden until it is.
 
-        `refresh_seconds` is the one value the kernel injects into a gather
-        template's context (crates/kernel/src/routes/gather.rs). It resolves
-        `?refresh=<seconds>` first, then the `gather_refresh_seconds` site
-        setting, and is left *undefined* when neither supplies a number — which
-        is why `default` is the right filter here and works: it substitutes for
-        an undefined value only. A configured `0` is defined, so it reaches the
-        `if` below as 0 and switches the refresh off rather than falling back to
-        the default of ten seconds.
-
-        Scoped to this file deliberately. Putting a reload timer in base.html
-        would reload the admin screens and every editing form on the site.
+        The reload is a JavaScript feature: with scripting off there is no timer
+        to describe, so there must be no line claiming there is one. The
+        effective interval is also not knowable here, because `?refresh=` is
+        read off `location.search` — and a server-rendered "Reloading every 10s"
+        above a page a query string had set to 30, or switched off entirely, is
+        the kind of thing that gets debugged for an hour.
     #}
-    {% set ng_refresh = refresh_seconds | default(value=10) %}
-    {% if ng_refresh > 0 %}
-    <p class="ng-refresh">Reloading every {{ ng_refresh }}s</p>
-    {% endif %}
+    <p class="ng-refresh" data-ng-refresh-label hidden></p>
 </div>
 
-<script>
-    (function () {
-        "use strict";
+{#
+    The script is a static asset, not an inline block.
 
-        /*
-         * Timestamps in the viewer's own timezone.
-         *
-         * The daemon stores timestamptz and the gather hands the template the
-         * `_epoch` twin; Tera's `date` filter renders that as UTC, because the
-         * site has no timezone setting to render it as anything else. Rather
-         * than invent one, each cell carries its epoch and the browser — which
-         * definitively knows where it is — rewrites it. The server-rendered UTC
-         * stays as the no-JavaScript fallback, and the `title` keeps it
-         * reachable either way.
-         */
-        var stamps = document.querySelectorAll(".ng-page [data-ng-epoch]");
-        for (var i = 0; i < stamps.length; i++) {
-            var epoch = parseInt(stamps[i].getAttribute("data-ng-epoch"), 10);
-            if (!isFinite(epoch)) {
-                continue;
-            }
-            var when = new Date(epoch * 1000);
-            stamps[i].title = stamps[i].textContent.trim() + " UTC";
-            stamps[i].textContent = when.getFullYear()
-                + "-" + String(when.getMonth() + 1).padStart(2, "0")
-                + "-" + String(when.getDate()).padStart(2, "0")
-                + " " + String(when.getHours()).padStart(2, "0")
-                + ":" + String(when.getMinutes()).padStart(2, "0")
-                + (stamps[i].hasAttribute("data-ng-seconds")
-                    ? ":" + String(when.getSeconds()).padStart(2, "0")
-                    : "");
-        }
-
-        {% if ng_refresh > 0 %}
-        /*
-         * Auto-reload. A whole-page reload rather than a fetch-and-replace:
-         * the page number lives in the URL, so reloading keeps the reader on
-         * the page of the pager they were looking at.
-         *
-         * The `if` is Tera's, not JavaScript's: at an interval of 0 the timer
-         * is not emitted at all. A `setTimeout` guarded by a runtime `seconds >
-         * 0` would behave identically and would still put the words "reload
-         * every" into a page somebody switched reloading off on, which is the
-         * kind of thing that gets debugged for an hour.
-         */
-        window.setTimeout(function () {
-            window.location.reload();
-        }, {{ ng_refresh }} * 1000);
-        {% endif %}
-    })();
-</script>
+    It used to be inline, with Tera `{% if %}` interleaved through the
+    JavaScript to decide whether to emit a timer at all. Two languages arguing
+    over one control flow is hard to read and impossible to lint: the interval
+    is an attribute on the page element above, and everything that reads it is
+    plain JavaScript in a file the browser can cache.
+#}
+<script src="/static/js/netgrasp.js" defer></script>
