@@ -115,6 +115,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The host-in-the-loop test loads the module from the overlay, so the
+      # overlay has to exist before the suite runs. This is also the step that
+      # makes the test meet the module CI just built rather than a stale one — in
+      # the monorepo this test read a `netgrasp.wasm` committed to git, so it
+      # could pass against a module nobody had rebuilt in weeks.
+      - name: Build the overlay the integration test loads
+        run: scripts/build-overlay.sh
+
       # `pipefail` is not optional here: without it the step's exit status is
       # tee's, which is always 0, and a failing test suite reports green.
       - name: Tests
@@ -137,6 +145,19 @@ jobs:
             || { echo "::error::the daemon-schema test did not run"; exit 1; }
           grep -q "the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema ... ok" test.log \
             || { echo "::error::the schema drift check did not pass"; exit 1; }
+
+      # Same reasoning for the host-in-the-loop suite, which is the expensive one
+      # to lose: it is the only thing anywhere that runs the compiled module
+      # through a real kernel, and it arrived here from Trovato precisely so it
+      # would not be dropped when netgrasp left that tree.
+      - name: The host-in-the-loop test actually ran
+        run: |
+          grep -q "Running tests/sync_test.rs" test.log \
+            || { echo "::error::the integration test did not run"; exit 1; }
+          passed=$(grep -c '^test .* \.\.\. ok$' test.log)
+          echo "$passed tests passed"
+          grep -q "the_write_back_leaves_every_daemon_owned_column_untouched ... ok" test.log \
+            || { echo "::error::the column-discipline test did not pass"; exit 1; }
 
   # Every migration is applied to a real Postgres, in order, exactly as the kernel
   # applies them. A migration that only ever runs on a developer's machine is a

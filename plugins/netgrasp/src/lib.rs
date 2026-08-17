@@ -831,6 +831,37 @@ mod tests {
         }
     }
 
+    /// The SDK the module is built against and the kernel the integration test
+    /// drives must be the same revision of Trovato.
+    ///
+    /// They are two entries in the workspace manifest, and nothing else would
+    /// notice them drifting apart. A plugin compiled against one contract and
+    /// exercised against another is a test that proves nothing about what ships:
+    /// the module would be built against SDK types the running kernel no longer
+    /// has, and the test would pass anyway because it never sees the mismatch.
+    #[test]
+    fn the_sdk_and_the_test_kernel_pin_the_same_trovato() {
+        let manifest = include_str!("../../../Cargo.toml");
+        let revs: Vec<&str> = manifest
+            .lines()
+            .filter(|line| {
+                line.starts_with("trovato-sdk =") || line.starts_with("trovato-kernel =")
+            })
+            .filter_map(|line| line.split("rev = \"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+
+        assert_eq!(
+            revs.len(),
+            2,
+            "expected a pinned rev on both trovato-sdk and trovato-kernel, found {revs:?}"
+        );
+        assert_eq!(
+            revs[0], revs[1],
+            "trovato-sdk and trovato-kernel pin different Trovato revisions"
+        );
+    }
+
     /// The `ng_device_state` record type is declared over a VIEW, and the view
     /// lists its columns explicitly — `SELECT d.*` would freeze today's column
     /// list in at CREATE VIEW time and silently omit anything added later. So the

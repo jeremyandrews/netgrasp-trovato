@@ -47,6 +47,27 @@ trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "611
 
 netgrasp-core = { path = "crates/netgrasp-core" }
 
+# trovato-kernel — TEST ONLY, and pinned to the same revision as the SDK above.
+#
+# The host-in-the-loop test (plugins/netgrasp/tests/sync_test.rs) drives the real
+# module through the real TapDispatcher, ItemService and GatherService against a
+# real Postgres. There is no way to do that without the kernel, and no reason to
+# reimplement a fake one: a fake host is a fake answer to "does this plugin work".
+#
+# It is a DEV-dependency only, which is what keeps it harmless. Dev-dependencies
+# are not built for `--target wasm32-wasip1`, so the shipped module is unaffected
+# and the "builds standalone with no Trovato checkout" claim is untouched — the
+# kernel arrives the same way the SDK does, as a pinned git revision.
+#
+# The rev must equal the SDK's. A plugin tested against one kernel revision and
+# shipped against another is testing nothing; a test in src/lib.rs asserts the
+# two pins are the same string.
+trovato-kernel = { git = "https://github.com/jeremyandrews/trovato.git", rev = "611c1fb72a60cb8528b93db2c6ab40aa564bee39" }
+
+# Required only because `RequestServices::for_background` takes a `reqwest::Client`
+# — the kernel's signature, not a choice this repo makes.
+reqwest = "0.12"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
