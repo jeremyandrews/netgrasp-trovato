@@ -115,10 +115,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `pipefail` is not optional here: without it the step's exit status is
+      # tee's, which is always 0, and a failing test suite reports green.
       - name: Tests
         env:
           DATABASE_URL: postgres://trovato:trovato@localhost:5432/trovato
-        run: cargo test --workspace -- --nocapture 2>&1 | tee test.log
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee test-raw.log
+          # CARGO_TERM_COLOR=always means cargo's output carries ANSI escapes, so
+          # "Running tests/…" and "… ok" are not contiguous strings in the file.
+          # Strip them once here rather than writing escape-tolerant patterns.
+          sed -e 's/\x1b\[[0-9;]*m//g' test-raw.log > test.log
 
       # The schema test is the expensive one to lose silently: without a database
       # it does not skip, it fails — but a future `#[ignore]` or a renamed target
