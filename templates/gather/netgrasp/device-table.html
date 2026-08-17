@@ -79,23 +79,32 @@
                 <td class="ng-mono">{{ row.mac }}</td>
 
                 {#
-                    The owner cell can only show the uuid it has. A gather reads
-                    one record type, so there is no ng_people row to take a name
-                    from here — the link goes to that person's device list,
-                    which is the page that exists for them.
-                #}
-                {#
-                    The *last* group of the uuid, not the first. These ids are
-                    UUIDv7: the leading bytes are a timestamp, so two people
-                    created in the same millisecond — which is what happens when
-                    they are seeded together — share the first eight characters
-                    exactly and the chip distinguishes nothing. The final group
-                    is the random one. The full id is in the title either way.
+                    The owner's NAME, since 006_netgrasp_owner_names.sql: the
+                    record type is declared over a view that left-joins ng_people,
+                    so `owner_name` arrives on the row. It used to be a uuid chip,
+                    because a gather reads one record type and there was no
+                    ng_people row to take a name from.
+
+                    The chip is still the fallback, for the case the view cannot
+                    resolve: a device naming an owner whose mirror row is gone.
+                    Showing the id then is better than an empty cell — it is the
+                    only handle on a dangling reference anybody has.
+
+                    The chip shows the *last* group of the uuid, not the first.
+                    These ids are UUIDv7: the leading bytes are a timestamp, so
+                    two people created in the same millisecond — which is what
+                    happens when they are seeded together — share the first eight
+                    characters exactly and the chip distinguishes nothing. The
+                    final group is the random one. The full id is in the title
+                    either way.
                 #}
                 <td>
-                    {%- if row.owner_item_id -%}
+                    {%- if row.owner_name -%}
+                    <a href="/devices/owner?owner={{ row.owner_item_id }}"
+                       title="Person {{ row.owner_item_id }}">{{ row.owner_name }}</a>
+                    {%- elif row.owner_item_id -%}
                     <a class="ng-id-chip" href="/devices/owner?owner={{ row.owner_item_id }}"
-                       title="Person {{ row.owner_item_id }}">{{ row.owner_item_id | split(pat="-") | last }}</a>
+                       title="Person {{ row.owner_item_id }} has no mirror row">{{ row.owner_item_id | split(pat="-") | last }}</a>
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
                 </td>
 

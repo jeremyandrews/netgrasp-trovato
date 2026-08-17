@@ -6,19 +6,39 @@
     three devices arrives as three rows (G-NO-GATHER-AGGREGATION), which is why
     the gather sorts by owner: the repetition at least arrives adjacent.
 
-    `group_by` finishes the job in the template, turning those adjacent rows
-    into one card per person. It keys on `owner_item_id` — the physical column
-    name, because these are records — and the gather's `owner_id is_not_null`
-    filter is what guarantees every row has one to group on.
+    `unique` then `filter` finishes the job in the template: one card per distinct
+    owner, then that owner's devices picked back out of `rows`. Both key on
+    `owner_item_id` — the physical column name, because these are records — and
+    the gather's `owner_id is_not_null` filter is what guarantees every row has
+    one to key on.
 
-    The card shows a uuid where a name belongs for the same reason the device
-    table's owner column does: one gather reads one record type, and ng_people
-    is a different table. The name is one click away on the person's own page.
+    Keyed on the id and NOT on the name, deliberately, even though the name is
+    what the card shows: two people may share a name, and merging them into one
+    card would be a wrong answer to the only question this page asks.
+
+    ===========================================================================
+    Why not `group_by`, which is the obvious filter for this
+    ===========================================================================
+    Because it silently reorders the cards. `group_by` returns a map, and Tera
+    builds that on `serde_json::Map` with `preserve_order` off, so it is a
+    BTreeMap and iterating it yields the cards in UUID order — which for UUIDv7
+    means the order the people were created in, whatever the gather's ORDER BY
+    said. The sort by `owner_name` in 006_netgrasp_owner_names.sql had no effect
+    at all while this used `group_by`, and nothing pointed that out: the page
+    rendered, in a plausible-looking order that simply was not the one asked for.
+
+    `unique` preserves input order and hands back the whole first row of each
+    group, so the SQL sort survives and the name is on the row that heads the
+    card.
+
+    The name arrives as `owner_name`, from the view the `ng_device_state` record
+    type is declared over. The card used to show a uuid, because a gather reads
+    one record type and ng_people is a different table.
 #}
 {% extends "gather/netgrasp/page.html" %}
 
 {% block summary %}
-{% set ng_people = rows | group_by(attribute="owner_item_id") %}
+{% set ng_people = rows | unique(attribute="owner_item_id") %}
 <div class="ng-summary">
     <span class="ng-summary__item ng-summary__item--online">
         <span class="ng-summary__count">{{ ng_people | length }}</span>
@@ -35,15 +55,28 @@
 {% endblock %}
 
 {% block results %}
-{% set ng_home = rows | group_by(attribute="owner_item_id") %}
+{% set ng_home = rows | unique(attribute="owner_item_id") %}
 <ul class="ng-people">
-    {% for owner_id, devices in ng_home %}
+    {% for ng_owner in ng_home %}
+    {#
+        `ng_owner` is a device row that happens to be the first one this person
+        has on the page, so it carries their name and id. Their other devices are
+        picked back out of `rows` by the same id — every row on the page, not just
+        this card's, which is why the filter is against `rows` and not against
+        anything narrower.
+    #}
+    {% set devices = rows | filter(attribute="owner_item_id", value=ng_owner.owner_item_id) %}
     <li class="ng-person">
+        {# The uuid chip stays as the fallback for an owner with no mirror row,
+           for the reason device-table.html gives. #}
         <h2 class="ng-person__name">
-            {# The last uuid group, for the reason given in device-table.html:
-               these are UUIDv7 and the leading characters are a timestamp. #}
-            <a href="/devices/owner?owner={{ owner_id }}" title="Person {{ owner_id }}">
-                <span class="ng-id-chip">{{ owner_id | split(pat="-") | last }}</span>
+            <a href="/devices/owner?owner={{ ng_owner.owner_item_id }}"
+               title="Person {{ ng_owner.owner_item_id }}">
+                {%- if ng_owner.owner_name -%}
+                {{ ng_owner.owner_name }}
+                {%- else -%}
+                <span class="ng-id-chip">{{ ng_owner.owner_item_id | split(pat="-") | last }}</span>
+                {%- endif -%}
             </a>
         </h2>
         <p class="ng-person__meta">{{ devices | length }} device{{ devices | length | pluralize }} online</p>
