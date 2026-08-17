@@ -1,7 +1,11 @@
 name = "netgrasp"
 description = "Network monitoring: devices, people, events and presence from the netgrasp daemon"
-version = "1.0.0"
-api_version = "1.0"
+# `api_version` must equal the kernel's `KERNEL_API_VERSION`, which is (0, 99) at
+# the Trovato revision pinned in the workspace Cargo.toml. The kernel refuses to
+# load a module that disagrees, so this string and that `rev` move together; a
+# test in src/lib.rs asserts the pair has not drifted.
+version = "0.99.0"
+api_version = "0.99"
 default_enabled = false
 dependencies = []
 

@@ -749,6 +749,31 @@ mod tests {
         );
     }
 
+    /// The manifest's `api_version` must match the kernel this repo is pinned
+    /// to, or the module is refused at load with a version mismatch and no page
+    /// exists to debug.
+    ///
+    /// Checked against this crate's own version rather than against a constant
+    /// imported from the kernel, because the SDK does not export one: Trovato's
+    /// version and its `KERNEL_API_VERSION` move in lock-step by its own
+    /// versioning protocol, and the workspace here carries the same number as
+    /// the revision it pins. So bumping the pinned `rev` without bumping the
+    /// workspace version, or bumping the workspace version without editing the
+    /// manifest, both fail here.
+    #[test]
+    fn the_manifest_declares_the_pinned_kernels_api_version() {
+        let manifest = include_str!("../netgrasp.info.toml");
+        let (major, rest) = env!("CARGO_PKG_VERSION")
+            .split_once('.')
+            .unwrap_or_default();
+        let minor = rest.split('.').next().unwrap_or_default();
+        let expected = format!("api_version = \"{major}.{minor}\"");
+        assert!(
+            manifest.contains(&expected),
+            "manifest does not declare {expected}"
+        );
+    }
+
     /// The manifest's `db_tables` must name every table the plugin's SQL
     /// touches, or a structured call is denied at runtime with
     /// `table-not-declared`.
