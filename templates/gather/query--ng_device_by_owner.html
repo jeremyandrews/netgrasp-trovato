@@ -1,18 +1,32 @@
 {#
     One person's devices. /devices/owner?owner=<person item id>
 
-    Reached by clicking an owner chip in any device table, or a person on
-    /people. The owner is a uuid because that is what ng_devices stores and a
-    record gather cannot join ng_people to turn it into a name.
+    Reached by clicking an owner in any device table, or a person on /people. The
+    URL carries a uuid because that is what ng_devices stores, but the heading
+    names the person: `owner_name` is on every row, from the view the record type
+    is declared over (006_netgrasp_owner_names.sql).
 #}
 {% extends "gather/netgrasp/page.html" %}
 
 {# An unresolved `url_arg` filter is dropped rather than matched as empty, so
    this route with no `owner` returns every device rather than none. #}
+{#
+    The name comes off a row rather than out of the filter value, which holds only
+    the id. `rows | first` is safe here because this block renders only when there
+    are rows — page.html puts the empty state in the other branch — and the chip
+    covers the owner whose mirror row is missing.
+#}
 {% block summary %}
 <p class="ng-page__description">
     {%- if filter_values.owner -%}
+    {%- set ng_owner = rows | first -%}
+    {%- if ng_owner.owner_name -%}
+    Devices belonging to <strong>{{ ng_owner.owner_name }}</strong>
+    <a class="ng-id-chip" href="/item/{{ filter_values.owner }}"
+       title="Person {{ filter_values.owner }}">{{ filter_values.owner | split(pat="-") | last }}</a>
+    {%- else -%}
     Owner <span class="ng-id-chip">{{ filter_values.owner }}</span>
+    {%- endif %}
     <a href="/people">All people</a>
     {%- else -%}
     No person given, so this is every device. Pick somebody on

@@ -25,7 +25,18 @@ BEGIN;
 -- Clear the previous run
 -- ---------------------------------------------------------------------------
 -- The demo owns the 02:00:5e:… locally-administered range, which no real NIC
--- uses. Events, presence, location and IP history cascade off ng_devices.
+-- uses.
+--
+-- Events go FIRST, and by join, because ng_events.device_id is
+-- `ON DELETE SET NULL` and not `ON DELETE CASCADE` — deleting a device orphans
+-- its events rather than removing them, which is right for a daemon (the log
+-- outlives the device) and wrong for a seed. Deleting the devices first left
+-- nineteen orphans behind and the next run added nineteen more: /events showed
+-- 38 rows, half of them with an em dash in the Device column, and this file's
+-- own claim to be idempotent was false. Presence, location and IP history really
+-- do cascade, so they need no statement here.
+DELETE FROM ng_events
+WHERE device_id IN (SELECT id FROM ng_devices WHERE mac LIKE '02:00:5e:%');
 DELETE FROM ng_devices WHERE mac LIKE '02:00:5e:%';
 DELETE FROM ng_people  WHERE item_id IN (
     '5eed0000-0000-4000-8000-000000000001',
@@ -163,6 +174,18 @@ INSERT INTO ng_devices (
      NOW() - INTERVAL '520 days', NOW() - INTERVAL '10 seconds', TRUE, NULL, 'Rack',
      'clean', NULL),
 
+    -- An owner id with NO ng_people row behind it. A real state, not a broken
+    -- seed: ng_people is written by the plugin's person taps, so a device keeps
+    -- naming an owner whose Item has since been deleted. It is the branch where
+    -- the owner view resolves no name and the templates fall back to the id chip,
+    -- and it is also the row that proves the view's join is a LEFT one — an inner
+    -- join would delete this device from every device page.
+    ('02:00:5e:00:00:0d', NULL, NULL, FALSE, TRUE, '5eed0000-0000-4000-8000-00000000dead',
+     'orphan-owner-laptop', 'dhcp', 0.70, 'orphan-owner-laptop', NULL, 'Lenovo', 'laptop', 0.80, 'Linux',
+     'online', '10.0.1.77', NULL, 'eth0',
+     NOW() - INTERVAL '60 days', NOW() - INTERVAL '2 minutes', FALSE, 'Office AP', 'Office',
+     'clean', NULL),
+
     -- An unexpected arrival, still on the network. This is the row the security
     -- page's events point at.
     ('02:00:5e:00:00:0c', NULL, NULL, FALSE, TRUE, NULL,
@@ -282,6 +305,10 @@ UNION ALL SELECT 'devices online',   count(*) FROM ng_devices WHERE state = 'onl
 UNION ALL SELECT 'devices idle',     count(*) FROM ng_devices WHERE state = 'idle'
 UNION ALL SELECT 'devices offline',  count(*) FROM ng_devices WHERE state = 'offline'
 UNION ALL SELECT 'devices owned',    count(*) FROM ng_devices WHERE owner_item_id IS NOT NULL
+-- Owned and resolvable to a name, which is what the device pages show. The gap
+-- between this and the line above is the dangling-owner row on purpose.
+UNION ALL SELECT 'devices named',    count(*) FROM ng_devices d
+    JOIN ng_people p ON p.item_id = d.owner_item_id
 UNION ALL SELECT 'events',           count(*) FROM ng_events
 UNION ALL SELECT 'security events',  count(*) FROM ng_events
     WHERE event_type IN ('arp_scan', 'arp_spoof', 'gratuitous_arp', 'identity_change', 'ip_conflict', 'rogue_dhcp')

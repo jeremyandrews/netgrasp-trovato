@@ -59,6 +59,7 @@ files = [
     "migrations/003_netgrasp_roles_tiles.sql",
     "migrations/004_netgrasp_security_event_types.sql",
     "migrations/005_netgrasp_web_interface.sql",
+    "migrations/006_netgrasp_owner_names.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -92,6 +93,16 @@ db_tables = [
     "ng_location_history",
     "ng_ip_history",
     "ng_state",
+    # A view, not a table: ng_devices left-joined to the person who owns each row,
+    # created by 006_netgrasp_owner_names.sql. It is here because the kernel
+    # admits a record type only if its backing relation is in this allowlist
+    # (RecordTypeRegistry::admit), and `ng_device_state` is declared over the
+    # view so the device pages can print an owner's name instead of a uuid.
+    #
+    # The plugin itself never reads it. Every statement in netgrasp_core::queries
+    # names ng_devices directly, which is what keeps the write path addressing the
+    # real table.
+    "ng_devices_with_owner",
 ]
 
 # Lightweight record types (P11g / D-53).
@@ -116,9 +127,16 @@ db_tables = [
 # admin's listing is `ORDER BY {changed_column}`
 # (crates/kernel/src/routes/admin_record_type.rs), so a defaulted declaration is
 # not a cosmetic wrong label but a 500 on every record list.
+#
+# `table` is the VIEW, not ng_devices. The view is ng_devices left-joined to
+# ng_people, so a row arrives carrying `owner_name` and the device pages can name
+# an owner instead of printing a uuid; a gather reads one record type and could
+# not otherwise reach a second table (006_netgrasp_owner_names.sql argues the
+# alternatives). Read-only either way — the record tier has no write surface, and
+# the plugin's own statements name ng_devices directly.
 [[record_types]]
 name = "ng_device_state"
-table = "ng_devices"
+table = "ng_devices_with_owner"
 id_column = "id"
 title_column = "mac"
 created_column = "first_seen_at_epoch"
@@ -141,6 +159,9 @@ first_seen = "first_seen_at_epoch"
 last_seen = "last_seen_at_epoch"
 display_name = "display_name"
 owner_id = "owner_item_id"
+# Exposed so a gather can sort and filter on it, which is what lets
+# /who-is-home order its cards by name rather than by uuid.
+owner_name = "owner_name"
 hidden = "hidden"
 notify = "notify"
 item_id = "trovato_item_id"

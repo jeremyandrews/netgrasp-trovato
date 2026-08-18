@@ -831,6 +831,65 @@ mod tests {
         }
     }
 
+    /// The `ng_device_state` record type is declared over a VIEW, and the view
+    /// lists its columns explicitly — `SELECT d.*` would freeze today's column
+    /// list in at CREATE VIEW time and silently omit anything added later. So the
+    /// two lists have to agree, and nothing in the running system says so: a
+    /// field mapped to a column the view does not select renders as a blank cell
+    /// with no error anywhere.
+    ///
+    /// Read out of the manifest rather than restated, so adding a field is what
+    /// this notices, not editing the test.
+    #[test]
+    fn the_owner_view_carries_every_column_the_record_type_maps() {
+        let manifest = include_str!("../netgrasp.info.toml");
+        let view = include_str!("../migrations/006_netgrasp_owner_names.sql");
+
+        // The record type's backing relation is the view, not the daemon's table.
+        assert!(
+            manifest.contains("table = \"ng_devices_with_owner\""),
+            "ng_device_state is no longer declared over the owner view"
+        );
+        assert!(
+            manifest.contains("\"ng_devices_with_owner\""),
+            "the view is not in db_tables, so the kernel will refuse the record type"
+        );
+
+        // Every physical column on the right-hand side of the ng_device_state
+        // field map: the block after its [record_types.fields] header, up to the
+        // next TOML section. Sections are the boundary, not blank lines and not
+        // comments — the map has both inside it.
+        let fields: String = manifest
+            .split("[record_types.fields]")
+            .nth(1)
+            .unwrap_or_default()
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut checked = 0;
+        for line in fields.lines() {
+            let Some((_, column)) = line.split_once('=') else {
+                continue;
+            };
+            let column = column.trim().trim_matches('"');
+            if column.is_empty() {
+                continue;
+            }
+            assert!(
+                view.contains(&format!("d.{column},")) || column == "owner_name",
+                "the view does not select {column}, which ng_device_state maps"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 19,
+            "only {checked} mapped columns were checked; the field map failed to parse"
+        );
+    }
+
     // --- presave coercion -------------------------------------------------
 
     #[test]
