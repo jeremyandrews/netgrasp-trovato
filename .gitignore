@@ -1,0 +1,10 @@
+target/
+Cargo.lock
+.DS_Store
+*.swp
+*.swo
+
+# Built by scripts/build-overlay.sh: the wasm plus the manifest and migrations
+# beside it, laid out the way `trovato plugin install` expects. Derived from
+# target/, so it is not source.
+overlay/

@@ -1,5 +1,11 @@
--- Netgrasp as a web interface: navigation, landing page, refresh interval.
+-- Netgrasp as a web interface: navigation and landing page.
 -- Forward-only; no rollback.
+--
+-- Everything below is a row in a kernel table that the kernel already reads.
+-- There is no netgrasp-specific code in Trovato behind any of it: the three
+-- capabilities this migration leans on (permission-filtered navigation, a front
+-- page that accepts any internal path, and a canonical URL per gather) are
+-- general kernel features that any plugin can use the same way.
 
 -- ---------------------------------------------------------------------------
 -- The anonymous role can see the device pages
@@ -8,14 +14,9 @@
 -- render for a logged-out visitor, and always did. What the anonymous role did
 -- not hold was `view netgrasp devices`, the permission every tap_menu entry
 -- declares, so the navigation to those same pages was invisible to the only
--- visitor this installation has.
---
--- Two halves had to meet for the menu to appear, and this is the second. The
--- first is in the kernel: `inject_site_context` used to hide any menu entry
--- that declared *any* permission, rather than hiding it from viewers who do not
--- *hold* it, so no grant on any role could have revealed these links. That is
--- fixed in crates/kernel/src/routes/helpers.rs. This grant is what the fixed
--- check now finds.
+-- visitor this installation has. The kernel shows a plugin menu entry to a
+-- viewer who *holds* the permission it declares (`MenuRegistry::root_menus_for`),
+-- so granting it is all that is needed.
 --
 -- The assumption behind granting it to anonymous rather than to a role: this is
 -- a localhost home dashboard with no login. To put the whole thing behind a
@@ -32,9 +33,8 @@ ON CONFLICT DO NOTHING;
 -- 002_netgrasp_gathers.sql aliased nine friendly paths onto /gather/<query_id>,
 -- but told the queries nothing about it. The alias is resolved by middleware
 -- *before* the handler runs, so a request for /events arrives as
--- /gather/ng_event_log and the handler falls back to that as its `base_path`
--- (crates/kernel/src/routes/gather.rs). Two things follow, and both were
--- visible on the live pages:
+-- /gather/ng_event_log and the handler falls back to that as its `base_path`.
+-- Two things follow, and both were visible on the live pages:
 --
 --   1. Every pager link pointed at /gather/ng_event_log?page=2. It works, and
 --      it moves the reader off the URL they arrived on, permanently, at the
@@ -43,7 +43,7 @@ ON CONFLICT DO NOTHING;
 --      the navigation could never mark the page you were on as active.
 --
 -- `canonical_url` is the field that already exists for exactly this
--- (QueryDisplay::canonical_url); no gather in this plugin had ever set it. The
+-- (`QueryDisplay::canonical_url`); no gather in this plugin had ever set it. The
 -- values below are the aliases from 002, unchanged.
 UPDATE gather_query SET
     display = jsonb_set(display, '{canonical_url}', to_jsonb(c.url)),
@@ -64,29 +64,19 @@ WHERE gather_query.query_id = c.query_id;
 -- ---------------------------------------------------------------------------
 -- The landing page is the online devices
 -- ---------------------------------------------------------------------------
--- `site_front_page` accepts any internal path as of the front-page handler
--- change in crates/kernel/src/routes/front.rs: a value that is not
--- `/item/<uuid>` is served as a redirect. Before that it was read as an item
--- path only, so setting it to a gather route saved cleanly and did nothing.
+-- `site_front_page` takes any internal path: the kernel renders `/item/<uuid>`
+-- inline and redirects `/` to anything else, so a gather route is a legal front
+-- page with no change to the front-page handler.
 --
 -- DO NOTHING, not DO UPDATE: a plugin migration claiming an unset front page is
 -- reasonable for an appliance, and overwriting an operator's choice on every
--- re-run is not.
+-- re-run is not. An operator who wants a different landing page sets this key,
+-- and re-running the migration leaves their value alone.
+--
+-- Not in scope for this row: the auto-reload interval. It is not site
+-- configuration, because the site context is not injected into a gather content
+-- template — it is a literal in templates/gather/netgrasp/page.html, overridable
+-- per page load with `?refresh=<seconds>`. That file explains why at length.
 INSERT INTO site_config (key, value, updated)
 VALUES ('site_front_page', '"/devices/online"'::jsonb, NOW())
-ON CONFLICT (key) DO NOTHING;
-
--- ---------------------------------------------------------------------------
--- The auto-reload interval
--- ---------------------------------------------------------------------------
--- One named setting, in seconds, read by every gather page's template through
--- the `refresh_seconds` value the kernel resolves for it. `0` switches the
--- reload off — the template then emits no timer at all rather than arming one
--- it has to cancel — and `?refresh=<seconds>` overrides it for a single page
--- load, which is how it gets tested without editing configuration.
---
--- Ten seconds is also what the templates default to when this row is absent, so
--- deleting it changes nothing; the row exists to be edited.
-INSERT INTO site_config (key, value, updated)
-VALUES ('gather_refresh_seconds', '10'::jsonb, NOW())
 ON CONFLICT (key) DO NOTHING;

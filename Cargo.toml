@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/netgrasp-core",
+    "plugins/netgrasp",
+]
+
+[workspace.package]
+version = "0.99.0"
+edition = "2024"
+license = "MIT"
+authors = ["Jeremiah Andrews"]
+repository = "https://github.com/jeremyandrews/netgrasp-trovato"
+
+[workspace.dependencies]
+# trovato-sdk — the Trovato plugin contract, consumed as an EXTERNAL git
+# dependency. This repository builds with no Trovato checkout anywhere on disk,
+# which is the whole point of it existing separately: netgrasp *builds on*
+# Trovato and never modifies it. Do not reintroduce `path = "../../crates/
+# plugin-sdk"`; that path dependency is what made this plugin unbuildable
+# outside the monorepo it was split from.
+#
+# PINNED BY `rev`, deliberately, to a commit on the public Trovato repository's
+# main branch. The triple that has to move together:
+#
+#   rev                 611c1fb72a60cb8528b93db2c6ab40aa564bee39
+#   Trovato version     0.99.0
+#   KERNEL_API_VERSION  (0, 99)
+#
+# `api_version` in plugins/netgrasp/netgrasp.info.toml must equal the kernel's
+# KERNEL_API_VERSION or the kernel refuses to load the module. A test in the
+# plugin asserts the manifest still says 0.99; when this rev moves, that
+# assertion is what tells you the manifest has to move with it.
+#
+# BUMP PROTOCOL: move this rev only to a commit that is (a) pushed to
+# jeremyandrews/trovato main, and (b) a deliberate checkpoint. Record the new
+# triple above, rerun `cargo build --target wasm32-wasip1 --release`, and
+# reinstall the plugin against a kernel built from the same rev.
+#
+# `trovato-sdk` pulls `trovato-sdk-macros` through a repo-relative path
+# dependency; cargo resolves that inside the git checkout, so only this one
+# entry is needed.
+#
+# Unlike the Ritrovo precedent, this points at the PUBLIC Trovato repository, so
+# no private-repository access is needed to build this repo.
+trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "611c1fb72a60cb8528b93db2c6ab40aa564bee39" }
+
+netgrasp-core = { path = "crates/netgrasp-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Test-only, for crates/netgrasp-core's daemon-schema test. Dev-dependencies are
+# not built for `--target wasm32-wasip1`, so the "every netgrasp-core dependency
+# must be wasm-safe" rule is unaffected by anything listed here.
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Mirrors Trovato's own lint policy. A plugin traps on panic and the kernel can
+# only report that it trapped, so `unwrap` and `expect` are denied rather than
+# warned: an unwrap here is an error message nobody ever gets to read.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+manual_let_else = "warn"
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"

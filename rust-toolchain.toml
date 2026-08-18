@@ -1,0 +1,23 @@
+# Pinned Rust toolchain for the Netgrasp Trovato integration.
+#
+# WHY THIS FILE EXISTS
+# This repository is an EXTERNAL plugin: it compiles to WebAssembly against the
+# Trovato SDK with no Trovato checkout on disk. Nothing else here would install
+# the `wasm32-wasip1` target, so a fresh clone would fail at the build step with
+# a bare "target may not be installed". rustup honors this file automatically,
+# so cloning and building provisions the target instead of documenting it.
+#
+# The channel mirrors the pin in the Trovato kernel's own rust-toolchain.toml.
+# Keeping the two in lock-step means the plugin and the kernel see the same
+# compiler and the same clippy lint set, which matters because the workspace
+# denies `unwrap_used` and `expect_used` and lint availability is
+# toolchain-dependent.
+#
+# BUMP PROTOCOL: bump this only alongside Trovato's pin, and rerun
+#   cargo build --target wasm32-wasip1 --release
+# before committing.
+
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip1"]

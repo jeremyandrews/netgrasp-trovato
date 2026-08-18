@@ -1,6 +1,6 @@
 [package]
 name = "netgrasp"
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Network monitoring plugin for Trovato"
@@ -12,7 +12,10 @@ workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-trovato-sdk = { path = "../../crates/plugin-sdk" }
-netgrasp-core = { path = "../../crates/netgrasp-core" }
+# The SDK is an EXTERNAL git dependency pinned in the workspace manifest — see
+# the bump protocol there. It is deliberately not a path into a Trovato
+# checkout: this repo builds with no Trovato source on disk.
+trovato-sdk = { workspace = true }
+netgrasp-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

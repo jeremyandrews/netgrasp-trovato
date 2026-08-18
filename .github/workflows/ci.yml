@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pin lives in rust-toolchain.toml, which rustup honours and
+  # dtolnay/rust-toolchain does not read. The two must move together; the bump
+  # protocol is in that file.
+  RUST_TOOLCHAIN: 1.96.0
+
+jobs:
+  # The claim this repository exists to make: it builds with no Trovato checkout
+  # on disk. Nothing in this job clones Trovato — cargo fetches the SDK from the
+  # pinned public git revision, which is the only Trovato that appears anywhere.
+  standalone:
+    name: builds standalone (no Trovato checkout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (native)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (wasm)
+        run: cargo clippy --target wasm32-wasip1 --release -- -D warnings
+
+      - name: Build the module
+        run: cargo build --target wasm32-wasip1 --release
+
+      # A cdylib that compiled but exports nothing is a plugin the kernel loads
+      # and never calls. The size floor catches an empty or truncated artifact.
+      - name: The module is real
+        run: |
+          wasm=target/wasm32-wasip1/release/netgrasp.wasm
+          test -f "$wasm"
+          size=$(wc -c <"$wasm")
+          echo "$size bytes"
+          test "$size" -gt 100000
+
+      # The manifest's capability allowlist has to match the artifact's actual
+      # host imports, in both directions. See the script for why this is derived
+      # from the binary rather than from the source.
+      - name: Declared capabilities match the module
+        run: scripts/check-host-imports.sh
+
+      - name: The overlay assembles
+        run: |
+          scripts/build-overlay.sh --no-build
+          test -f overlay/plugins/netgrasp/netgrasp.wasm
+          test -f overlay/plugins/netgrasp/netgrasp.info.toml
+          test -f overlay/plugins/netgrasp/migrations/001_netgrasp_schema.sql
+
+      - name: Documentation builds
+        run: cargo doc --no-deps
+
+      # Belt and braces on the repository's whole reason for being: no manifest
+      # here may reach into a Trovato checkout by path.
+      # Comments are stripped first: the workspace manifest documents the banned
+      # form in prose, and a check that cannot tell a warning from a violation is
+      # a check that gets deleted the first time it cries wolf.
+      - name: No path dependency on Trovato
+        run: |
+          offenders=$(find . -name Cargo.toml -not -path './target/*' \
+            -exec grep -Hn 'path *= *"\.\./\.\./crates' {} + \
+            | grep -v ':[0-9]*:#' || true)
+          if [ -n "$offenders" ]; then
+            echo "$offenders"
+            echo "::error::a crate depends on a Trovato checkout by path"
+            exit 1
+          fi
+
+  # netgrasp-core's daemon-schema test applies the daemon's real DDL to a scratch
+  # schema and runs the plugin's real statements against it, so it needs Postgres.
+  # It is the one test on this side that ever meets the schema the plugin is
+  # written for, so it must not be allowed to quietly not run.
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: trovato
+          POSTGRES_PASSWORD: trovato
+          POSTGRES_DB: trovato
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trovato"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `pipefail` is not optional here: without it the step's exit status is
+      # tee's, which is always 0, and a failing test suite reports green.
+      - name: Tests
+        env:
+          DATABASE_URL: postgres://trovato:trovato@localhost:5432/trovato
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee test-raw.log
+          # CARGO_TERM_COLOR=always means cargo's output carries ANSI escapes, so
+          # "Running tests/…" and "… ok" are not contiguous strings in the file.
+          # Strip them once here rather than writing escape-tolerant patterns.
+          sed -e 's/\x1b\[[0-9;]*m//g' test-raw.log > test.log
+
+      # The schema test is the expensive one to lose silently: without a database
+      # it does not skip, it fails — but a future `#[ignore]` or a renamed target
+      # would drop it from the run with everything still green. Assert it ran.
+      - name: The daemon-schema test actually ran
+        run: |
+          grep -q "Running tests/daemon_schema_test.rs" test.log \
+            || { echo "::error::the daemon-schema test did not run"; exit 1; }
+          grep -q "the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema ... ok" test.log \
+            || { echo "::error::the schema drift check did not pass"; exit 1; }
+
+  # Every migration is applied to a real Postgres, in order, exactly as the kernel
+  # applies them. A migration that only ever runs on a developer's machine is a
+  # migration that breaks on somebody else's install.
+  migrations:
+    name: migrations apply
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: trovato
+          POSTGRES_PASSWORD: trovato
+          POSTGRES_DB: netgrasp_migrations
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trovato"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # 001 is the only migration that stands alone: the later four write into
+      # kernel tables (gather_query, role_permissions, site_config, url_alias)
+      # that only a Trovato install creates. So this job proves the daemon schema
+      # migration is valid SQL against a real server, and the full ordered run is
+      # what scripts/serve-demo.sh exercises against a Trovato database.
+      - name: The schema migration applies, twice
+        env:
+          PGPASSWORD: trovato
+        run: |
+          psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -f plugins/netgrasp/migrations/001_netgrasp_schema.sql
+          # It is guarded and forward-only, so a second run must be a no-op
+          # rather than an error: the kernel reruns nothing, but an operator
+          # replaying a migration should not be punished for it.
+          psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -f plugins/netgrasp/migrations/001_netgrasp_schema.sql
+          psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -c "select count(*) from ng_devices"
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
