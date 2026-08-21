@@ -208,3 +208,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shellcheck
         run: shellcheck scripts/*.sh
+
+      # The tests scan docker-compose.demo.yml as text, which catches a wrong
+      # search path but not a mis-indented one. `config` is the parser itself,
+      # and it also resolves the YAML anchors the file uses to keep the cron key
+      # in one place.
+      - name: The demo compose file parses
+        run: docker compose -f docker-compose.demo.yml config >/dev/null

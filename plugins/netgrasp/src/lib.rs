@@ -1050,16 +1050,49 @@ mod tests {
         include_str!("../../../docker/overlay.Dockerfile")
     }
 
-    /// The value of a `KEY: value` line in the compose file, first occurrence.
+    /// The value of a `KEY: value` line in the compose file, first occurrence,
+    /// with a YAML anchor declaration (`&name `) stripped off the front.
     fn compose_value(key: &str) -> String {
-        demo_compose()
+        let raw = demo_compose()
             .lines()
             .map(str::trim)
             .find_map(|line| line.strip_prefix(&format!("{key}:")))
             .unwrap_or_else(|| panic!("docker-compose.demo.yml declares no {key}"))
-            .trim()
-            .trim_matches('"')
-            .to_string()
+            .trim();
+        let raw = match raw.strip_prefix('&') {
+            Some(rest) => rest.split_once(' ').map(|(_, v)| v).unwrap_or(""),
+            None => raw,
+        };
+        raw.trim().trim_matches('"').to_string()
+    }
+
+    /// One service's block, from its `  name:` key to the next key at that
+    /// indent. Indentation is the whole structure of a compose file, so the
+    /// block ends at the first line that starts a sibling key rather than at the
+    /// first blank line or comment.
+    fn compose_service(name: &str) -> String {
+        let mut lines = demo_compose()
+            .lines()
+            .skip_while(|line| line.trim_end() != format!("  {name}:"));
+        let key = lines
+            .next()
+            .unwrap_or_else(|| panic!("docker-compose.demo.yml has no {name} service"));
+        std::iter::once(key)
+            .chain(lines.take_while(|line| {
+                line.trim().is_empty() || line.starts_with("   ") || line.starts_with("  #")
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every volume mount in the compose file, as written.
+    fn compose_mounts() -> Vec<&'static str> {
+        demo_compose()
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter(|value| value.contains(":/netgrasp/"))
+            .collect()
     }
 
     /// The three search paths are the whole integration seam, and the demo is
@@ -1152,10 +1185,12 @@ mod tests {
                 "the demo does not mount {mount}"
             );
         }
-        assert!(
-            !demo_compose().contains("/netgrasp/plugins\n") && !demo_compose().contains(":rw"),
-            "a netgrasp directory is mounted writable"
-        );
+        for mount in compose_mounts() {
+            assert!(
+                mount.ends_with(":ro"),
+                "{mount} mounts a netgrasp directory writable"
+            );
+        }
     }
 
     /// The demo's overlay is built by the repository's own script, not by a
@@ -1197,13 +1232,9 @@ mod tests {
                 || demo_compose().contains("seed-demo.sql"),
             "the demo never loads scripts/seed-demo.sql"
         );
-        let seed = demo_compose()
-            .split("\n  seed:")
-            .nth(1)
-            .expect("the demo has no seed service");
-        let seed = seed.split("\n  ").next().unwrap_or(seed);
+        let seed = compose_service("seed");
         assert!(
-            seed.contains("service_healthy"),
+            seed.contains("trovato:") && seed.contains("condition: service_healthy"),
             "the seed does not wait for the kernel to be healthy"
         );
     }
@@ -1226,4 +1257,46 @@ mod tests {
         );
     }
 
+    /// The kernel gates the whole site behind a first-run wizard. Until
+    /// `site_config` carries `installed`, `check_installation` answers every path
+    /// except `/health`, `/static` and `/install` with a 303 to the installer, so
+    /// a demo can install the plugin, seed it, serve it, come up healthy, and
+    /// still show a stranger a form instead of a single netgrasp page. Observed,
+    /// not hypothetical: that is exactly what the first version of this compose
+    /// file did.
+    ///
+    /// The wizard is two form POSTs. A demo that promises one command has to make
+    /// them, and then has to check that a real page serves afterwards, because a
+    /// 303 to /install is a 200 as far as any health check is concerned.
+    #[test]
+    fn the_demo_walks_through_the_kernels_first_run_wizard() {
+        let first_run = include_str!("../../../scripts/first-run.sh");
+        for step in ["/install/admin", "/install/site"] {
+            assert!(
+                first_run.contains(step),
+                "scripts/first-run.sh does not post {step}"
+            );
+        }
+        assert!(
+            first_run.contains("/devices/online"),
+            "scripts/first-run.sh never checks that a netgrasp page serves"
+        );
+        assert!(
+            demo_compose().contains("scripts/first-run.sh"),
+            "the demo never completes the kernel's first-run wizard"
+        );
+    }
+
+    /// Two ways to serve this repository, one first run. `serve-demo.sh` drives a
+    /// Trovato checkout and the compose file drives the published image, and both
+    /// meet the same wizard for the same reason. Sharing the script is what keeps
+    /// the developer path from being the one nobody notices has broken.
+    #[test]
+    fn both_ways_of_serving_this_repository_share_one_first_run_script() {
+        let serve_demo = include_str!("../../../scripts/serve-demo.sh");
+        assert!(
+            serve_demo.contains("first-run.sh"),
+            "scripts/serve-demo.sh does not run scripts/first-run.sh"
+        );
+    }
 }
