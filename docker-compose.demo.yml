@@ -1,0 +1,244 @@
+# The self-standing netgrasp demo: one command, nothing installed but Docker.
+#
+#   docker compose -f docker-compose.demo.yml up
+#
+# then open http://localhost:3101/, which redirects to /devices/online.
+#
+# WHAT THIS IS
+# Every other way of running netgrasp needs something: a Trovato checkout built
+# from source (scripts/serve-demo.sh), a Rust toolchain, a LAN with the daemon
+# watching it. This needs none of them. It runs the PUBLISHED Trovato kernel
+# image, mounts netgrasp into it, and loads a seed so the pages have rows
+# without a daemon anywhere.
+#
+# HOW IT KEEPS THE ONE ARCHITECTURAL RULE
+# Nothing is copied into Trovato. The kernel image is used exactly as published,
+# and netgrasp arrives through Trovato's three colon-separated search paths:
+#
+#   PLUGINS_DIR    /app/plugins   : /netgrasp/plugins
+#   TEMPLATES_DIR  /app/templates : /netgrasp/templates
+#   STATIC_DIR     /app/static    : /netgrasp/static
+#
+# A later entry wins a name collision, so netgrasp's directory is second in each
+# and all three of its mounts are read-only. That is the whole integration seam.
+#
+# THE ORDER A BRAND NEW DATABASE NEEDS
+# Three states, and they only work in this order:
+#
+#   1. the kernel's own migrations. `trovato plugin install` runs them itself
+#      before it touches the plugin, so no separate step exists for them.
+#   2. the plugin's migrations, and the plugin enabled.
+#   3. the demo rows. These have to come last: `item.type` is a foreign key onto
+#      `item_type`, the plugin's Item types are registered from tap_item_info
+#      when the kernel next boots, and the seed inserts two ng_person Items. Run
+#      it before that boot and its first INSERT fails.
+#
+# So the kernel installs and then serves in one command, and the seed waits for
+# the health check, which the kernel only answers after it has registered the
+# types.
+#
+# AND ONE MORE STATE, WHICH IS NOT NETGRASP'S
+# A fresh Trovato is gated on its own first-run wizard: until `site_config` says
+# `installed`, every path except /health, /static and /install answers 303 to the
+# installer. All of the above can be right and a visitor still sees a setup form.
+# The `installer` service below walks that wizard with two form POSTs, which is
+# what makes this one command rather than one command and a form to fill in.
+#
+# EXPECTED NOISE ON FIRST RUN
+# `plugin install` offers to copy a freshly built wasm over the one in the plugin
+# directory, looking for it under a target/ next to the plugins directory. There
+# is none inside the container, so it prints
+#   Warning: WASM not found at '/netgrasp/target/wasm32-wasip1/release/netgrasp.wasm'
+# and carries on with the module the overlay already contains, which is the one
+# that was just built. Nothing is wrong.
+
+name: netgrasp-demo
+
+services:
+  # ---------------------------------------------------------------------------
+  # The overlay: build it, then hand it to the kernel through a volume.
+  # ---------------------------------------------------------------------------
+  # This is the only service that needs a compiler, and it is a one-shot: it
+  # copies the assembled plugin directory into a named volume and exits. The
+  # kernel mounts that volume read-only.
+  #
+  # `docker compose up` builds this image if it does not exist. Add --build to
+  # rebuild it after editing the plugin.
+  overlay:
+    build:
+      context: .
+      dockerfile: docker/overlay.Dockerfile
+    command:
+      - /bin/sh
+      - -c
+      - 'rm -rf /out/netgrasp && cp -a /overlay/netgrasp /out/netgrasp && ls -l /out/netgrasp'
+    volumes:
+      - netgrasp-overlay:/out
+
+  postgres:
+    # The image Trovato's own compose file uses. The kernel's embedding migration
+    # runs CREATE EXTENSION vector when the extension is available, so this is
+    # the server its migrations are exercised against.
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: trovato
+      POSTGRES_PASSWORD: trovato
+      POSTGRES_DB: netgrasp
+    volumes:
+      - netgrasp-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trovato -d netgrasp"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # ---------------------------------------------------------------------------
+  # The kernel: published image, netgrasp mounted, install then serve.
+  # ---------------------------------------------------------------------------
+  # The image tag is pinned rather than `latest` on purpose. A demo whose kernel
+  # moves underneath it breaks with no commit to blame. The plugin's manifest
+  # declares api_version 0.99 and the kernel accepts a plugin whose minor is at
+  # or below its own, so it loads here unchanged; a test asserts that pair.
+  trovato:
+    image: ghcr.io/jeremyandrews/trovato:0.101.0
+    command:
+      - /bin/sh
+      - -c
+      - './trovato plugin install netgrasp && exec ./trovato serve'
+    environment:
+      DATABASE_URL: postgres://trovato:trovato@postgres:5432/netgrasp
+      REDIS_URL: redis://redis:6379
+      PORT: "3000"
+      # tap_cron fires only on POST /cron/<CRON_KEY>. This is a localhost demo,
+      # so the key is a fixed string; anything reachable from elsewhere wants a
+      # real secret here and in the poker below.
+      CRON_KEY: &cron_key netgrasp-demo-cron
+      RUST_LOG: info,sqlx=warn,tower_http=warn
+      PLUGINS_DIR: /app/plugins:/netgrasp/plugins
+      TEMPLATES_DIR: /app/templates:/netgrasp/templates
+      STATIC_DIR: /app/static:/netgrasp/static
+    volumes:
+      - netgrasp-overlay:/netgrasp/plugins:ro
+      - ./templates:/netgrasp/templates:ro
+      - ./static:/netgrasp/static:ro
+    # Bound to the loopback address by default: the demo grants the anonymous
+    # role read access to every page and ships a known admin password, which is
+    # the right posture for a dashboard on a desk and the wrong one for anything
+    # a network can reach. NETGRASP_BIND=0.0.0.0 if you mean it.
+    ports:
+      - "${NETGRASP_BIND:-127.0.0.1}:${NETGRASP_PORT:-3101}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      overlay:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # The demo rows.
+  # ---------------------------------------------------------------------------
+  # scripts/seed-demo.sql, the same file scripts/serve-demo.sh loads with --seed,
+  # run through the postgres image's psql so the host needs no client. It is
+  # idempotent, so a second `up` replaces its rows rather than doubling them, and
+  # it prints a row count per listing when it finishes: that output is what a
+  # page's row count is checked against.
+  seed:
+    image: pgvector/pgvector:pg17
+    environment:
+      PGPASSWORD: trovato
+    command:
+      - psql
+      - -h
+      - postgres
+      - -U
+      - trovato
+      - -d
+      - netgrasp
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /netgrasp/scripts/seed-demo.sql
+    volumes:
+      - ./scripts:/netgrasp/scripts:ro
+    depends_on:
+      trovato:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # The first run, and the only end-to-end check in the file.
+  # ---------------------------------------------------------------------------
+  # Trovato's installer, completed from a script: two form POSTs, no CSRF token,
+  # idempotent once the site is installed. scripts/first-run.sh is the same file
+  # scripts/serve-demo.sh runs against a source checkout, so the two ways of
+  # serving this repository cannot drift into one of them being broken.
+  #
+  # It finishes by asking for /devices/online and failing on anything but a 200,
+  # which is the one check the health check cannot make: a 303 to /install is a
+  # healthy response. When this container exits 0 the demo is genuinely up.
+  installer:
+    image: curlimages/curl:8.11.1
+    environment:
+      NETGRASP_ADMIN_USER: admin
+      NETGRASP_ADMIN_EMAIL: admin@example.invalid
+      # Twelve characters minimum, the kernel's rule. Fine for a demo bound to
+      # localhost; change it, or delete the anonymous grant (see the README),
+      # before this is reachable from anywhere else.
+      NETGRASP_ADMIN_PASSWORD: netgrasp-demo-password
+      NETGRASP_SITE_NAME: Netgrasp
+    command:
+      - /bin/sh
+      - /netgrasp/scripts/first-run.sh
+      - http://trovato:3000
+    volumes:
+      - ./scripts:/netgrasp/scripts:ro
+    depends_on:
+      trovato:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # The clock.
+  # ---------------------------------------------------------------------------
+  # The kernel runs no internal scheduler: tap_cron fires only when something
+  # POSTs the cron route, and the queue worker handles a bounded batch per call.
+  # Without this container the pages still render, because the seed writes clean
+  # rows, but nothing ever mints a device Item, prunes an expired event or clears
+  # a dirty row again. `|| true` so one failed poke against a restarting kernel
+  # does not end the loop for good.
+  cron:
+    image: curlimages/curl:8.11.1
+    environment:
+      # The same key the kernel was given, by anchor, so the two cannot drift into
+      # a poker that gets a 404 nobody looks at.
+      CRON_KEY: *cron_key
+      NETGRASP_CRON_INTERVAL: "60"
+    command:
+      - /bin/sh
+      - -c
+      - 'while true; do curl -fsS -m 30 -X POST "http://trovato:3000/cron/$$CRON_KEY" >/dev/null || true; sleep "$$NETGRASP_CRON_INTERVAL"; done'
+    depends_on:
+      trovato:
+        condition: service_healthy
+
+volumes:
+  # The assembled plugin directory: netgrasp.wasm, netgrasp.info.toml,
+  # migrations/. A volume rather than a bind mount so the build writes nothing to
+  # the host and a clone stays clean.
+  netgrasp-overlay:
+  netgrasp-postgres:

@@ -1,0 +1,11 @@
+# The overlay build stage does `COPY . .`, and target/ is gigabytes of build
+# artifacts that the container rebuilds from scratch anyway. Sending it as build
+# context costs minutes and buys nothing.
+target/
+overlay/
+
+.git/
+.github/
+.DS_Store
+*.swp
+*.swo

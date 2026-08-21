@@ -17,6 +17,11 @@
 #   --seed   also load scripts/seed-demo.sql, so the pages have rows. Needs psql.
 #   --bg     background the server and wait for /health rather than blocking.
 #
+# It also walks Trovato's first-run wizard (scripts/first-run.sh), because a
+# fresh install answers every page with a redirect to /install until somebody
+# does. docker-compose.demo.yml runs the same script against the published
+# kernel image, with no Trovato checkout at all.
+#
 # Environment:
 #   DATABASE_URL   defaults to postgres://trovato:trovato@localhost:5432/netgrasp
 #   REDIS_URL      defaults to redis://127.0.0.1:6379
@@ -30,7 +35,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ $# -lt 1 ]; then
-    sed -n '2,30p' "${BASH_SOURCE[0]}" >&2
+    sed -n '2,31p' "${BASH_SOURCE[0]}" >&2
     exit 1
 fi
 
@@ -69,38 +74,49 @@ if [ ! -x "$TROVATO_BIN" ]; then
     (cd "$TROVATO" && cargo build --release --bin trovato)
 fi
 
-# `trovato plugin install` runs the plugin's migrations, which need the kernel's
-# own tables to exist. The kernel migrates on startup, so on a brand new database
-# the server has to come up once before the plugin can be installed. Doing it in
-# this order — serve, install, serve — is why this is a script and not three
-# lines in a README.
-echo "==> kernel migrations (brief startup)"
-"$TROVATO_BIN" serve >/dev/null 2>&1 &
-boot=$!
-for _ in $(seq 1 60); do
-    if curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
-kill "$boot" 2>/dev/null || true
-wait "$boot" 2>/dev/null || true
+# Start the server in the background and wait for /health. The caller stops it.
+boot_server() {
+    "$TROVATO_BIN" serve >/dev/null 2>&1 &
+    BOOT_PID=$!
+    for _ in $(seq 1 60); do
+        if curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    echo "error: the server did not become healthy on port $PORT" >&2
+    return 1
+}
 
+stop_server() {
+    kill "$BOOT_PID" 2>/dev/null || true
+    wait "$BOOT_PID" 2>/dev/null || true
+}
+
+# `trovato plugin install` runs the plugin's migrations, which need the kernel's
+# own tables to exist. It applies the kernel's own migrations first, so nothing
+# has to boot the server to get them: install can go straight at a brand new
+# database.
 echo "==> installing the netgrasp plugin"
 "$TROVATO_BIN" plugin install netgrasp
 
+# Now a startup with the plugin enabled, which is where two things happen that
+# nothing else does:
+#
+#   * the kernel registers the plugin's Item types (ng_device, ng_person) from
+#     tap_item_info. `item.type` is a foreign key onto `item_type`, so the seed's
+#     ng_person INSERTs fail before this;
+#   * Trovato's first-run wizard can be completed. Until it is, every path except
+#     /health, /static and /install answers 303 to /install, so every netgrasp
+#     page would be an installer form.
+#
+# Doing it in this order (install, boot, seed, serve) is why this is a script
+# and not four lines in a README.
+echo "==> first run"
+boot_server
+"$ROOT/scripts/first-run.sh" "http://localhost:$PORT"
+stop_server
+
 if [ "$SEED" = "1" ]; then
     echo "==> seeding demo rows"
-    # The plugin registers its Item types (ng_device, ng_person) from tap_item_info
-    # at startup, and the seed inserts Items of those types — so the seed has to
-    # run after the server has been up once with the plugin enabled, which the
-    # startup above has now done.
-    "$TROVATO_BIN" serve >/dev/null 2>&1 &
-    boot=$!
-    for _ in $(seq 1 60); do
-        if curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then break; fi
-        sleep 1
-    done
-    kill "$boot" 2>/dev/null || true
-    wait "$boot" 2>/dev/null || true
     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$ROOT/scripts/seed-demo.sql"
 fi
 

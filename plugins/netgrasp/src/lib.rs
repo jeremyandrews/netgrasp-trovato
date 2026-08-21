@@ -1028,4 +1028,275 @@ mod tests {
     fn the_retention_default_the_plugin_uses_is_the_ninety_days_the_daemon_keeps() {
         assert_eq!(netgrasp_core::retention::DEFAULT_RETENTION_DAYS, 90);
     }
+
+    // --- the self-standing demo -------------------------------------------
+    //
+    // `docker-compose.demo.yml` is the only path into this repository that needs
+    // nothing but Docker: no Rust on the host, no Trovato checkout, no daemon and
+    // no LAN. Nothing in the compose file is checked by a compiler, so a typo in a
+    // search path is a demo that silently serves Trovato's own pages instead of
+    // netgrasp's. These tests are what notices.
+
+    /// The compose file, read as text.
+    ///
+    /// Scanned rather than parsed: a YAML parser would be a dependency added to
+    /// a plugin whose whole point is a small wasm artifact, and every claim below
+    /// is about a literal string an operator can also see by eye.
+    fn demo_compose() -> &'static str {
+        include_str!("../../../docker-compose.demo.yml")
+    }
+
+    fn demo_overlay_dockerfile() -> &'static str {
+        include_str!("../../../docker/overlay.Dockerfile")
+    }
+
+    /// The value of a `KEY: value` line in the compose file, first occurrence,
+    /// with a YAML anchor declaration (`&name `) stripped off the front.
+    fn compose_value(key: &str) -> String {
+        let raw = demo_compose()
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .unwrap_or_else(|| panic!("docker-compose.demo.yml declares no {key}"))
+            .trim();
+        let raw = match raw.strip_prefix('&') {
+            Some(rest) => rest.split_once(' ').map(|(_, v)| v).unwrap_or(""),
+            None => raw,
+        };
+        raw.trim().trim_matches('"').to_string()
+    }
+
+    /// One service's block, from its `  name:` key to the next key at that
+    /// indent. Indentation is the whole structure of a compose file, so the
+    /// block ends at the first line that starts a sibling key rather than at the
+    /// first blank line or comment.
+    fn compose_service(name: &str) -> String {
+        let mut lines = demo_compose()
+            .lines()
+            .skip_while(|line| line.trim_end() != format!("  {name}:"));
+        let key = lines
+            .next()
+            .unwrap_or_else(|| panic!("docker-compose.demo.yml has no {name} service"));
+        std::iter::once(key)
+            .chain(lines.take_while(|line| {
+                line.trim().is_empty() || line.starts_with("   ") || line.starts_with("  #")
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every volume mount in the compose file, as written.
+    fn compose_mounts() -> Vec<&'static str> {
+        demo_compose()
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter(|value| value.contains(":/netgrasp/"))
+            .collect()
+    }
+
+    /// The three search paths are the whole integration seam, and the demo is
+    /// the one place they are written down as a deployment rather than as prose.
+    /// Each must EXTEND the image's own directory rather than replace it (a
+    /// lone `/netgrasp/templates` hides every Trovato base template and every
+    /// page 500s), and netgrasp's directory must come LAST, because a later
+    /// entry is the one that wins a name collision.
+    #[test]
+    fn the_demo_extends_each_of_the_three_search_paths_and_wins_the_collision() {
+        for (var, dir) in [
+            ("PLUGINS_DIR", "plugins"),
+            ("TEMPLATES_DIR", "templates"),
+            ("STATIC_DIR", "static"),
+        ] {
+            let value = compose_value(var);
+            assert_eq!(
+                value,
+                format!("/app/{dir}:/netgrasp/{dir}"),
+                "{var} must extend the image's /app/{dir} and put netgrasp's directory last"
+            );
+        }
+    }
+
+    /// The kernel the demo runs is a PINNED published release, and the manifest
+    /// must be loadable by it.
+    ///
+    /// The kernel's rule (`PluginInfo::check_api_compatibility`) is plugin major
+    /// == kernel major and plugin minor <= kernel minor, so this repository's
+    /// `0.99` manifest runs unchanged on a `0.101` kernel. That is a fact worth
+    /// pinning rather than rediscovering: the sibling test above ties
+    /// `api_version` to this workspace's version, and without this one nothing
+    /// says the released kernel in the demo can still load it.
+    ///
+    /// `latest` is rejected on purpose. A demo whose kernel changes underneath
+    /// it is a demo that breaks with no commit to blame.
+    #[test]
+    fn the_demo_kernel_is_a_pinned_release_that_can_load_this_manifest() {
+        let image = demo_compose()
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("image: ghcr.io/jeremyandrews/trovato:"))
+            .expect("docker-compose.demo.yml runs no ghcr.io/jeremyandrews/trovato image")
+            .trim();
+
+        assert!(
+            image != "latest" && image != "nightly",
+            "the demo kernel must be a pinned version, not '{image}'"
+        );
+
+        let mut kernel = image.split('.');
+        let kernel_major: u32 = kernel.next().unwrap().parse().expect("kernel major");
+        let kernel_minor: u32 = kernel.next().unwrap().parse().expect("kernel minor");
+
+        let manifest = include_str!("../netgrasp.info.toml");
+        let declared = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("api_version = "))
+            .expect("the manifest declares no api_version")
+            .trim()
+            .trim_matches('"');
+        let mut plugin = declared.split('.');
+        let plugin_major: u32 = plugin.next().unwrap().parse().expect("plugin major");
+        let plugin_minor: u32 = plugin.next().unwrap().parse().expect("plugin minor");
+
+        assert_eq!(
+            plugin_major, kernel_major,
+            "api_version {declared} cannot load on kernel {image}: major mismatch"
+        );
+        assert!(
+            plugin_minor <= kernel_minor,
+            "api_version {declared} needs a newer kernel than {image}"
+        );
+    }
+
+    /// Nothing in this repository is copied into Trovato, and the demo is where
+    /// that rule is easiest to break: a writable mount is one `plugin install`
+    /// away from the kernel copying a build artifact into it. All three of
+    /// netgrasp's contributions are mounted read-only, and the assertion is
+    /// per-mount rather than a count so a fourth mount cannot arrive unnoticed.
+    #[test]
+    fn the_demo_mounts_every_netgrasp_directory_read_only() {
+        for mount in [
+            "netgrasp-overlay:/netgrasp/plugins:ro",
+            "./templates:/netgrasp/templates:ro",
+            "./static:/netgrasp/static:ro",
+        ] {
+            assert!(
+                demo_compose().contains(mount),
+                "the demo does not mount {mount}"
+            );
+        }
+        for mount in compose_mounts() {
+            assert!(
+                mount.ends_with(":ro"),
+                "{mount} mounts a netgrasp directory writable"
+            );
+        }
+    }
+
+    /// The demo's overlay is built by the repository's own script, not by a
+    /// second copy of its logic inside a Dockerfile. `build-overlay.sh` is where
+    /// the layout `trovato plugin install` expects is decided, and it is also
+    /// what runs `check-host-imports.sh` on the artifact it just assembled.
+    /// A Dockerfile that ran `cargo build` and `cp` itself would drop that check
+    /// and drift the layout.
+    #[test]
+    fn the_demo_builds_its_overlay_with_the_repositorys_own_script() {
+        assert!(
+            demo_overlay_dockerfile().contains("scripts/build-overlay.sh"),
+            "docker/overlay.Dockerfile does not call scripts/build-overlay.sh"
+        );
+        assert!(
+            !demo_overlay_dockerfile().contains("cargo build"),
+            "docker/overlay.Dockerfile reimplements the build instead of calling the script"
+        );
+    }
+
+    /// A brand new database has to be walked through three states in order:
+    /// the kernel's own migrations, then the plugin's, then the demo rows. The
+    /// kernel migrates from `plugin install` and registers the plugin's Item
+    /// types when it next boots, and `item.type` is a foreign key onto
+    /// `item_type`, so a seed that runs before that boot fails on its first
+    /// `ng_person` INSERT.
+    ///
+    /// Install-then-serve in one command, and a seed that waits for the health
+    /// check, is what orders those three states. Both halves are asserted
+    /// because losing either one is a demo that comes up empty or not at all.
+    #[test]
+    fn the_demo_installs_the_plugin_before_it_serves_and_seeds_after_it_is_healthy() {
+        assert!(
+            demo_compose().contains("./trovato plugin install netgrasp && exec ./trovato serve"),
+            "the demo kernel does not install the plugin before serving"
+        );
+        assert!(
+            demo_compose().contains("scripts/seed-demo.sql")
+                || demo_compose().contains("seed-demo.sql"),
+            "the demo never loads scripts/seed-demo.sql"
+        );
+        let seed = compose_service("seed");
+        assert!(
+            seed.contains("trovato:") && seed.contains("condition: service_healthy"),
+            "the seed does not wait for the kernel to be healthy"
+        );
+    }
+
+    /// The kernel runs no scheduler: `tap_cron` fires only when something POSTs
+    /// `/cron/<CRON_KEY>`. Without a poker the demo still serves every page,
+    /// the seed writes `sync_state = 'clean'`, but nothing ever mints a device
+    /// Item, prunes an expired event or clears a dirty row again, which is half
+    /// of what the plugin does. The poker must use the same key the kernel is
+    /// given, or every poke is a 404 nobody looks at.
+    #[test]
+    fn the_demo_pokes_the_cron_route_with_the_key_the_kernel_was_given() {
+        assert!(
+            demo_compose().contains("/cron/$$CRON_KEY"),
+            "the demo has no cron poker, so tap_cron never fires"
+        );
+        assert!(
+            compose_value("CRON_KEY").len() > 3,
+            "the demo sets no CRON_KEY for the poker to use"
+        );
+    }
+
+    /// The kernel gates the whole site behind a first-run wizard. Until
+    /// `site_config` carries `installed`, `check_installation` answers every path
+    /// except `/health`, `/static` and `/install` with a 303 to the installer, so
+    /// a demo can install the plugin, seed it, serve it, come up healthy, and
+    /// still show a stranger a form instead of a single netgrasp page. Observed,
+    /// not hypothetical: that is exactly what the first version of this compose
+    /// file did.
+    ///
+    /// The wizard is two form POSTs. A demo that promises one command has to make
+    /// them, and then has to check that a real page serves afterwards, because a
+    /// 303 to /install is a 200 as far as any health check is concerned.
+    #[test]
+    fn the_demo_walks_through_the_kernels_first_run_wizard() {
+        let first_run = include_str!("../../../scripts/first-run.sh");
+        for step in ["/install/admin", "/install/site"] {
+            assert!(
+                first_run.contains(step),
+                "scripts/first-run.sh does not post {step}"
+            );
+        }
+        assert!(
+            first_run.contains("/devices/online"),
+            "scripts/first-run.sh never checks that a netgrasp page serves"
+        );
+        assert!(
+            demo_compose().contains("scripts/first-run.sh"),
+            "the demo never completes the kernel's first-run wizard"
+        );
+    }
+
+    /// Two ways to serve this repository, one first run. `serve-demo.sh` drives a
+    /// Trovato checkout and the compose file drives the published image, and both
+    /// meet the same wizard for the same reason. Sharing the script is what keeps
+    /// the developer path from being the one nobody notices has broken.
+    #[test]
+    fn both_ways_of_serving_this_repository_share_one_first_run_script() {
+        let serve_demo = include_str!("../../../scripts/serve-demo.sh");
+        assert!(
+            serve_demo.contains("first-run.sh"),
+            "scripts/serve-demo.sh does not run scripts/first-run.sh"
+        );
+    }
 }
