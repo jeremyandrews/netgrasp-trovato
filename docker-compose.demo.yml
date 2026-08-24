@@ -108,7 +108,7 @@ services:
   # declares api_version 0.99 and the kernel accepts a plugin whose minor is at
   # or below its own, so it loads here unchanged; a test asserts that pair.
   trovato:
-    image: ghcr.io/jeremyandrews/trovato:0.101.0
+    image: ghcr.io/jeremyandrews/trovato:0.102.0
     command:
       - /bin/sh
       - -c
