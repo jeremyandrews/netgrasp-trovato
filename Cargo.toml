@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.99.0"
+version = "0.102.0"
 edition = "2024"
 license = "MIT"
 authors = ["Jeremiah Andrews"]
@@ -23,14 +23,15 @@ repository = "https://github.com/jeremyandrews/netgrasp-trovato"
 # PINNED BY `rev`, deliberately, to a commit on the public Trovato repository's
 # main branch. The triple that has to move together:
 #
-#   rev                 611c1fb72a60cb8528b93db2c6ab40aa564bee39
-#   Trovato version     0.99.0
-#   KERNEL_API_VERSION  (0, 99)
+#   rev                 ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74
+#   Trovato version     0.102.0
+#   KERNEL_API_VERSION  (0, 102)
 #
 # `api_version` in plugins/netgrasp/netgrasp.info.toml must equal the kernel's
 # KERNEL_API_VERSION or the kernel refuses to load the module. A test in the
-# plugin asserts the manifest still says 0.99; when this rev moves, that
-# assertion is what tells you the manifest has to move with it.
+# plugin derives the expected `api_version` from this workspace's own version, so
+# the workspace bump above is what carries the manifest with it; when this rev
+# moves and the version does not, that assertion is what tells you.
 #
 # BUMP PROTOCOL: move this rev only to a commit that is (a) pushed to
 # jeremyandrews/trovato main, and (b) a deliberate checkpoint. Record the new
@@ -43,7 +44,7 @@ repository = "https://github.com/jeremyandrews/netgrasp-trovato"
 #
 # Unlike the Ritrovo precedent, this points at the PUBLIC Trovato repository, so
 # no private-repository access is needed to build this repo.
-trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "611c1fb72a60cb8528b93db2c6ab40aa564bee39" }
+trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74" }
 
 netgrasp-core = { path = "crates/netgrasp-core" }
 
@@ -62,7 +63,7 @@ netgrasp-core = { path = "crates/netgrasp-core" }
 # The rev must equal the SDK's. A plugin tested against one kernel revision and
 # shipped against another is testing nothing; a test in src/lib.rs asserts the
 # two pins are the same string.
-trovato-kernel = { git = "https://github.com/jeremyandrews/trovato.git", rev = "611c1fb72a60cb8528b93db2c6ab40aa564bee39" }
+trovato-kernel = { git = "https://github.com/jeremyandrews/trovato.git", rev = "ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74" }
 
 # Required only because `RequestServices::for_background` takes a `reqwest::Client`
 # — the kernel's signature, not a choice this repo makes.
