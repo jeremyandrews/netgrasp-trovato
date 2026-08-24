@@ -11,6 +11,9 @@
 //!
 //! - [`model`] — the domain rows ([`model::DeviceRow`], [`model::PersonFields`],
 //!   [`model::Span`], [`model::EventRow`]).
+//! - [`assist`] — what the three AI-assistant scopes decide without a host:
+//!   how an instruction names a device or a person, whether a tool's arguments
+//!   make sense, what a snapshot reads like, and what a proposal card says.
 //! - [`columns`] — the three disjoint column sets that make "the two writers
 //!   never collide" a checkable property rather than a promise.
 //! - [`queries`] — every statement the plugin issues against the daemon's
@@ -31,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assist;
 pub mod columns;
 pub mod error;
 pub mod model;

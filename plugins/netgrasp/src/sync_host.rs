@@ -150,7 +150,7 @@ fn sync_one(row: &DeviceRow) -> CoreResult<SyncAction> {
 }
 
 /// Load an Item, mapping "no such Item" to `None`.
-fn load_item(id: &str) -> CoreResult<Option<Value>> {
+pub fn load_item(id: &str) -> CoreResult<Option<Value>> {
     match item_host::get_item(id) {
         Ok(Value::Null) => Ok(None),
         Ok(v) => Ok(Some(v)),
@@ -165,7 +165,7 @@ fn load_item(id: &str) -> CoreResult<Option<Value>> {
 /// (`status: 0`) is deliberately *not* done — a device the daemon just found
 /// should appear in the lists immediately, and an admin hides it with the
 /// `hidden` field rather than by unpublishing.
-fn create_device_item(mac: &str, title: &str) -> CoreResult<String> {
+pub fn create_device_item(mac: &str, title: &str) -> CoreResult<String> {
     let payload = json!({
         "type": DEVICE_TYPE,
         "title": title,
@@ -199,7 +199,7 @@ fn refresh_title(item_id: &str, title: &str) -> CoreResult<()> {
 /// Writes `trovato_item_id` only — a link-owned column, so this touches neither
 /// the daemon's nor the user's set. The two ids are different types and both
 /// casts matter: the Item id is a uuid, the device id is a bigint.
-fn link_item(device_id: i64, item_id: &str) -> CoreResult<()> {
+pub fn link_item(device_id: i64, item_id: &str) -> CoreResult<()> {
     exec(
         queries::UPDATE_LINK_ITEM,
         &[json!(item_id), json!(device_id)],

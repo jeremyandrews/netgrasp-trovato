@@ -295,6 +295,66 @@ The `ng_` prefix is not renamed.
 
 ---
 
+### Decision 9 — the assistant scopes are three, and every write is a proposal
+
+Trovato 0.102 lets a plugin declare what can be configured **by conversation**:
+`tap_assistant_scopes` says what, `tap_assistant_context` describes one of them,
+and `tap_assistant_tool` answers the model's tool calls. Netgrasp declares three
+scopes and no more, and the count is the decision.
+
+- `netgrasp_device` (`id_kind: Item`, `ng_device`) — one device: its owner, its
+  name, its notes, its two flags.
+- `netgrasp_person` (`id_kind: Item`, `ng_person`) — one person: their name,
+  notes and notification settings, the devices that are theirs, and deleting them.
+- `netgrasp_network` (`id_kind: None`) — everything: who owns what, who is home,
+  and the tidying-up that spans more than one thing.
+
+A fourth scope per gather page was considered and rejected: a scope is a *thing
+being configured*, and `/events/security` is a view of the same network the third
+scope already is. Three scopes with overlapping tools beat eight with the same
+tools split up, because the model picks the scope by URL and the person picks the
+URL by what they are looking at.
+
+**Every write is a proposal.** That is the kernel's design and not this plugin's,
+but two consequences are the plugin's:
+
+1. A write tool is dispatched with `mode: Describe` first, and **must change
+   nothing** in that mode. Netgrasp's Describe branches do the same reads the
+   Execute branches do — resolve the device, resolve the person, count the
+   devices in the way — and then return a sentence. A host-in-the-loop test
+   asserts a Describe leaves `ng_devices` and the Item byte-identical.
+2. The sentence is the whole basis on which somebody clicks Apply, so every one
+   of them names the device by its display name **and** its MAC, names the
+   person, and states the value being replaced: *"Assign Amazon tablet
+   (02:00:5e:00:00:04) to Jamie (currently Arlo)"*. `netgrasp_core::assist` builds
+   those strings and is exhaustively tested without a database.
+
+**A device write may have to mint an Item first.** `write_back_device` addresses
+the row by `trovato_item_id`, and only a `dirty` row ever gets an Item from the
+cron sync — so a device that has been `clean` since before the plugin existed, or
+that the demo seed created, has no Item and a naive write would update zero rows
+and report success. Every device write therefore resolves the row, mints the Item
+the way `sync_one` does when there is none, and says so on the card ("This also
+creates its Trovato item"). It is the first thing this feature got wrong in
+testing and the reason that test exists.
+
+**Nothing an assistant does writes `sync_state`.** The two statements that write
+it are both in `sync_host.rs` and neither is reachable from a tool, so Decision
+4's termination argument is untouched: an applied proposal produces a `clean` row
+the next sync pass does not select. A test asserts a following cron tick examines
+zero rows.
+
+**The permission is checked twice, and the two checks disagree by design.** The
+kernel gates opening a conversation on `administer netgrasp` (or `administer
+site`, which it treats as a superuser). Every tool checks `administer netgrasp`
+again at the moment of the call, because a conversation outlives the request that
+opened it. The host's `current-user-has-permission` has no `administer site`
+bypass, so those two checks are not the same check —
+`G-USER-API-NO-ADMIN-BYPASS` in `FRICTION.md` says so, and a site granting the
+permission for real is the answer until the kernel's is.
+
+---
+
 ## What is not in this build
 
 - **No kernel modification.** Every friction item is reported, not fixed
@@ -307,3 +367,6 @@ The `ng_` prefix is not renamed.
   specified in `netgrasp_core::columns::USER_OWNED` and enforced by test, so
   the daemon-side check is a bounded follow-up rather than an open question.
 - **No enrichment / UniFi, no arrival-departure notification** (CLOSE 16), **no iOS.**
+- **No assistant scope over the event log.** Events are read-only and high volume:
+  there is nothing to configure, and the network scope's `device_history` already
+  puts a device's events in front of the model.

@@ -71,6 +71,20 @@
      data-ng-refresh="{{ ng_refresh }}">
     <h1 class="ng-page__title">{{ query.label }}</h1>
 
+    {#
+        The network assistant, on every listing page.
+
+        `assistant/launcher.html` is the KERNEL's partial, reached through the
+        same TEMPLATES_DIR search path this file is served from, and it renders
+        nothing at all unless the site has the assistant switched on. The device
+        and person Item pages carry their own launchers already: the kernel adds
+        one automatically for every scope whose `item_types` names the type,
+        which is what `netgrasp_device` and `netgrasp_person` declare.
+    #}
+    {% set scope = "netgrasp_network" %}
+    {% set assistant_label = "Ask about the network" %}
+    {% include "assistant/launcher.html" ignore missing %}
+
     {% if query.description %}
     <p class="ng-page__description">{{ query.description }}</p>
     {% endif %}
