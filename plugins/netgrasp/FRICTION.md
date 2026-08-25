@@ -17,8 +17,15 @@ Verified at `KERNEL_API_VERSION (1,0)` (`crates/kernel/src/plugin/mod.rs:51`)
 with **no kernel, WIT, SDK or kernel-migration change** in the build session. The
 design decisions these findings forced are argued in `DESIGN.md`.
 
-The last three findings (`G-DB-HOST-TYPE-COVERAGE`, `G-RECORD-ID-MUST-BE-UUID`,
-`G-RECORD-STRUCTURAL-COLUMNS-UNVALIDATED`) were added by a later pass that
+Two findings (`G-USER-API-NO-ADMIN-BYPASS`, `G-ITEM-API-NO-DELETE-BINDING`) were
+added by the pass that made Netgrasp configurable by conversation against the
+0.102 assistant taps. Both are about the same thing from two sides: a plugin
+acting on a person's behalf has to make decisions the kernel also makes, and the
+host functions it makes them with do not behave the way the kernel's own code
+does.
+
+The three findings before those (`G-DB-HOST-TYPE-COVERAGE`, `G-RECORD-ID-MUST-BE-UUID`,
+`G-RECORD-STRUCTURAL-COLUMNS-UNVALIDATED`) were added by an earlier pass that
 pointed the plugin at the daemon's **landed** schema for the first time, rather
 than at the design record it had been built from. They are the findings a second
 writer only meets once it has actually met the other writer, and the first of
@@ -229,6 +236,52 @@ convention, the same 256 KB buffer constant and the same native stubs as
 FFI is the point at which "a gap" becomes "a defect".
 
 **Recommendation (post-1.0, trivial):** export the binding from the SDK.
+
+### G-USER-API-NO-ADMIN-BYPASS — **[Medium, NEW]** `current-user-has-permission` ignores `administer site`, so a plugin's own permission check disagrees with every kernel route
+
+Every kernel route treats `administer site` as a superuser: `UserContext::is_admin()`
+short-circuits the permission check, and the AI Assistant's own gate is
+`user.is_admin() || (use ai && use ai assistant && <the scope's permission>)`
+(`crates/kernel/src/routes/assistant.rs`). The host function a plugin uses to make
+the same decision does not: `current-user-has-permission` is
+`caller.data().request.user.has_permission(&permission)`
+(`crates/kernel/src/host/user.rs:49`), a literal membership test with no bypass.
+
+So an administrator who does not literally hold `administer netgrasp` opens a
+Netgrasp conversation — the kernel lets them — and then every tool in it refuses
+them, because the tool asks the host. The two answers are both defensible and
+they are not the same answer, and nothing says so anywhere: the symptom is an
+assistant that works until you try to use it.
+
+Netgrasp's tools check the permission at the moment of the change on purpose (a
+conversation outlives the request that opened it), so removing the check is not
+the fix. The site-side fix is to grant `administer netgrasp` for real rather than
+relying on the bypass, which is what this plugin's own tests do.
+
+**Recommendation (post-1.0, small):** make `current-user-has-permission` honour
+the `administer site` bypass, so a plugin's check and a route's check agree; or,
+if the literal semantics are deliberate, say so in the WIT and give the SDK a
+second binding that does include the bypass.
+
+### G-ITEM-API-NO-DELETE-BINDING — **[Low, RESIDUAL, widened]** the hand-rolled `item-api` binding now needs a third extern
+
+`G-SDK-NO-ITEM` recorded that the SDK ships no `item-api` binding and that Argus
+and Netgrasp both hand-rolled the same two externs. Deleting a person is the
+first thing either plugin has needed to do that removes an Item, so
+`plugins/netgrasp/src/item_host.rs` now declares a third: `delete-item`, whose
+signature differs from the other two (no output buffer; 0 or a negative code).
+
+The finding is the same one, and it is now three functions deep rather than two.
+It also inherits `G-SAVE-ITEM-BYPASSES-SERVICE` exactly: `delete-item` calls
+`Item::delete` directly (`crates/kernel/src/host/item.rs:280`), so it fires no
+`tap_item_delete` — which means the plugin's own delete tap, the one that clears
+the owner columns and drops the mirror row, does not run when the plugin does the
+deleting. The assistant's `delete_person` tool therefore calls `retire_person`
+itself before calling `delete-item`. That is correct and it is not discoverable:
+nothing about the host function says the tap you rely on will not fire.
+
+**Recommendation (post-1.0, trivial):** export all three bindings from the SDK,
+and say in the WIT that the `item-api` writes fire no taps.
 
 ### G-SDK-NO-ESCAPE — **[Low, RESIDUAL, higher stakes here]** the SDK ships no HTML escaping helper, and this plugin renders attacker-supplied text
 

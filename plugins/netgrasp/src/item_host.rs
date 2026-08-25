@@ -32,6 +32,11 @@ unsafe extern "C" {
 
     #[link_name = "get-item"]
     fn __get_item(id_ptr: i32, id_len: i32, out_ptr: i32, out_max_len: i32) -> i32;
+
+    // Unlike the two above, this one takes no output buffer: it returns 0 for
+    // success or a negative host error code.
+    #[link_name = "delete-item"]
+    fn __delete_item(id_ptr: i32, id_len: i32) -> i32;
 }
 
 /// The shared call shape: hand the host a UTF-8 payload and a caller-allocated
@@ -106,6 +111,39 @@ pub fn save_item(item: &Value) -> Result<Value, i32> {
 #[cfg(target_arch = "wasm32")]
 pub fn get_item(id: &str) -> Result<Value, i32> {
     call_host(__get_item, id)
+}
+
+/// Delete one Item by id.
+///
+/// The kernel treats "no such Item" as success, so this cannot report whether
+/// anything was there — the caller checks first if it needs to know.
+///
+/// The third `item-api` binding this file carries, and the one the assistant
+/// added: deleting a person is the only thing Netgrasp does that removes an
+/// Item, and until somebody could ask an assistant to do it, nothing needed to.
+/// **G-SDK-NO-ITEM** again — the SDK still ships no binding for this interface,
+/// so the extern is declared here beside the other two.
+///
+/// Like `save-item`, it calls `Item::delete` **directly** rather than through
+/// `ItemService`, so it fires **no `tap_item_delete`**. That is why the person
+/// delete path calls [`crate::sync_host::retire_person`] itself: the tap that
+/// would normally clear the owners and drop the mirror row is never dispatched.
+///
+/// # Errors
+///
+/// Returns the host error code (negative `i32`) on failure.
+#[cfg(target_arch = "wasm32")]
+pub fn delete_item(id: &str) -> Result<(), i32> {
+    // SAFETY: `id` is live for the duration of the call and the pointer and
+    // length describe it exactly; the host only reads it.
+    let result = unsafe { __delete_item(id.as_ptr() as i32, id.len() as i32) };
+    if result < 0 { Err(result) } else { Ok(()) }
+}
+
+/// Native stub: nothing to delete off wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_item(_id: &str) -> Result<(), i32> {
+    Ok(())
 }
 
 /// Native stub so the plugin crate still compiles (and unit-tests) off wasm.

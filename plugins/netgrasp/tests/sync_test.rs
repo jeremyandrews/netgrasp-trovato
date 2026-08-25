@@ -1620,3 +1620,789 @@ async fn item_json(pool: &PgPool, item_id: Uuid) -> serde_json::Value {
         "fields": fields,
     })
 }
+
+// ===========================================================================
+// Configuring Netgrasp by conversation
+// ===========================================================================
+//
+// The three assistant taps, through the real dispatcher, with a real user
+// context and a real Postgres. What is asserted here is everything that only
+// shows up when a host is involved: that a Describe changes nothing, that an
+// Execute changes exactly the user-owned columns, that a device with no Item
+// gets one, and that the permission belt bites.
+
+const SCOPE_DEVICE: &str = "netgrasp_device";
+const SCOPE_PERSON: &str = "netgrasp_person";
+const SCOPE_NETWORK: &str = "netgrasp_network";
+const PERM_ADMINISTER: &str = "administer netgrasp";
+
+/// A user context holding `administer netgrasp`.
+///
+/// The permission is checked **literally** by the host's
+/// `current-user-has-permission` — there is no `administer site` bypass on that
+/// call, unlike every kernel route — so a test that expects a tool to run has to
+/// carry this exact string.
+async fn ng_admin(pool: &PgPool) -> UserContext {
+    UserContext::authenticated(
+        any_user(pool).await,
+        vec![
+            PERM_ADMINISTER.to_string(),
+            "edit ng_device content".to_string(),
+            "edit ng_person content".to_string(),
+        ],
+    )
+}
+
+/// A user context holding nothing.
+async fn ng_nobody(pool: &PgPool) -> UserContext {
+    UserContext::authenticated(any_user(pool).await, vec!["access content".to_string()])
+}
+
+/// Dispatch one tap with a real user and services, and return its output.
+async fn dispatch_as(
+    pool: &PgPool,
+    user: &UserContext,
+    tap: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let disp = dispatcher();
+    let state = RequestState::new(
+        user.clone(),
+        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
+            .with_plugin_runtime(disp.runtime().clone()),
+    );
+    let results = disp.dispatch(tap, &payload.to_string(), state).await;
+    assert_eq!(results.len(), 1, "expected exactly one {tap} result");
+    serde_json::from_str(&results[0].output)
+        .unwrap_or_else(|e| panic!("{tap} returned non-JSON ({e}): {}", results[0].output))
+}
+
+/// Call one tool and return its `AssistantToolResult`.
+async fn call_tool(
+    pool: &PgPool,
+    user: &UserContext,
+    scope: &str,
+    scope_id: Option<&str>,
+    tool: &str,
+    arguments: serde_json::Value,
+    mode: &str,
+) -> serde_json::Value {
+    dispatch_as(
+        pool,
+        user,
+        "tap_assistant_tool",
+        &serde_json::json!({
+            "scope": scope,
+            "scope_id": scope_id,
+            "tool": tool,
+            "arguments": arguments,
+            "mode": mode,
+            "user_id": user.id.to_string(),
+        }),
+    )
+    .await
+}
+
+/// The snapshot a conversation would open with.
+async fn open_context(
+    pool: &PgPool,
+    user: &UserContext,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> serde_json::Value {
+    dispatch_as(
+        pool,
+        user,
+        "tap_assistant_context",
+        &serde_json::json!({
+            "scope": scope,
+            "scope_id": scope_id,
+            "user_id": user.id.to_string(),
+        }),
+    )
+    .await
+}
+
+/// Seed a device the demo's way: `clean`, with an owner, and with **no Item**.
+async fn seed_clean_device(pool: &PgPool, mac: &str, owner: Option<Uuid>, state: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO ng_devices \
+             (mac, owner_item_id, vendor, device_type, os_family, state, last_ip, \
+              first_seen_at, last_seen_at, sync_state) \
+         VALUES ($1, $2, 'Amazon Technologies', 'tablet', 'Android', $3, '10.0.2.18', \
+                 to_timestamp($4), to_timestamp($4), 'clean') \
+         RETURNING id",
+    )
+    .bind(mac)
+    .bind(owner)
+    .bind(state)
+    .bind(now() as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Create a person Item and its mirror row, the way the person taps do.
+async fn seed_person_item(pool: &PgPool, name: &str) -> Uuid {
+    let author = any_user(pool).await;
+    let item_id = items(pool)
+        .create(
+            CreateItem {
+                item_type: PERSON_TYPE.into(),
+                title: name.to_string(),
+                status: Some(1),
+                author_id: author,
+                fields: Some(serde_json::json!({
+                    "field_notes": "",
+                    "field_notify_arrive": false,
+                    "field_notify_depart": false,
+                })),
+                promote: Some(0),
+                sticky: Some(0),
+                stage_id: None,
+                language: None,
+                log: None,
+            },
+            &UserContext::authenticated(author, vec!["create ng_person content".into()]),
+        )
+        .await
+        .expect("create the person item")
+        .id;
+    // `tap_item_insert` mirrors it, but this test drives the taps directly, so
+    // the mirror is written here the same way that tap writes it.
+    sqlx::query(
+        "INSERT INTO ng_people (item_id, name, notes, notify_arrive, notify_depart) \
+         VALUES ($1, $2, '', FALSE, FALSE) ON CONFLICT (item_id) DO UPDATE SET name = EXCLUDED.name",
+    )
+    .bind(item_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .unwrap();
+    item_id
+}
+
+/// A device row's user-owned columns and its Item link.
+async fn device_state(
+    pool: &PgPool,
+    device: i64,
+) -> (Option<Uuid>, Option<Uuid>, Option<String>, String) {
+    let row = sqlx::query(
+        "SELECT owner_item_id, trovato_item_id, display_name, sync_state \
+         FROM ng_devices WHERE id = $1",
+    )
+    .bind(device)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        row.try_get("owner_item_id").unwrap(),
+        row.try_get("trovato_item_id").unwrap(),
+        row.try_get("display_name").unwrap(),
+        row.try_get("sync_state").unwrap(),
+    )
+}
+
+#[test]
+fn the_three_scopes_are_declared_and_the_kernel_registry_accepts_them() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+
+        let disp = dispatcher();
+        let results = disp
+            .dispatch("tap_assistant_scopes", "{}", background(&pool))
+            .await;
+        assert_eq!(results.len(), 1, "the manifest must list the scopes tap");
+
+        // The kernel's own validation, not a restatement of it: if a scope would
+        // be dropped on a real site, it is dropped here and named.
+        let registry = trovato_kernel::assistant::AssistantRegistry::from_tap_results(
+            results
+                .into_iter()
+                .map(|r| (r.plugin_name, r.output))
+                .collect(),
+        );
+        assert!(
+            registry.rejections().is_empty(),
+            "the kernel refused a scope: {:?}",
+            registry.rejections()
+        );
+        assert_eq!(registry.len(), 3);
+
+        let device = registry.get(SCOPE_DEVICE).expect("the device scope");
+        assert_eq!(device.scope.permission, PERM_ADMINISTER);
+        assert!(device.applies_to_item_type(DEVICE_TYPE));
+        assert!(!device.applies_to_item_type(PERSON_TYPE));
+        assert_eq!(device.write_tool_count(), 4);
+
+        let person = registry.get(SCOPE_PERSON).expect("the person scope");
+        assert!(person.applies_to_item_type(PERSON_TYPE));
+        assert_eq!(person.write_tool_count(), 5);
+
+        let network = registry.get(SCOPE_NETWORK).expect("the network scope");
+        assert_eq!(
+            network.scope.id_kind,
+            trovato_sdk::types::AssistantIdKind::None
+        );
+        assert!(network.tool("who_was_online").is_some());
+        assert_eq!(network.write_tool_count(), 5);
+
+        // Every scope's prompt says what the daemon cannot know, which is the
+        // most confident wrong answer available here.
+        for scope in registry.scopes() {
+            assert!(
+                scope
+                    .scope
+                    .prompt
+                    .contains("it cannot know who is holding one"),
+                "{} lost the shared prefix",
+                scope.scope.name
+            );
+        }
+    });
+}
+
+#[test]
+fn each_scopes_context_describes_what_it_was_opened_on() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:04", Some(jamie), "offline").await;
+        run_cron(&pool).await; // no dirty rows; the device keeps no Item
+
+        // A device conversation opens on the Item, so give it one.
+        sqlx::query("UPDATE ng_devices SET sync_state = 'dirty' WHERE id = $1")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_cron(&pool).await;
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item_id = item_id.expect("the sync minted an item").to_string();
+
+        let context = open_context(&pool, &admin, SCOPE_DEVICE, Some(&item_id)).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(snapshot.contains("02:00:5e:00:00:04"), "{snapshot}");
+        assert!(snapshot.contains("Owner: Jamie"), "{snapshot}");
+        assert!(snapshot.contains("Amazon Technologies"), "{snapshot}");
+        assert!(
+            snapshot.len() < netgrasp_core::assist::SNAPSHOT_MAX_BYTES,
+            "the snapshot is {} bytes",
+            snapshot.len()
+        );
+        assert!(!context["links"].as_array().unwrap().is_empty());
+
+        let context = open_context(&pool, &admin, SCOPE_PERSON, Some(&jamie.to_string())).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(snapshot.contains("Person: Jamie"), "{snapshot}");
+        assert!(snapshot.contains("Devices (1):"), "{snapshot}");
+        assert!(snapshot.contains("02:00:5e:00:00:04"), "{snapshot}");
+
+        let context = open_context(&pool, &admin, SCOPE_NETWORK, None).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(snapshot.contains("People (1):"), "{snapshot}");
+        assert!(snapshot.contains("Jamie's devices:"), "{snapshot}");
+        assert!(
+            snapshot.contains("Devices by state (1 total):"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Security events in the last 24 hours: 0"),
+            "{snapshot}"
+        );
+    });
+}
+
+#[test]
+fn describing_an_assignment_changes_nothing_at_all() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:04", Some(arlo), "offline").await;
+
+        let before_daemon = daemon_snapshot(&pool, device).await;
+        let before_state = device_state(&pool, device).await;
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "assign_device",
+            serde_json::json!({"device": "02:00:5e:00:00:04", "person": "Jamie"}),
+            "describe",
+        )
+        .await;
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["summary"].as_str().unwrap_or_default(),
+            "Assign Amazon tablet (02:00:5e:00:00:04) to Jamie (currently Arlo) \
+             (creates its Trovato item)",
+            "the card names the device, the new owner and the one it replaces"
+        );
+
+        // Nothing moved. Not the owner, not the link, not a daemon column.
+        assert_eq!(device_state(&pool, device).await, before_state);
+        assert_eq!(daemon_snapshot(&pool, device).await, before_daemon);
+        let items_now: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item WHERE type = 'ng_device'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(items_now, 0, "Describe minted an item");
+    });
+}
+
+#[test]
+fn applying_an_assignment_writes_both_tiers_and_mints_the_missing_item() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        // The demo's own state: clean, owned, and with no Item. `write_back_device`
+        // addresses the row by the Item link, so without minting one this would
+        // update nothing and report success.
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:04", Some(arlo), "offline").await;
+        let before_daemon = daemon_snapshot(&pool, device).await;
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "assign_device",
+            serde_json::json!({"device": "02:00:5e:00:00:04", "person": "Jamie"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        let (owner, item_id, display_name, sync_state) = device_state(&pool, device).await;
+        assert_eq!(owner, Some(jamie), "the daemon's row names the new owner");
+        let item_id = item_id.expect("the tool minted the device's item");
+        assert_eq!(
+            display_name, None,
+            "an unchanged title clears display_name rather than pinning the daemon's own name"
+        );
+        assert_eq!(
+            sync_state, "clean",
+            "no assistant write may raise sync_state, or the loop has an edge"
+        );
+        assert_eq!(
+            daemon_snapshot(&pool, device).await,
+            before_daemon,
+            "a daemon-owned column moved"
+        );
+
+        // Both tiers agree: the Item's field carries the same owner.
+        let item = item_json(&pool, item_id).await;
+        assert_eq!(
+            item["fields"]["field_owner"].as_str().unwrap_or_default(),
+            jamie.to_string()
+        );
+        assert_eq!(
+            item["fields"]["field_mac"].as_str().unwrap_or_default(),
+            "02:00:5e:00:00:04",
+            "every field is written, because Item::update replaces them wholesale"
+        );
+
+        // And a following sync tick is a no-op: nothing was left dirty.
+        let report = run_cron(&pool).await;
+        assert_eq!(
+            report["sync"]["examined"], 0,
+            "the write left a row dirty: {report}"
+        );
+
+        // Unassigning clears both tiers.
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id.to_string()),
+            "set_owner",
+            serde_json::json!({"person": null}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        let (owner, _, _, _) = device_state(&pool, device).await;
+        assert_eq!(owner, None);
+        let item = item_json(&pool, item_id).await;
+        assert_eq!(
+            item["fields"]["field_owner"].as_str().unwrap_or_default(),
+            ""
+        );
+    });
+}
+
+#[test]
+fn renaming_stores_a_typed_name_and_clears_a_derived_one() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:08", None, "unknown").await;
+        sqlx::query("UPDATE ng_devices SET sync_state = 'dirty', vendor = NULL WHERE id = $1")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_cron(&pool).await;
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item_id = item_id.expect("the sync minted an item").to_string();
+
+        // A name a human typed is stored and wins.
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id),
+            "rename",
+            serde_json::json!({"display_name": "Office printer"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        let (_, _, display_name, _) = device_state(&pool, device).await;
+        assert_eq!(display_name.as_deref(), Some("Office printer"));
+
+        // A name that merely equals what the daemon would have called it anyway
+        // is stored as NULL, so the device goes back to tracking what the daemon
+        // learns. The existing pinning rule, reached through the assistant.
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id),
+            "rename",
+            serde_json::json!({"display_name": "02:00:5e:00:00:08"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        let (_, _, display_name, _) = device_state(&pool, device).await;
+        assert_eq!(
+            display_name, None,
+            "the daemon's own name must not be pinned as a human's choice"
+        );
+    });
+}
+
+#[test]
+fn creating_and_deleting_a_person_keeps_the_mirror_in_step() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "create_person",
+            serde_json::json!({"name": "Aurora"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        let (item_id, name): (Uuid, String) =
+            sqlx::query_as("SELECT item_id, name FROM ng_people WHERE name = 'Aurora'")
+                .fetch_one(&pool)
+                .await
+                .expect("the mirror row was written");
+        assert_eq!(name, "Aurora");
+        let item = item_json(&pool, item_id).await;
+        assert_eq!(item["type"], PERSON_TYPE);
+        assert_eq!(item["title"], "Aurora");
+
+        // Describing a duplicate is refused, so a card nobody would question is
+        // never produced.
+        let duplicate = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "create_person",
+            serde_json::json!({"name": "aurora"}),
+            "describe",
+        )
+        .await;
+        assert_eq!(duplicate["ok"], false, "{duplicate}");
+        assert!(
+            duplicate["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already exists"),
+            "{duplicate}"
+        );
+
+        // A device in the way stops the delete, at execute as well as describe.
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:03", Some(item_id), "online").await;
+        let refused = call_tool(
+            &pool,
+            &admin,
+            SCOPE_PERSON,
+            Some(&item_id.to_string()),
+            "delete_person",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unassign"),
+            "{refused}"
+        );
+        assert!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ng_people WHERE item_id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                == 1,
+            "the refused delete removed the mirror row anyway"
+        );
+
+        // Unassign, then delete.
+        call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "assign_device",
+            serde_json::json!({"device": "02:00:5e:00:00:03", "person": null}),
+            "execute",
+        )
+        .await;
+        let deleted = call_tool(
+            &pool,
+            &admin,
+            SCOPE_PERSON,
+            Some(&item_id.to_string()),
+            "delete_person",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(deleted["ok"], true, "{deleted}");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ng_people WHERE item_id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "the mirror row outlived the person"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM item WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "the person's item outlived the person"
+        );
+        // And no device is left pointing at an id with nothing behind it.
+        let (owner, _, _, _) = device_state(&pool, device).await;
+        assert_eq!(owner, None);
+    });
+}
+
+#[test]
+fn a_caller_without_the_permission_gets_nothing_done() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let nobody = ng_nobody(&pool).await;
+
+        seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:04", None, "offline").await;
+        let before = device_state(&pool, device).await;
+
+        for mode in ["describe", "execute"] {
+            let refused = call_tool(
+                &pool,
+                &nobody,
+                SCOPE_NETWORK,
+                None,
+                "assign_device",
+                serde_json::json!({"device": "02:00:5e:00:00:04", "person": "Jamie"}),
+                mode,
+            )
+            .await;
+            assert_eq!(refused["ok"], false, "{mode}: {refused}");
+            assert!(
+                refused["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("do not have permission"),
+                "{mode}: {refused}"
+            );
+        }
+        assert_eq!(device_state(&pool, device).await, before);
+
+        // A read is refused too: the belt is on the whole tap, not on the writes.
+        let refused = call_tool(
+            &pool,
+            &nobody,
+            SCOPE_NETWORK,
+            None,
+            "list_people",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+
+        // The same call with the permission works, which is what makes the
+        // refusal above about the permission rather than about the arguments.
+        let allowed = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "list_people",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(allowed["ok"], true, "{allowed}");
+        assert!(
+            allowed["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Jamie")
+        );
+    });
+}
+
+#[test]
+fn an_ambiguous_person_name_names_the_candidates_rather_than_guessing() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let first = seed_person_item(&pool, "Sam").await;
+        let second = seed_person_item(&pool, "sam").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:07", None, "online").await;
+
+        let refused = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "assign_device",
+            serde_json::json!({"device": "02:00:5e:00:00:07", "person": "Sam"}),
+            "describe",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+        let message = refused["content"].as_str().unwrap_or_default();
+        assert!(message.contains("matches 2 people"), "{message}");
+        assert!(message.contains(&first.to_string()), "{message}");
+        assert!(message.contains(&second.to_string()), "{message}");
+
+        // A uuid resolves it, which is what the message tells the model to do.
+        let described = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "assign_device",
+            serde_json::json!({"device": "02:00:5e:00:00:07", "person": first.to_string()}),
+            "describe",
+        )
+        .await;
+        assert_eq!(described["ok"], true, "{described}");
+        let _ = device;
+    });
+}
+
+#[test]
+fn who_was_online_answers_from_the_seeded_presence_rows() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:01", Some(jamie), "online").await;
+        let now = now();
+        sqlx::query(
+            "INSERT INTO ng_presence (device_id, ip, started_at, ended_at, is_summary) \
+             VALUES ($1, '10.0.1.24', to_timestamp($2), NULL, FALSE)",
+        )
+        .bind(device)
+        .bind((now - 7_200) as f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let from = netgrasp_core::assist::format_utc(now - 3_600)
+            .replace(" UTC", "Z")
+            .replace(' ', "T");
+        let to = netgrasp_core::assist::format_utc(now)
+            .replace(" UTC", "Z")
+            .replace(' ', "T");
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "who_was_online",
+            serde_json::json!({"from": from, "to": to}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        let content = result["content"].as_str().unwrap_or_default();
+        assert!(content.contains("Jamie"), "{content}");
+        assert!(content.contains("02:00:5e:00:00:01"), "{content}");
+        assert!(
+            content.contains("still online"),
+            "an open span is what 'right now' means: {content}"
+        );
+
+        // A window wider than a week is refused, with the reason.
+        let refused = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "who_was_online",
+            serde_json::json!({"from": "2026-01-01T00:00:00Z", "to": "2026-06-01T00:00:00Z"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("7 days")
+        );
+    });
+}

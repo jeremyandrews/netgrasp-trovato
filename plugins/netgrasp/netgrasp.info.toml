@@ -46,6 +46,13 @@ implements = [
     "tap_perm",
     "tap_menu",
     "tap_cron",
+    # Configuring Netgrasp by conversation (kernel 0.102). The kernel dispatches
+    # only the taps this list names, so an exported tap missing from here is
+    # silently never called — which is exactly what a scope that never appears
+    # looks like from the outside.
+    "tap_assistant_scopes",
+    "tap_assistant_context",
+    "tap_assistant_tool",
 ]
 weight = 0
 
@@ -69,14 +76,25 @@ files = [
 #               externs itself in item_host.rs (G-SDK-NO-ITEM, inherited).
 #   logging   — structured logging from the taps.
 #   variables — the event retention window, read from site config.
+#   user-api  — `current-user-has-permission`, checked by every assistant write
+#               tool at the moment of the change. The kernel checks the scope's
+#               permission when a conversation opens; a conversation outlives
+#               that request, so the tool checks again.
 #
-# No http, no ai-api, no queue, no user-api: Netgrasp reaches nothing outside the
-# database and does no AI work. The daemon does the network I/O.
+# No http, no ai-api, no queue: Netgrasp reaches nothing outside the database and
+# makes no AI calls of its own. The daemon does the network I/O, and the model
+# calls are the kernel's — the assistant taps answer a model, they do not talk to
+# one.
+#
+# `scripts/check-host-imports.sh` diffs this list against the module's real
+# imports in BOTH directions, so this entry and the `current_user_has_permission`
+# call it authorizes have to land in the same change.
 [capabilities]
 host_interfaces = [
     "db",
     "item-api",
     "logging",
+    "user-api",
     "variables",
 ]
 raw_sql = true

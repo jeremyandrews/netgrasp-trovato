@@ -885,3 +885,451 @@ async fn columns_of(
     .await
     .unwrap()
 }
+
+// ===========================================================================
+// The assistant scopes' reads
+// ===========================================================================
+//
+// Every statement below is run against the daemon's own DDL and decoded into the
+// struct the plugin decodes it into. That pairing is the point: a column the
+// projection forgot, or a type that arrives as `null` through the `db` host,
+// shows up here as a `None` in a field the snapshot then renders as absent — and
+// nowhere else, because the plugin has no schema to check its SQL against.
+
+/// Seed a device the demo's way: every observation column filled in, an owner,
+/// and no Item link — the state a `clean` row the cron sync has never touched is
+/// in, which is the one the write tools have to mint an Item for.
+async fn seed_owned_device(
+    conn: &mut PgConnection,
+    mac: &str,
+    owner: Option<&str>,
+    state: &str,
+    seen: i64,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO ng_devices \
+             (mac, display_name, notes, hidden, notify, owner_item_id, resolved_name, \
+              identity_source, identity_confidence, hostname, mdns_name, vendor, device_type, \
+              os_family, state, last_ip, last_ipv6, current_ap, current_location, \
+              first_seen_at, last_seen_at, sync_state) \
+         VALUES ($1, NULL, 'seeded', FALSE, TRUE, $2::uuid, NULL, NULL, NULL, NULL, NULL, \
+                 'Amazon Technologies', 'tablet', 'Android', $3, '10.0.2.18', NULL, NULL, NULL, \
+                 to_timestamp($4), to_timestamp($5), 'clean') \
+         RETURNING id",
+    )
+    .bind(mac)
+    .bind(owner)
+    .bind(state)
+    .bind((seen - 900_000) as f64)
+    .bind(seen as f64)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+}
+
+/// Put one person in the mirror.
+async fn seed_person(conn: &mut PgConnection, item_id: &str, name: &str, state: &str) {
+    sqlx::query(
+        "INSERT INTO ng_people (item_id, name, notes, notify_arrive, notify_depart, state) \
+         VALUES ($1::uuid, $2, 'a note', TRUE, FALSE, $3)",
+    )
+    .bind(item_id)
+    .bind(name)
+    .bind(state)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn every_device_read_decodes_into_the_struct_the_snapshots_render_from() {
+    use netgrasp_core::assist::DeviceFacts;
+
+    let mut conn = daemon_db("assist_device_reads").await;
+    let now = now();
+    seed_person(&mut conn, PERSON, "Arlo", "away").await;
+    let id = seed_owned_device(&mut conn, "02:00:5e:00:00:04", Some(PERSON), "offline", now).await;
+    seed_owned_device(&mut conn, "02:00:5e:00:00:06", None, "online", now).await;
+
+    // By MAC, case-insensitively, which is what a model will send.
+    let rows: Vec<DeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICE_BY_MAC,
+        &[json!("02:00:5E:00:00:04")],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    let facts = &rows[0];
+    assert_eq!(facts.id, id);
+    assert_eq!(facts.mac, "02:00:5e:00:00:04");
+    assert_eq!(facts.owner_item_id.as_deref(), Some(PERSON));
+    assert_eq!(
+        facts.owner_name.as_deref(),
+        Some("Arlo"),
+        "the owner's name resolves through the mirror without a join to the view"
+    );
+    assert_eq!(facts.notes.as_deref(), Some("seeded"));
+    assert!(facts.notify);
+    assert!(!facts.hidden);
+    // Both timestamps arrive as integers. Reading the `timestamptz` instead
+    // would put a null here and this would pass with `None`.
+    assert!(facts.first_seen.unwrap_or_default() > 0, "{facts:?}");
+    assert!(facts.last_seen.unwrap_or_default() > 0, "{facts:?}");
+    assert!(
+        facts.trovato_item_id.is_none(),
+        "a clean row the sync never touched has no item, which is the case that matters"
+    );
+    // And the description a proposal card would carry.
+    assert_eq!(facts.descriptive(), "Amazon tablet");
+
+    // By id.
+    let rows: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICE_BY_ID, &[json!(id)]).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].mac, "02:00:5e:00:00:04");
+
+    // Everything, and the two listing filters that partition it.
+    let all: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICES_ALL, &[json!(50)]).await;
+    assert_eq!(all.len(), 2);
+
+    let unowned: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICES_UNOWNED, &[json!(50)]).await;
+    assert_eq!(unowned.len(), 1);
+    assert_eq!(unowned[0].mac, "02:00:5e:00:00:06");
+
+    let owned: Vec<DeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICES_BY_OWNER,
+        &[json!(PERSON), json!(50)],
+    )
+    .await;
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].mac, "02:00:5e:00:00:04");
+
+    let online: Vec<DeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICES_BY_STATE,
+        &[json!("online"), json!(50)],
+    )
+    .await;
+    assert_eq!(online.len(), 1);
+    assert_eq!(online[0].state.as_deref(), Some("online"));
+
+    let hidden: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICES_HIDDEN, &[json!(50)]).await;
+    assert!(hidden.is_empty());
+}
+
+#[tokio::test]
+async fn the_name_search_looks_in_every_column_a_name_could_be_in() {
+    use netgrasp_core::assist::DeviceFacts;
+
+    let mut conn = daemon_db("assist_find").await;
+    let now = now();
+    // One device per column the search reads, so a dropped `OR` is a failing
+    // assertion rather than a search that quietly finds four things out of five.
+    for (mac, column, value) in [
+        ("aa:bb:cc:00:01:01", "display_name", "Office printer"),
+        ("aa:bb:cc:00:01:02", "resolved_name", "studio-nas"),
+        ("aa:bb:cc:00:01:03", "hostname", "kitchen-pi.lan"),
+        ("aa:bb:cc:00:01:04", "mdns_name", "LivingRoomTV"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO ng_devices (mac, {column}, state, first_seen_at, last_seen_at) \
+             VALUES ($1, $2, 'online', to_timestamp($3), to_timestamp($3))"
+        ))
+        .bind(mac)
+        .bind(value)
+        .bind(now as f64)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    for (fragment, expected_mac) in [
+        ("printer", "aa:bb:cc:00:01:01"),
+        ("STUDIO", "aa:bb:cc:00:01:02"),
+        ("kitchen-pi", "aa:bb:cc:00:01:03"),
+        ("livingroom", "aa:bb:cc:00:01:04"),
+        ("01:03", "aa:bb:cc:00:01:03"),
+    ] {
+        let found: Vec<DeviceFacts> = query_rows(
+            &mut conn,
+            queries::SELECT_DEVICES_BY_NAME,
+            &[json!(fragment), json!(50)],
+        )
+        .await;
+        assert!(
+            found.iter().any(|d| d.mac == expected_mac),
+            "searching '{fragment}' did not find {expected_mac}"
+        );
+    }
+
+    // The fragment is bound, so a quote in it is data and not syntax: this
+    // returns nothing rather than failing, which is what parameterization buys.
+    let found: Vec<DeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICES_BY_NAME,
+        &[json!("' OR 1=1 --"), json!(50)],
+    )
+    .await;
+    assert!(
+        found.is_empty(),
+        "a bound quote matched {} devices",
+        found.len()
+    );
+
+    // A `%` in the fragment IS still a wildcard once it is concatenated into the
+    // pattern, which the constant's doc says out loud. Bounded by the row limit
+    // and harmless; pinned here so nobody later believes otherwise.
+    let found: Vec<DeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICES_BY_NAME,
+        &[json!("%"), json!(50)],
+    )
+    .await;
+    assert_eq!(
+        found.len(),
+        4,
+        "a bare % is a wildcard and matches everything"
+    );
+}
+
+#[tokio::test]
+async fn the_people_reads_carry_the_mirror_and_a_device_count() {
+    use netgrasp_core::assist::PersonFacts;
+
+    let mut conn = daemon_db("assist_people").await;
+    let now = now();
+    seed_person(&mut conn, PERSON, "Arlo", "away").await;
+    seed_person(&mut conn, ITEM_A, "Jamie", "home").await;
+    seed_owned_device(&mut conn, "02:00:5e:00:00:04", Some(PERSON), "offline", now).await;
+    seed_owned_device(&mut conn, "02:00:5e:00:00:01", Some(ITEM_A), "online", now).await;
+    seed_owned_device(&mut conn, "02:00:5e:00:00:02", Some(ITEM_A), "online", now).await;
+
+    let people: Vec<PersonFacts> =
+        query_rows(&mut conn, queries::SELECT_PEOPLE_WITH_COUNTS, &[json!(50)]).await;
+    assert_eq!(people.len(), 2);
+    // Ordered by name, so Arlo is first.
+    assert_eq!(people[0].name, "Arlo");
+    assert_eq!(people[0].device_count, 1);
+    assert_eq!(people[0].state.as_deref(), Some("away"));
+    assert!(people[0].notify_arrive);
+    assert!(!people[0].notify_depart);
+    assert_eq!(people[1].name, "Jamie");
+    assert_eq!(people[1].device_count, 2);
+
+    let one: Vec<PersonFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_PERSON_WITH_COUNT,
+        &[json!(PERSON)],
+    )
+    .await;
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].device_count, 1);
+
+    // A person nobody owns anything of still comes back, with zero — a left
+    // join, not an inner one.
+    seed_person(&mut conn, ITEM_B, "Aurora", "away").await;
+    let people: Vec<PersonFacts> =
+        query_rows(&mut conn, queries::SELECT_PEOPLE_WITH_COUNTS, &[json!(50)]).await;
+    assert_eq!(people.len(), 3);
+    assert_eq!(
+        people
+            .iter()
+            .find(|p| p.name == "Aurora")
+            .unwrap()
+            .device_count,
+        0
+    );
+
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        device_count: i64,
+    }
+    let counted: Vec<CountRow> = query_rows(
+        &mut conn,
+        queries::SELECT_OWNED_DEVICE_COUNT,
+        &[json!(ITEM_A)],
+    )
+    .await;
+    assert_eq!(counted[0].device_count, 2);
+}
+
+#[tokio::test]
+async fn the_event_reads_return_the_types_the_model_declares_and_no_others() {
+    use netgrasp_core::assist::EventFacts;
+
+    let mut conn = daemon_db("assist_events").await;
+    let now = now();
+    let id = seed_owned_device(&mut conn, "02:00:5e:00:00:0c", None, "online", now).await;
+
+    // One of every security type, one that is not, and one too old to count.
+    let mut seeded = netgrasp_core::model::SECURITY_EVENT_TYPES.to_vec();
+    seeded.push("device_seen");
+    for event_type in &seeded {
+        sqlx::query(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+             VALUES ($1, $2, to_timestamp($3), $4::jsonb)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind((now - 600) as f64)
+        .bind(json!({"seen": true}))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+         VALUES ($1, 'arp_spoof', to_timestamp($2), '{}'::jsonb)",
+    )
+    .bind(id)
+    .bind((now - 86_400 * 3) as f64)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Per device, inside the window.
+    let events: Vec<EventFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICE_EVENTS,
+        &[json!(id), json!(now - 86_400), json!(50)],
+    )
+    .await;
+    assert_eq!(
+        events.len(),
+        seeded.len(),
+        "the older event is outside the day"
+    );
+    assert!(events[0].ts.unwrap_or_default() > 0, "{:?}", events[0]);
+    assert!(events[0].details.is_some());
+
+    // Security only, and every one of the model's types is reachable.
+    let security: Vec<EventFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_SECURITY_EVENTS,
+        &[json!(now - 86_400), json!(50)],
+    )
+    .await;
+    assert_eq!(
+        security.len(),
+        netgrasp_core::model::SECURITY_EVENT_TYPES.len()
+    );
+    for event_type in netgrasp_core::model::SECURITY_EVENT_TYPES {
+        assert!(
+            security.iter().any(|e| e.event_type == *event_type),
+            "{event_type} is not reachable through SELECT_SECURITY_EVENTS"
+        );
+    }
+    assert!(
+        security
+            .iter()
+            .all(|e| e.mac.as_deref() == Some("02:00:5e:00:00:0c")),
+        "the join to the device did not carry the MAC"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        event_count: i64,
+    }
+    let counted: Vec<CountRow> = query_rows(
+        &mut conn,
+        queries::SELECT_SECURITY_EVENT_COUNT,
+        &[json!(now - 86_400)],
+    )
+    .await;
+    assert_eq!(
+        counted[0].event_count,
+        netgrasp_core::model::SECURITY_EVENT_TYPES.len() as i64
+    );
+}
+
+/// The window read returns spans that **overlap** the window, not only spans
+/// contained by it.
+///
+/// A containment test answers "nobody was home" for the most common real case —
+/// a device that came online before the window and was still online during it —
+/// which is exactly the question this tool exists to answer.
+#[tokio::test]
+async fn who_was_online_returns_only_and_all_of_the_overlapping_spans() {
+    use netgrasp_core::assist::PresenceWindowFacts;
+
+    let mut conn = daemon_db("assist_window").await;
+    let now = now();
+    seed_person(&mut conn, PERSON, "Arlo", "away").await;
+    let owned =
+        seed_owned_device(&mut conn, "02:00:5e:00:00:04", Some(PERSON), "offline", now).await;
+    let free = seed_owned_device(&mut conn, "02:00:5e:00:00:06", None, "online", now).await;
+
+    let window_start = now - 3_600;
+    let window_end = now - 1_800;
+
+    for (device, start_delta, end_delta, is_summary, label) in [
+        // Wholly inside.
+        (owned, -3_000, Some(-2_000), false, "inside"),
+        // Starts before, ends inside: the case containment gets wrong.
+        (owned, -7_200, Some(-2_500), false, "straddles the start"),
+        // Starts inside, still open: "who is home right now".
+        (free, -2_400, None, false, "still open"),
+        // Wholly before, and wholly after: neither overlaps.
+        (free, -20_000, Some(-10_000), false, "before"),
+        (free, -60, Some(-10), false, "after"),
+        // A compacted day, which is not a session.
+        (owned, -3_000, Some(-2_000), true, "summary"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ng_presence (device_id, ip, started_at, ended_at, is_summary) \
+             VALUES ($1, $2, to_timestamp($3), \
+                     CASE WHEN $4::float8 IS NULL THEN NULL ELSE to_timestamp($4) END, $5)",
+        )
+        .bind(device)
+        .bind(label)
+        .bind((now + start_delta) as f64)
+        .bind(end_delta.map(|d| (now + d) as f64))
+        .bind(is_summary)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let spans: Vec<PresenceWindowFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_PRESENCE_WINDOW,
+        &[json!(window_start), json!(window_end), json!(200)],
+    )
+    .await;
+
+    assert_eq!(
+        spans.len(),
+        3,
+        "expected three overlapping spans: {spans:?}"
+    );
+    assert!(
+        spans.iter().any(|s| s.end.is_none()),
+        "the open span must be included: it is what 'right now' means"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.start.unwrap_or_default() < window_start && s.end.is_some()),
+        "the span that starts before the window must be included"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.owner_name.as_deref() == Some("Arlo")),
+        "the owner's name must arrive with the span"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.owner_item_id.is_none() && s.mac == "02:00:5e:00:00:06"),
+        "an unowned device's span must arrive too"
+    );
+    // Both times decode as integers, not nulls.
+    for span in &spans {
+        assert!(span.start.unwrap_or_default() > 0, "{span:?}");
+    }
+}

@@ -33,6 +33,7 @@ use netgrasp_core::{DEVICE_TYPE, PERSON_TYPE};
 use trovato_sdk::host;
 use trovato_sdk::prelude::*;
 
+mod assist_host;
 mod db;
 mod device_view;
 mod item_host;
@@ -402,6 +403,38 @@ fn mirror_person_result(item: &serde_json::Value) -> serde_json::Value {
             serde_json::json!({ "error": e.to_string() })
         }
     }
+}
+
+// ===========================================================================
+// Configuring Netgrasp by conversation
+// ===========================================================================
+
+/// Declare the three things a person can configure by talking to them.
+///
+/// Dispatched once at boot, without services, so this must be a constant: no
+/// database, no host calls beyond what building a value takes. Everything that
+/// varies — what devices exist, who owns them — arrives later through
+/// [`tap_assistant_context`] and the read tools.
+#[plugin_tap]
+pub fn tap_assistant_scopes() -> Vec<AssistantScope> {
+    assist_host::scopes()
+}
+
+/// Describe whatever a conversation was opened on.
+#[plugin_tap]
+pub fn tap_assistant_context(request: AssistantContextRequest) -> AssistantContext {
+    assist_host::context(&request)
+}
+
+/// Answer one tool call: a read, a description of a write, or a write.
+///
+/// A write reaches `Execute` only after a person applied the proposal that
+/// `Describe` produced. Netgrasp does not have to trust that: every write tool
+/// checks `administer netgrasp` again here, because a conversation outlives the
+/// request that opened it and the kernel checked the permission then.
+#[plugin_tap]
+pub fn tap_assistant_tool(call: AssistantToolCall) -> AssistantToolResult {
+    assist_host::tool(&call)
 }
 
 // ===========================================================================
