@@ -359,13 +359,19 @@ permission for real is the answer until the kernel's is.
 
 - **No kernel modification.** Every friction item is reported, not fixed
   (`FRICTION.md`).
-- **No daemon-side commit.** The `Code/netgrasp/` checkout named in the scope does
-  not exist on this machine; `~/devel/rust/netgrasp-rs` is an empty tree with a
-  `.git` directory and no working files, and no other copy is present. The
-  daemon-side task ("verify the daemon tolerates user-owned columns being written
-  by another process") could not be run. The plugin side of that contract is
-  specified in `netgrasp_core::columns::USER_OWNED` and enforced by test, so
-  the daemon-side check is a bounded follow-up rather than an open question.
+- **No daemon-side commit.** The daemon lives in the `netgraspd` repository
+  (`github.com/jeremyandrews/netgraspd`); the `Code/netgrasp/` path named in the
+  scope was never where it is, which is why no checkout was found when this was
+  written. The plugin side of the two-writer contract is specified in
+  `netgrasp_core::columns::USER_OWNED` and enforced by test.
+  The daemon-side half of it ("verify the daemon tolerates user-owned columns
+  being written by another process") has since been run, against a live LAN with
+  both halves on one database: it holds. The daemon's single device-update
+  statement names no user-owned column, and `display_name`, `notify` and
+  `owner_item_id` written through the assistant survived three hours of daemon
+  flushes untouched. What that run also showed is that the daemon reads those
+  columns only when it starts, so a change made through the assistant does not
+  reach a running daemon until it restarts. See `docs/JOINT-RUN.md`.
 - **No enrichment / UniFi, no arrival-departure notification** (CLOSE 16), **no iOS.**
 - **No assistant scope over the event log.** Events are read-only and high volume:
   there is nothing to configure, and the network scope's `device_history` already
