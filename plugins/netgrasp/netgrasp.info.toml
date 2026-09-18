@@ -53,6 +53,12 @@ implements = [
     "tap_assistant_scopes",
     "tap_assistant_context",
     "tap_assistant_tool",
+    # The row menu's forms (kernel 0.99). tap_menu registers six paths with a
+    # handler_type of "api" and a callback each; the kernel routes those to
+    # tap_api, having already checked the entry's permission and, for a POST,
+    # the _token. Without this line the paths are registered and every request
+    # to one is dispatched to a plugin that does not answer.
+    "tap_api",
 ]
 weight = 0
 

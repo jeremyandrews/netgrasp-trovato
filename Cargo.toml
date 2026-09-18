@@ -84,6 +84,13 @@ dotenvy = "0.15"
 # invisible here and, at runtime, falls back to the kernel's dump of every
 # column of the base table (DESIGN.md, `gather/netgrasp/page.html`).
 tera = "1.20"
+
+# Test-only, for the form suite. `axum` supplies the HeaderMap and
+# `tower-sessions` the Session that the kernel's own CSRF gate takes, so the
+# "a POST with no token is refused" test can call the real check with a real
+# session rather than describe it. Both are the versions the pinned kernel uses.
+axum = "0.8"
+tower-sessions = "0.14"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v7", "serde"] }
