@@ -1,5 +1,5 @@
 /*
- * Netgrasp gather pages: local timestamps and the auto-reload.
+ * Netgrasp gather pages: local timestamps, the row menu and the auto-reload.
  *
  * Served from the netgrasp repository's own `static/` directory, appended to
  * Trovato's STATIC_DIR search path. Loaded with `defer` by
@@ -20,7 +20,80 @@
     }
 
     localiseTimestamps(page);
+    wireRowMenus(page);
     startAutoReload(page);
+
+    /*
+     * Right-click opens the row's menu.
+     *
+     * The menu is a <details> element that already works: clicking its summary
+     * opens it, Enter and Space open it from the keyboard, and every entry in
+     * it is an ordinary link. Nothing below adds an action, a destination or a
+     * capability that is not reachable with scripting switched off — it moves
+     * the same menu under the pointer, which is the one thing a right-click can
+     * offer that a click on the button cannot.
+     *
+     * Touch has no contextmenu event worth binding, which is why the button is
+     * visible rather than a hover affordance: on a touch screen the button IS
+     * the interface, and this function never runs.
+     */
+    function wireRowMenus(root) {
+        root.addEventListener("contextmenu", function (event) {
+            var row = event.target.closest("tr, .ng-person");
+            if (!row) {
+                return;
+            }
+            var menu = row.querySelector("details.ng-menu");
+            if (!menu) {
+                // A row with no menu — an event with no device — keeps the
+                // browser's own context menu. Suppressing it there would take
+                // something away and give nothing back.
+                return;
+            }
+
+            event.preventDefault();
+            closeMenus(root, menu);
+            menu.open = true;
+
+            // Focus the summary rather than the first entry: that is where a
+            // <details> puts focus when opened by click or by keyboard, so the
+            // three ways in agree, and Escape below has somewhere to return to.
+            var summary = menu.querySelector("summary");
+            if (summary) {
+                summary.focus();
+            }
+        });
+
+        /*
+         * Escape closes the menu the focus is in and puts focus back on its
+         * button, which is where it came from. Without this a keyboard user who
+         * opens a menu and changes their mind has no way out but Tab.
+         */
+        root.addEventListener("keydown", function (event) {
+            if (event.key !== "Escape") {
+                return;
+            }
+            var open = event.target.closest("details.ng-menu[open]");
+            if (!open) {
+                return;
+            }
+            open.open = false;
+            var summary = open.querySelector("summary");
+            if (summary) {
+                summary.focus();
+            }
+        });
+    }
+
+    /* Close every open row menu but `keep`. */
+    function closeMenus(root, keep) {
+        var open = root.querySelectorAll("details.ng-menu[open]");
+        for (var i = 0; i < open.length; i++) {
+            if (open[i] !== keep) {
+                open[i].open = false;
+            }
+        }
+    }
 
     /*
      * Timestamps in the viewer's own timezone.
@@ -67,6 +140,18 @@
      * At an interval of 0 no timer is created at all — not one created and
      * cleared — and the label stays hidden, so a page somebody switched
      * reloading off on says nothing about reloading.
+     *
+     * The reload DEFERS rather than fires while somebody is using the page.
+     * A whole-page reload with a menu open closes the menu, and with a form
+     * half filled in throws the typing away — on a ten second timer, which is
+     * less time than it takes to read the entries. So when the moment arrives
+     * and the page is in use, the timer is simply armed again: the reader keeps
+     * what they were doing, and the page refreshes as soon as they are done.
+     *
+     * Deferring rather than cancelling is the whole point. Cancelling on first
+     * interaction would leave a wall display frozen after somebody walked past
+     * and opened a menu, which is the failure this feature is most likely to
+     * have and least likely to be noticed.
      */
     function startAutoReload(root) {
         var seconds = resolveInterval(root);
@@ -81,9 +166,35 @@
             label.hidden = false;
         }
 
-        window.setTimeout(function () {
-            window.location.reload();
-        }, seconds * 1000);
+        var arm = function () {
+            window.setTimeout(function () {
+                if (inUse(root)) {
+                    arm();
+                    return;
+                }
+                window.location.reload();
+            }, seconds * 1000);
+        };
+        arm();
+    }
+
+    /*
+     * Whether the reader is in the middle of something a reload would destroy.
+     *
+     * Two cases, and the second is not implied by the first: a menu standing
+     * open, and focus sitting in a form control — which on a netgrasp page is
+     * the pager or a plugin-served form embedded in one, and in general is
+     * anything with a value somebody typed.
+     */
+    function inUse(root) {
+        if (root.querySelector("details.ng-menu[open]")) {
+            return true;
+        }
+        var focused = document.activeElement;
+        if (!focused || !root.contains(focused)) {
+            return false;
+        }
+        return !!focused.closest("details.ng-menu, input, select, textarea");
     }
 
     /*

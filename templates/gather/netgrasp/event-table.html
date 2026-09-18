@@ -33,6 +33,7 @@
                 <th>Event</th>
                 <th>Device</th>
                 <th>Details</th>
+                <th><span class="ng-visually-hidden">Actions</span></th>
             </tr>
         </thead>
         <tbody>
@@ -68,6 +69,47 @@
                 {# `details` is jsonb; json_encode keeps it one readable cell. #}
                 <td class="ng-details">
                     {%- if row.details -%}{{ row.details | json_encode() }}{%- endif -%}
+                </td>
+
+                {#
+                    The menu on an event row acts on the DEVICE the event is
+                    about, because an event has nothing of its own to configure:
+                    it is a read-only record, deleted wholesale on a retention
+                    timer, and DESIGN.md Decision 2 is the argument for why it
+                    stays that way. A menu offering to rename an event would be
+                    offering something the tier cannot do.
+
+                    A gather reads one record type, so this row carries
+                    `device_id` — the `ng_devices` bigint — and neither the MAC
+                    nor the device's Item. That is enough: the plugin's forms
+                    resolve a device from either a MAC or a row id, the same two
+                    shapes `netgrasp_core::assist::parse_device_ref` accepts, so
+                    the id is a complete reference. `ng_row_item` is left unset,
+                    which sends the assistant entry to the network scope — the
+                    correct answer here, since the Item's uuid is exactly what
+                    this row does not have.
+
+                    An event with no device (`device_id` null) gets no menu:
+                    there is nothing for it to be about. The bindings sit inside
+                    that guard rather than above it because both the label and
+                    the menu's reference concatenate `device_id`, and Tera's `~`
+                    raises on a null rather than rendering it empty — which would
+                    take the whole page down to the column dump for the sake of
+                    one event whose device is gone. The `{% set %}`-inside-`{% if
+                    %}` caution the device table carries is about a binding still
+                    being visible AFTER the `{% endif %}`; nothing here reads
+                    them after it, and the include that does is in the branch.
+                #}
+                <td class="ng-actions">
+                    {%- if row.device_id %}
+                    {% set ng_row_kind = "device" %}
+                    {% set ng_row_ref = row.device_id %}
+                    {% set ng_row_item = "" %}
+                    {% set ng_row_label = "device #" ~ row.device_id %}
+                    {% set ng_row_flags = false %}
+                    {% set ng_row_id = "event-" ~ row.id %}
+                    {% include "gather/netgrasp/row-actions.html" %}
+                    {%- endif %}
                 </td>
             </tr>
             {% endfor %}

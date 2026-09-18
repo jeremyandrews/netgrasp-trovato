@@ -7,6 +7,59 @@ tool will do it too.
 
 ## Unreleased
 
+### Added
+
+**Every listing row has an actions menu, and it works with scripting off.**
+`templates/gather/netgrasp/row-actions.html`, `static/js/netgrasp.js`,
+`static/css/netgrasp.css`.
+
+Device rows, event rows and person cards carry a `⋯` menu: rename, assign an
+owner, hide or unhide, mute or unmute alerts, and open a conversation about the
+row. It is a `<details>` element with a list of links in it, so the browser opens
+it on click and on Enter or Space and every entry is reachable with no
+JavaScript at all. Right-click opens the same element under the pointer and
+closes any other; Escape closes it and puts focus back on the button. Touch gets
+the visible button, which is why there is a visible button.
+
+**No entry writes from the row, and that is the kernel's decision rather than
+this plugin's.** A gather content template is rendered in its own Tera context —
+twelve keys, all of them about the query — and the site context carrying
+`csrf_token` is built afterwards for the page around it
+(`crates/kernel/src/routes/gather.rs`, `render_gather_with_theme`). A
+`<form method="post">` in a row would post with no token, and the kernel refuses
+a state-changing plugin request without one *before* dispatch, so the form would
+403 and the plugin would never be called. Each entry therefore links to a page
+`tap_api` serves, which is handed a token and renders the form.
+
+The same limitation is why "Assign owner" is a link rather than an inline
+select: a gather reads one record type, so the people list is not in a device
+page's context either. And it is why the kernel's own assistant launcher has
+never rendered on any of these nine pages — `assistant_enabled` is in the context
+that does not reach them, and an assistant that is switched off is supposed to
+render nothing, so the failure and the intended behaviour look identical.
+`FRICTION.md`: `G-GATHER-TEMPLATE-NO-CSRF`,
+`G-ASSISTANT-LAUNCHER-NEVER-RENDERS-ON-A-GATHER`, `G-ASSISTANT-NO-SEED`,
+`G-NO-ROW-ACTIONS-PARTIAL`, `G-THEME-NO-DARK-TOKENS`.
+
+**The auto-reload defers instead of firing while the page is in use.** A menu
+standing open or a focused field re-arms the timer rather than reloading.
+Reloading ten seconds after somebody opens a menu closes it before it can be
+read; cancelling outright would leave a wall display frozen because somebody
+walked past.
+
+**The gather templates are now rendered by a test, not grepped by one.**
+`plugins/netgrasp/src/lib.rs`. Every template assertion in this repository was a
+string search, and a string search cannot tell a working template from one that
+raises on the first row — which matters here more than it sounds, because a
+gather template that raises falls back to the kernel's dump of every column of
+the base table, so the page still renders and nothing looks wrong. The new test
+renders all three listings through real Tera with the rows they actually get,
+nulls included. It caught three defects in this change before any of them
+shipped: a filter inside a parenthesised `set` (a parse error, which takes the
+template down whole), `urlencode` raising on the event table's integer
+`device_id`, and `~` raising on the null `device_id` of an event whose device is
+gone.
+
 ### Fixed
 
 **A device edit no longer writes a column the tool call did not name.**

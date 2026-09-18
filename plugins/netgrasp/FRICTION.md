@@ -447,6 +447,129 @@ the column.
 
 ---
 
+## Findings from building the row actions menu (kernel 0.102.0, reported not patched)
+
+Five findings met while putting a per-row actions menu on the listing pages and
+a set of no-JavaScript forms behind it. Four of the five are one fault seen from
+four sides: **a gather content template is rendered in a context that contains
+only its own query's data**, so anything the surrounding page knows — the
+viewer, their permissions, a form token, whether the assistant is on — is
+unreachable from the place the rows are drawn.
+
+### G-GATHER-TEMPLATE-NO-CSRF — **[High, NEW]** a gather template cannot render a form token, so no listing row can contain a write
+
+`render_gather_with_theme` (`crates/kernel/src/routes/gather.rs`) builds the
+content template's context from exactly twelve keys: `query`, `rows`, `total`,
+`page`, `per_page`, `total_pages`, `has_next`, `has_prev`, `base_path`,
+`exposed_filters`, `filter_values` and `pager`. The site context — built by
+`inject_site_context` (`crates/kernel/src/routes/helpers.rs`), which is where
+`csrf_token` is inserted — is constructed *afterwards*, in `execute_and_render`,
+and is used only for the page wrapper around the already-rendered content. The
+two contexts never meet, and no template under `templates/gather/` in the kernel
+tree contains the string `_token`.
+
+**Impact.** A `<form method="post">` written into a gather row posts with no
+token. `routes/plugin_api.rs` refuses a state-changing method without one before
+dispatching, so the plugin is never called: the form 403s, and it 403s in a way
+that looks like a plugin bug. Every row action in this plugin is therefore a
+**link** to a page `tap_api` serves, because `ApiRequest::csrf_token` is the only
+place a plugin can get a valid token. That is one extra page load per action, on
+a menu whose whole purpose is to save one.
+
+It also means a listing cannot hide an action from a viewer who is not allowed
+to take it: the gather context carries no viewer and no permissions, so the menu
+is drawn identically for everyone and the refusal happens one click later.
+
+**Recommendation (post-1.0, small):** insert `csrf_token` — and the viewer's
+authentication state — into the gather content context alongside `base_path`.
+Both are already computed in `execute_and_render` (`viewer` on the first line of
+it) before the content is rendered; this is a matter of passing what is in hand.
+
+### G-ASSISTANT-LAUNCHER-NEVER-RENDERS-ON-A-GATHER — **[Medium, NEW]** the kernel's own launcher partial is inert on every gather page
+
+`templates/assistant/launcher.html` renders nothing unless `assistant_enabled` is
+truthy, and `assistant_enabled` is inserted by `inject_site_context` — which, per
+the finding above, does not reach a gather content template. A gather template
+that includes the partial gets an undefined variable, which Tera's `{% if %}`
+reads as false.
+
+**Impact.** This is not hypothetical and it is not this build's doing: the
+network assistant launcher on this plugin's nine listing pages
+(`templates/gather/netgrasp/page.html`) has never rendered, on any of them, since
+it was added — and nothing reports it, because an assistant that is switched off
+is *supposed* to render nothing. The failure is indistinguishable from the
+intended behaviour.
+
+The consequence for the row menu is that the "Ask the assistant" entry cannot be
+gated the way the kernel's own partial gates itself. It is rendered
+unconditionally, so on a site with the assistant switched off it is an entry that
+leads somewhere unhelpful.
+
+**Recommendation (post-1.0, trivial):** same fix as above — `assistant_enabled`
+and `assistant_scopes` into the gather content context. The partial is already
+written to be included by a plugin's template; it just cannot work there.
+
+### G-ASSISTANT-NO-SEED — **[Medium, NEW]** a conversation cannot be opened on a question
+
+`/ai/assistant/{scope}` and `/ai/assistant/{scope}/{scope_id}` take a `Path` and
+nothing else (`crates/kernel/src/routes/assistant.rs`): there is no `Query`
+extractor on either, and no release carries one — `seed` appears nowhere in the
+assistant routes, the service or the templates at `v0.102.0` or on `main`.
+
+**Impact.** A menu entry can open a conversation *about* a thing but cannot say
+what was being asked. "Ask the assistant about this device" lands on an empty
+conversation the person then has to restate their question into, having just
+clicked an entry that stated it. Worse where the scope is wrong for the subject:
+a device with no Item has no `netgrasp_device` conversation to open, so the entry
+falls back to the network scope, where the specific device is exactly the context
+that has been lost. This plugin puts the device's reference in the query string
+against the day the parameter exists; today the kernel ignores it.
+
+**Recommendation (post-1.0, small):** accept `?seed=<text>` and post it as the
+conversation's first user message. Bounded in length and escaped like any other
+user input; it is the difference between a launcher and a link.
+
+### G-NO-ROW-ACTIONS-PARTIAL — **[Low, NEW]** there is no shared element for a per-row menu, so every consumer invents one
+
+The kernel ships `templates/elements/` partials for a plugin's UI to reuse, and
+there is no `row-actions.html` among them at `v0.102.0` or on `main`. A listing
+row's actions menu is the same shape for every plugin that has one — a
+disclosure, a list of links, a keyboard escape, a focus ring — and there is
+nothing to inherit.
+
+**Impact.** This plugin ships its own
+(`templates/gather/netgrasp/row-actions.html`), with its own markup contract, its
+own class names and its own dark-mode rules. A second plugin doing the same will
+not match it, and neither will match the kernel's own admin listings.
+
+**Recommendation (post-1.0, small):** an `elements/row-actions.html` taking a
+list of `{href, label}` and an accessible name, with the CSS in the theme. The
+hard part is not the markup; it is that the entries in it want a form token,
+which is `G-GATHER-TEMPLATE-NO-CSRF` again.
+
+### G-THEME-NO-DARK-TOKENS — **[Low, NEW]** the theme is light-only, so a plugin that wants dark mode invents its own palette
+
+`prefers-color-scheme` appears in no stylesheet and no template in the kernel
+tree. The tokens the theme publishes (`--gray-50` … `--gray-950`, `--success`,
+`--warning`, `--danger`, `templates/base.html` and `static/css/theme.css`) are
+fixed light values with no dark counterpart, and there is no `--surface` or
+`--text` to follow.
+
+**Impact.** A plugin styling its own pages for dark mode has nothing to derive
+from, so it names its own surface tokens and its own dark values — as
+`static/css/netgrasp.css` now does. Those values cannot be right: they are
+guesses at a palette the site owner never chose, and the page chrome around the
+plugin's content stays light regardless, because reaching it would mean editing
+Trovato.
+
+**Recommendation (post-1.0, medium):** publish semantic surface tokens
+(`--surface`, `--surface-raised`, `--text`, `--text-muted`, `--border`) and a
+`@media (prefers-color-scheme: dark)` block redefining them at `:root`. A plugin
+then gets dark mode by using the tokens, and the site gets one answer instead of
+one per plugin.
+
+---
+
 ## Findings from the first joint run (kernel 0.102.0, reported not patched)
 
 Seven kernel defects were met while running the daemon and this plugin together

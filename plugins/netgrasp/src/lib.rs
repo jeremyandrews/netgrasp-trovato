@@ -764,6 +764,283 @@ mod tests {
         }
     }
 
+    /// The row menu is one partial included by three templates, which is the
+    /// only reason the device table, the event table and the people cards offer
+    /// the same entries. A listing that stops including it loses its menu
+    /// silently: the rows still render, and nothing anywhere is an error.
+    #[test]
+    fn every_listing_offers_the_row_menu() {
+        for (what, template) in [
+            (
+                "device-table.html",
+                include_str!("../../../templates/gather/netgrasp/device-table.html"),
+            ),
+            (
+                "event-table.html",
+                include_str!("../../../templates/gather/netgrasp/event-table.html"),
+            ),
+            (
+                "query--ng_person_list.html",
+                include_str!("../../../templates/gather/query--ng_person_list.html"),
+            ),
+        ] {
+            assert!(
+                template.contains("gather/netgrasp/row-actions.html"),
+                "{what} no longer includes the row actions menu"
+            );
+            assert!(
+                template.contains("ng_row_ref"),
+                "{what} includes the menu without telling it what the row is"
+            );
+        }
+    }
+
+    /// **The menu may not write from a gather row, and this is why.**
+    ///
+    /// A gather content template is rendered in its own Tera context and the
+    /// site context that carries `csrf_token` is built afterwards, for the page
+    /// around it (`G-GATHER-TEMPLATE-NO-CSRF`). A `<form method="post">` here
+    /// would post with no token, and the kernel refuses a state-changing plugin
+    /// request without one *before* dispatching — so the form would 403 and the
+    /// plugin would never be called.
+    ///
+    /// The failure is silent in the worst way: it looks exactly like a broken
+    /// handler. This test is what stops somebody restoring the "obvious" inline
+    /// form in a year's time and spending a day on the 403.
+    #[test]
+    fn the_row_menu_writes_nothing_from_a_gather_row() {
+        let partial = include_str!("../../../templates/gather/netgrasp/row-actions.html");
+        let markup = strip_tera_comments(partial);
+        assert!(
+            !markup.contains("<form"),
+            "a gather template cannot carry a form token, so the menu must not post from a row"
+        );
+        assert!(
+            !markup.contains("method=\"post\""),
+            "a gather template cannot carry a form token, so the menu must not post from a row"
+        );
+    }
+
+    /// The right-click handler and the menu are two files agreeing on one
+    /// selector, the same way the chrome and the script agree on the refresh
+    /// attribute. Rename the class in one of them and right-click silently
+    /// stops working while the button keeps working — the hardest kind of half
+    /// to notice.
+    #[test]
+    fn the_menu_and_the_script_agree_on_the_menu_element() {
+        let partial = include_str!("../../../templates/gather/netgrasp/row-actions.html");
+        let script = include_str!("../../../static/js/netgrasp.js");
+
+        assert!(
+            partial.contains("<details class=\"ng-menu\""),
+            "the menu is no longer a details element with the class the script looks for"
+        );
+        assert!(
+            script.contains("details.ng-menu"),
+            "the script no longer finds the menu"
+        );
+        assert!(
+            script.contains("contextmenu"),
+            "the script no longer opens the menu on right-click"
+        );
+        // The no-JavaScript guarantee, asserted rather than trusted: the menu
+        // opens because it is a <details>, so the script must never be what
+        // makes an entry reachable.
+        assert!(
+            partial.contains("<summary"),
+            "the menu no longer opens without JavaScript"
+        );
+    }
+
+    /// The reload must not close a menu somebody just opened. The script and
+    /// the menu agree on that through the same selector as above; what this
+    /// pins is that the deferral exists at all, because removing it leaves a
+    /// menu that closes itself ten seconds after it opens.
+    #[test]
+    fn the_reload_defers_while_the_page_is_in_use() {
+        let script = include_str!("../../../static/js/netgrasp.js");
+        assert!(
+            script.contains("inUse"),
+            "the reload no longer checks whether the page is in use"
+        );
+        assert!(
+            script.contains("details.ng-menu[open]"),
+            "the reload no longer notices an open menu"
+        );
+    }
+
+    /// The menu is styled in both colour schemes. A dark-mode block that loses
+    /// the menu's rules leaves an unreadable control rather than an ugly one.
+    #[test]
+    fn the_stylesheet_covers_the_menu_in_both_schemes() {
+        let css = include_str!("../../../static/css/netgrasp.css");
+        for class in [
+            ".ng-menu",
+            ".ng-menu__button",
+            ".ng-menu__panel",
+            ".ng-actions",
+            ".ng-visually-hidden",
+        ] {
+            assert!(css.contains(class), "{class} is not styled");
+        }
+        assert!(
+            css.contains("@media (prefers-color-scheme: dark)"),
+            "the stylesheet has no dark mode"
+        );
+        let (_, dark) = css
+            .split_once("@media (prefers-color-scheme: dark)")
+            .unwrap_or_default();
+        assert!(
+            dark.contains(".ng-menu__button"),
+            "the menu button is not restyled for dark mode"
+        );
+    }
+
+    /// **The listing templates are rendered, not grepped.**
+    ///
+    /// Every other template assertion in this file is a string search, which
+    /// cannot tell a working template from one that aborts on the first row. It
+    /// matters more here than it sounds: when a gather template raises, the
+    /// kernel falls back to its built-in dump of every column of the base
+    /// table, daemon internals included — the page still renders, so nothing
+    /// looks broken, and seven of these nine pages were in exactly that state
+    /// before `gather/netgrasp/page.html` existed.
+    ///
+    /// The rows below are the shape a *record* gather really yields: flat, keyed
+    /// by physical column name, with JSON nulls where a column is unset — which
+    /// is the case that breaks templates, because `default` does not fire for a
+    /// null and an undefined variable aborts the render.
+    #[test]
+    fn every_listing_template_renders_with_the_rows_it_will_really_get() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+
+        // A device with everything, and a device with nothing but the two
+        // columns the schema guarantees: a MAC and an id. The second is the
+        // interesting one — no Item, no name, no owner, no flags.
+        let devices = serde_json::json!([
+            {
+                "id": 1,
+                "mac": "02:00:5e:00:00:04",
+                "display_name": "Office printer",
+                "resolved_name": "printer.local",
+                "hostname": "printer",
+                "device_type": "printer",
+                "state": "online",
+                "last_ip": "10.0.2.18",
+                "owner_item_id": "0193a5a0-0000-7000-8000-00000000000a",
+                "owner_name": "Jamie",
+                "hidden": false,
+                "notify": true,
+                "trovato_item_id": "0193a5a0-0000-7000-8000-00000000000b",
+                "last_seen_at_epoch": 1_757_000_000
+            },
+            {
+                "id": 2,
+                "mac": "02:00:5e:00:00:09",
+                "display_name": null,
+                "resolved_name": null,
+                "hostname": null,
+                "device_type": null,
+                "state": null,
+                "last_ip": null,
+                "owner_item_id": null,
+                "owner_name": null,
+                "hidden": null,
+                "notify": null,
+                "trovato_item_id": null,
+                "last_seen_at_epoch": null
+            }
+        ]);
+
+        let events = serde_json::json!([
+            {
+                "id": 11,
+                "device_id": 2,
+                "event_type": "arp_spoof",
+                "timestamp_epoch": 1_757_000_100,
+                "details": {"claimed": "10.0.2.1"}
+            },
+            // An event with no device: the row that must render a menu-less
+            // cell rather than a menu about nothing.
+            {"id": 12, "device_id": null, "event_type": null, "timestamp_epoch": null, "details": null}
+        ]);
+
+        let people = serde_json::json!([
+            {
+                "id": "0193a5a0-0000-7000-8000-00000000000a",
+                "title": "Jamie",
+                "fields": {"field_notes": "", "field_notify_arrive": true}
+            },
+            // A person with no fields at all, which is what an Item the plugin
+            // minted carrying only a title looks like.
+            {"id": "0193a5a0-0000-7000-8000-00000000000c", "title": null, "fields": {}}
+        ]);
+
+        for (template, rows) in [
+            ("gather/netgrasp/device-table.html", &devices),
+            ("gather/netgrasp/event-table.html", &events),
+            ("gather/query--ng_person_list.html", &people),
+        ] {
+            let mut context = tera::Context::new();
+            context.insert("rows", rows);
+            context.insert("total", &2);
+            context.insert("page", &1);
+            context.insert("total_pages", &1);
+            context.insert("base_path", "/devices");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": "ng_device_list", "label": "Devices"}),
+            );
+            context.insert("filter_values", &serde_json::json!({}));
+
+            let html = tera
+                .render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"));
+
+            // The menu reached every row, including the row with nothing on it.
+            assert!(
+                html.contains("ng-menu__button"),
+                "{template} rendered no row menu"
+            );
+            // The degradation rule: a device with no Item still gets actions,
+            // and its assistant entry falls back to the network scope carrying
+            // the device's own reference.
+            if template == "gather/netgrasp/device-table.html" {
+                assert!(
+                    html.contains("/ai/assistant/netgrasp_device/"),
+                    "a device with an Item must open its own scope"
+                );
+                assert!(
+                    html.contains("/ai/assistant/netgrasp_network?device="),
+                    "a device with no Item must fall back to the network scope"
+                );
+                assert!(
+                    html.contains("02%3A00%3A5e%3A00%3A00%3A09"),
+                    "the fallback must carry the MAC: {html}"
+                );
+            }
+        }
+    }
+
+    /// Tera comments are not markup, and this file's comments discuss the very
+    /// markup the test above forbids.
+    fn strip_tera_comments(template: &str) -> String {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(start) = rest.find("{#") {
+            out.push_str(&rest[..start]);
+            match rest[start..].find("#}") {
+                Some(end) => rest = &rest[start + end + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Every menu path must also be a path the *web* interface can serve. The
     /// alias test above proves the route exists; this one proves the migration
     /// that makes the menu visible at all is still shipped, since a menu nobody

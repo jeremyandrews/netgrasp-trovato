@@ -27,9 +27,30 @@
 <ul class="ng-people">
     {% for row in rows %}
     <li class="ng-person">
-        <h2 class="ng-person__name">
-            <a href="/devices/owner?owner={{ row.id }}">{{ row.title | default(value="(unnamed)") }}</a>
-        </h2>
+        {#
+            The people page is cards rather than a table, so the menu sits in
+            the card's header instead of a last column. It is the same partial
+            and the same entries a table row gets, minus the two a person does
+            not have: nobody owns a person, and `ng_person` has no `hidden`
+            field — only `field_notify_arrive` and `field_notify_depart`, which
+            is the one alert entry below.
+
+            `row.id` is the person's Item uuid here, not a record id: this is
+            the one gather in the directory whose rows are Items, which is also
+            why the assistant entry can open the person scope directly.
+        #}
+        <div class="ng-person__header">
+            <h2 class="ng-person__name">
+                <a href="/devices/owner?owner={{ row.id }}">{{ row.title | default(value="(unnamed)") }}</a>
+            </h2>
+            {% set ng_row_kind = "person" %}
+            {% set ng_row_ref = row.id %}
+            {% set ng_row_item = row.id %}
+            {% set ng_row_label = row.title | default(value="this person") %}
+            {% set ng_row_flags = false %}
+            {% set ng_row_id = row.id %}
+            {% include "gather/netgrasp/row-actions.html" %}
+        </div>
         {# No id chip here, unlike the device table and Who is home: those two
            pages have only a uuid to label a person with, and this one has the
            name. An id shown beside the name it identifies is noise. #}

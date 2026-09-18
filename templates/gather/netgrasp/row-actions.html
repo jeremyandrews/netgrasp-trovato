@@ -1,0 +1,155 @@
+{#
+    The per-row actions menu, shared by the device table, the event table and
+    the people list.
+
+    One partial for all three, for the reason device-table.html gives about
+    itself: three copies of a menu is a menu that stops agreeing with itself the
+    first time an entry is added to one of them.
+
+    ===========================================================================
+    Why every entry is a LINK and not a form
+    ===========================================================================
+    A write has to carry the kernel's `_token`, and **a gather content template
+    cannot render one.** The gather route renders this template in a context of
+    its own — `query`, `rows`, `total`, `page`, `per_page`, `total_pages`,
+    `has_next`, `has_prev`, `base_path`, `exposed_filters`, `filter_values`,
+    `pager`, and nothing else (`crates/kernel/src/routes/gather.rs`,
+    `render_gather_with_theme`). The site context that carries `csrf_token` is
+    built *afterwards*, for the page wrapper around this content
+    (`routes/helpers.rs`, `inject_site_context`). The two never meet.
+
+    So a `<form method="post">` written here would post without a token and the
+    kernel would refuse it with 403 before the plugin was dispatched at all —
+    not a bug to be found later, a feature that could never have worked.
+
+    What does work, and is what every entry below does: link to a page the
+    PLUGIN serves. `tap_api` is handed a freshly minted token in
+    `ApiRequest::csrf_token`, so the plugin renders the single-field form with a
+    valid token in it and the POST goes from there. That is the
+    `trovato_contact` pattern, and it is the only no-JavaScript write path a
+    plugin has. `FRICTION.md`, `G-GATHER-TEMPLATE-NO-CSRF`.
+
+    It is also what makes "Assign owner" a select of people at all: a gather
+    reads ONE record type, so the people list is not in this context either. The
+    page the link opens can read it; this template cannot.
+
+    ===========================================================================
+    What the caller sets before including
+    ===========================================================================
+    - `ng_row_kind`   — "device" or "person". Decides which entries appear.
+    - `ng_row_ref`    — how the plugin is to find the thing: a MAC or an
+                        `ng_devices.id` for a device, a person's Item uuid for a
+                        person. The device forms parse either, the same way
+                        `netgrasp_core::assist::parse_device_ref` does, which is
+                        what lets an event row — which carries `device_id` and
+                        no MAC — offer the same device actions as a device row.
+    - `ng_row_label`  — what to call it in the menu's accessible name.
+    - `ng_row_item`   — the Trovato Item uuid, or empty. Empty is normal: a
+                        device has no Item until the cron sync mints one, and a
+                        row the daemon has never marked dirty may never have had
+                        one (DESIGN.md Decision 9).
+    - `ng_row_flags`  — whether this row carries the device's user-owned flags.
+                        A device row does; an event row does not.
+    - `ng_row_hidden` / `ng_row_notify` — those flags, read only when
+                        `ng_row_flags` says they mean anything. Devices only.
+    - `ng_row_id`     — a value unique on the page, for the `id` attributes.
+
+    `base_path` is the listing to come back to and comes from the gather
+    context, not from the caller.
+#}
+{#
+    Each filtered value is bound on its own line and interpolated at the point
+    of use. Tera will not parse a filter inside a parenthesised sub-expression
+    of a `set` — `"?back=" ~ (base_path | urlencode)` is a parse error, not a
+    runtime one, so it takes the whole template down with it and the page falls
+    back to the kernel's column dump. The render test in `src/lib.rs` is what
+    caught that, and is why it exists.
+
+    `ng_row_ref` is concatenated with an empty string before it is encoded,
+    because it is not always text: a device row names its device by MAC and an
+    event row names the same device by `ng_devices.id`, which arrives as a JSON
+    number. `urlencode` raises on a number rather than coercing it, and raising
+    in a gather template is the column dump again. The same render test caught
+    this one too.
+#}
+{%- set ng_back = base_path | urlencode -%}
+{%- set ng_ref_text = ng_row_ref ~ "" -%}
+{%- set ng_target = ng_ref_text | urlencode -%}
+
+<details class="ng-menu" id="ng-menu-{{ ng_row_id }}">
+    {#
+        `<summary>` is the whole no-JavaScript mechanism: a disclosure widget
+        the browser opens on click and on Enter or Space, focusable by keyboard
+        without a `tabindex`, with no script anywhere in the path. The
+        contextmenu handler in netgrasp.js opens this same element and adds
+        nothing it does not already do.
+    #}
+    <summary class="ng-menu__button" aria-label="Actions for {{ ng_row_label }}">
+        <span aria-hidden="true">&ctdot;</span>
+    </summary>
+    <div class="ng-menu__panel">
+        <ul class="ng-menu__list">
+            {%- if ng_row_kind == "device" %}
+            <li><a href="/netgrasp/device/rename?back={{ ng_back }}&amp;target={{ ng_target }}">Rename&hellip;</a></li>
+            <li><a href="/netgrasp/device/owner?back={{ ng_back }}&amp;target={{ ng_target }}">Assign owner&hellip;</a></li>
+            {#
+                The label says what the entry DOES, not what the row is: "Hide"
+                on an already hidden device is the kind of menu that gets
+                clicked twice.
+
+                It can only say that where the row knows the flag, which is the
+                device tables and not the event table — an event row carries
+                `device_id` and none of the device's user-owned columns. Rather
+                than assume a value and label the entry with a direction that
+                may be the wrong one, `ng_row_flags` says whether the caller
+                actually knows, and the entry goes neutral when it does not. The
+                page the link opens reads the real value and says which way it
+                is about to go, so nothing is lost but a word.
+            #}
+            <li><a href="/netgrasp/device/hidden?back={{ ng_back }}&amp;target={{ ng_target }}">
+                {%- if not ng_row_flags %}Hide or unhide&hellip;
+                {%- elif ng_row_hidden %}Unhide
+                {%- else %}Hide{% endif -%}
+            </a></li>
+            <li><a href="/netgrasp/device/notify?back={{ ng_back }}&amp;target={{ ng_target }}">
+                {%- if not ng_row_flags %}Arrival alerts&hellip;
+                {%- elif ng_row_notify %}Mute alerts
+                {%- else %}Unmute alerts{% endif -%}
+            </a></li>
+            {%- else %}
+            <li><a href="/netgrasp/person/rename?back={{ ng_back }}&amp;target={{ ng_target }}">Rename&hellip;</a></li>
+            <li><a href="/netgrasp/person/notify?back={{ ng_back }}&amp;target={{ ng_target }}">Arrival alerts&hellip;</a></li>
+            {%- endif %}
+            {#
+                The assistant entry, and the scope it can honestly open.
+
+                An Item-scoped conversation needs the Item's uuid. Where there
+                is none — a device the cron sync has never minted an Item for,
+                or an event row, which carries neither — the entry degrades to
+                the network scope, which takes no id, and carries the device's
+                own reference so the conversation can be about something. The
+                kernel's assistant route reads only its path, so that reference
+                rides in the query string where a `seed` would go if one
+                existed: inert today, and still better than an entry that opens
+                a conversation about nothing in particular. `FRICTION.md`,
+                `G-ASSISTANT-NO-SEED`.
+
+                Written out here rather than bound to a variable above, because
+                a `{% set %}` inside an `{% if %}` is not reliably visible after
+                the `{% endif %}` — the trap device-table.html's naming ladder
+                carries the same warning about.
+            #}
+            <li class="ng-menu__separator">
+                <a href="/ai/assistant/
+                    {%- if ng_row_kind == "person" -%}
+                    netgrasp_person/{{ ng_row_ref }}
+                    {%- elif ng_row_item -%}
+                    netgrasp_device/{{ ng_row_item }}
+                    {%- else -%}
+                    netgrasp_network?device={{ ng_target }}
+                    {%- endif -%}
+                ">Ask the assistant about this</a>
+            </li>
+        </ul>
+    </div>
+</details>

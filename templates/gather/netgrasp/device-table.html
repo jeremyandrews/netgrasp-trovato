@@ -21,6 +21,12 @@
                 <th>MAC</th>
                 <th>Owner</th>
                 <th>Last seen</th>
+                {# The actions column has no visible heading: the header cell of
+                   a column of menu buttons has nothing to say that the buttons
+                   do not, and "Actions" repeated above every row is noise a
+                   screen reader has to read past. The accessible name is on
+                   each button instead. #}
+                <th><span class="ng-visually-hidden">Actions</span></th>
             </tr>
         </thead>
         <tbody>
@@ -121,6 +127,37 @@
                     {%- if row.last_seen_at_epoch -%}
                     {{ row.last_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                {#
+                    The row's menu. Every entry is a link to a page the plugin
+                    serves, for the reason row-actions.html gives at length: a
+                    gather template has no `csrf_token` in its context, so a
+                    write cannot start here.
+
+                    The device is named to the plugin by its MAC. The MAC is the
+                    daemon's own identity for the row and is never null, so this
+                    works on a device whose Item has not been minted yet — which
+                    is the case the `trovato_item_id` guard four columns to the
+                    left exists for. `ng_row_item` carries the Item when there
+                    is one, and only the assistant entry needs it.
+
+                    The accessible name is the MAC rather than the displayed
+                    name: the naming ladder above is an if-chain precisely
+                    because these columns arrive as JSON null, and it cannot be
+                    bound to a variable here without the `{% set %}`-inside-`{%
+                    if %}` trap that chain's own comment warns about.
+                #}
+                <td class="ng-actions">
+                    {% set ng_row_kind = "device" %}
+                    {% set ng_row_ref = row.mac %}
+                    {% set ng_row_item = row.trovato_item_id %}
+                    {% set ng_row_label = row.mac %}
+                    {% set ng_row_flags = true %}
+                    {% set ng_row_hidden = row.hidden %}
+                    {% set ng_row_notify = row.notify %}
+                    {% set ng_row_id = row.id %}
+                    {% include "gather/netgrasp/row-actions.html" %}
                 </td>
             </tr>
             {% endfor %}
