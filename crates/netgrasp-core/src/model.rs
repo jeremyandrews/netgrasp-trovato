@@ -25,9 +25,20 @@ pub struct DeviceRow {
     pub id: i64,
     /// Hardware address. The daemon's identity for the device.
     pub mac: String,
-    /// Reverse-DNS or mDNS name, when one resolves.
+    /// The daemon's own resolved identity for the device, and the name every
+    /// page shows: the answer its identity resolution settled on, with
+    /// `identity_source` saying which signal produced it. It outranks the raw
+    /// signals below, and leaving it out of the title derivation is what titled
+    /// a Brother printer after a Singapore OUI holder (`docs/JOINT-RUN.md`,
+    /// plugin finding 2).
+    #[serde(default)]
+    pub resolved_name: Option<String>,
+    /// Reverse-DNS or DHCP hostname, when one resolves.
     #[serde(default)]
     pub hostname: Option<String>,
+    /// mDNS name, when one was advertised.
+    #[serde(default)]
+    pub mdns_name: Option<String>,
     /// OUI lookup result.
     #[serde(default)]
     pub vendor: Option<String>,
@@ -58,6 +69,29 @@ pub struct DeviceRow {
     /// The linked `ng_device` Item, once the sync pass has created one.
     #[serde(default)]
     pub trovato_item_id: Option<String>,
+
+    // The rest of the user-owned set. Read by the sync pass for one purpose:
+    // an Item minted without them reads them back as absent, and `field_bool`
+    // maps an absent boolean to `false` — so a device Item created carrying
+    // only its MAC turns `notify` off (`NOT NULL DEFAULT TRUE` in the daemon's
+    // schema) the first time anything writes the whole overlay back. The mint
+    // carries the row's values so the two tiers agree from birth.
+    //
+    // `Option<bool>` rather than `bool`, because these are read by one
+    // projection and not by the other: `None` is "this statement did not read
+    // it", which is not the same claim as `false`.
+    /// Free text an admin keeps about the device.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Hidden from the default listings. `None` when unread.
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    /// Arrival and departure alerts. `None` when unread.
+    #[serde(default)]
+    pub notify: Option<bool>,
+    /// Item id of the owning `ng_person`. `None` for unowned or unread.
+    #[serde(default)]
+    pub owner_item_id: Option<String>,
 }
 
 impl DeviceRow {
@@ -67,7 +101,9 @@ impl DeviceRow {
         Self {
             id,
             mac: mac.into(),
+            resolved_name: None,
             hostname: None,
+            mdns_name: None,
             vendor: None,
             device_type: None,
             os_family: None,
@@ -78,6 +114,28 @@ impl DeviceRow {
             last_seen: None,
             display_name: None,
             trovato_item_id: None,
+            notes: None,
+            hidden: None,
+            notify: None,
+            owner_item_id: None,
+        }
+    }
+
+    /// The user-owned overlay this row currently carries, as a sparse edit.
+    ///
+    /// Used when the sync pass mints an Item for a row that has none: the Item
+    /// is created carrying these values rather than carrying only the MAC, so
+    /// the two tiers agree from the moment the Item exists. A column the
+    /// projection did not read is absent here rather than defaulted, so a
+    /// narrower read cannot invent a value.
+    #[must_use]
+    pub fn overlay(&self) -> DeviceEdit {
+        DeviceEdit {
+            display_name: None,
+            owner_item_id: self.owner_item_id.clone().map(Some),
+            notes: self.notes.clone(),
+            hidden: self.hidden,
+            notify: self.notify,
         }
     }
 }
@@ -99,6 +157,106 @@ pub struct DeviceOverlay {
     pub hidden: bool,
     /// Whether arrival/departure of this device is worth telling someone about.
     pub notify: bool,
+}
+
+/// A **sparse** device overlay: the user-owned columns one edit names, and no
+/// others.
+///
+/// [`DeviceOverlay`] is the whole overlay and is the right shape for the admin
+/// content form, which submits every field: the saved Item *is* the new state.
+/// It is the wrong shape for an assistant tool call, which names one thing —
+/// "rename this to Office printer" says nothing about the alerts — and this is
+/// what that difference cost:
+///
+/// A rename built a full overlay, filling the fields the call did not name from
+/// the device's Item. The cron sync mints a device Item carrying only
+/// `field_mac`, so `field_notify` was absent, `field_bool` read an absent
+/// boolean as `false`, and the write-back wrote `notify = false` over a column
+/// the daemon's schema defaults to `TRUE`. A rename turned the device's alerts
+/// off, and the proposal card said nothing about it. Observed twice in one run,
+/// on a rename and on an owner assignment, with 33 of 34 device Items still in
+/// the state that reproduces it (`docs/JOINT-RUN.md`, plugin finding 1).
+///
+/// So an edit says, per column, either "set it to this" or nothing at all, and
+/// [`crate::writeback::build_partial_update`] builds its `SET` list from
+/// [`DeviceEdit::columns`]. A column nobody named is not in the statement, so
+/// there is no value for it to be wrong about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEdit {
+    /// The device's label — the Item's title, stored as `display_name`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The owner. `Some(None)` unassigns; the outer `None` leaves it alone.
+    ///
+    /// Two levels because "give this device to nobody" and "this call is not
+    /// about the owner" are different instructions with different statements,
+    /// and one level cannot tell them apart.
+    #[serde(default)]
+    pub owner_item_id: Option<Option<String>>,
+    /// The notes. An empty or blank string clears them.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Hidden from the default listings.
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    /// Arrival and departure alerts.
+    #[serde(default)]
+    pub notify: Option<bool>,
+}
+
+impl DeviceEdit {
+    /// Every user-owned column, named. The shape an admin's whole-Item edit has.
+    #[must_use]
+    pub fn from_overlay(overlay: &DeviceOverlay) -> Self {
+        Self {
+            display_name: Some(overlay.display_name.clone()),
+            owner_item_id: Some(overlay.owner_item_id.clone()),
+            // A blank string and a `None` both become SQL `NULL`, which is what
+            // the whole-Item path has always written for absent notes.
+            notes: Some(overlay.notes.clone().unwrap_or_default()),
+            hidden: Some(overlay.hidden),
+            notify: Some(overlay.notify),
+        }
+    }
+
+    /// Whether this edit names `column`.
+    ///
+    /// A column this type does not carry answers `false`, which is what makes
+    /// "a daemon column cannot be written" hold here as well as in the
+    /// statement builder.
+    #[must_use]
+    pub fn names(&self, column: &str) -> bool {
+        match column {
+            "display_name" => self.display_name.is_some(),
+            "owner_item_id" => self.owner_item_id.is_some(),
+            "notes" => self.notes.is_some(),
+            "hidden" => self.hidden.is_some(),
+            "notify" => self.notify.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The user-owned columns this edit writes, in [`crate::columns::USER_OWNED`]
+    /// order.
+    ///
+    /// The one answer to "what will change", read by the statement builder and
+    /// by the proposal card alike, so what somebody clicks Apply on is what
+    /// happens. Iterating `USER_OWNED` rather than listing the fields again is
+    /// what keeps this in step with the statement's `SET` list.
+    #[must_use]
+    pub fn columns(&self) -> Vec<&'static str> {
+        crate::columns::USER_OWNED
+            .iter()
+            .copied()
+            .filter(|column| self.names(column))
+            .collect()
+    }
+
+    /// Whether this edit would change nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns().is_empty()
+    }
 }
 
 /// The fields of an `ng_person` Item, mirrored into `ng_people` for the daemon.
@@ -387,6 +545,82 @@ mod tests {
             serde_json::from_str(r#"{"event_type":"device_seen","timestamp":1000}"#).unwrap();
         assert!(row.details.is_empty());
         assert!(row.detail("anything").is_none());
+    }
+
+    // --- the sparse edit --------------------------------------------------
+
+    /// The change set is in `USER_OWNED` order because it is *read out of*
+    /// `USER_OWNED`, which is the same thing that orders the statement's `SET`
+    /// list. Two lists in one order by construction rather than by agreement.
+    #[test]
+    fn an_edits_columns_are_the_user_owned_ones_it_names_in_that_order() {
+        let edit = DeviceEdit {
+            notify: Some(false),
+            display_name: Some("Office printer".into()),
+            ..DeviceEdit::default()
+        };
+        assert_eq!(edit.columns(), ["display_name", "notify"]);
+        assert!(edit.names("display_name"));
+        assert!(edit.names("notify"));
+        assert!(!edit.names("hidden"));
+        assert!(!edit.is_empty());
+    }
+
+    #[test]
+    fn an_edit_that_names_nothing_is_empty_and_an_edit_of_everything_is_full() {
+        assert!(DeviceEdit::default().is_empty());
+        assert!(DeviceEdit::default().columns().is_empty());
+        assert_eq!(
+            DeviceEdit::from_overlay(&DeviceOverlay::default()).columns(),
+            crate::columns::USER_OWNED.to_vec()
+        );
+    }
+
+    /// Unassigning names the owner column. One level of `Option` could not tell
+    /// "give it to nobody" from "this call is not about the owner", and the
+    /// difference is a statement.
+    #[test]
+    fn unassigning_names_the_owner_and_silence_about_it_does_not() {
+        let unassign = DeviceEdit {
+            owner_item_id: Some(None),
+            ..DeviceEdit::default()
+        };
+        assert_eq!(unassign.columns(), ["owner_item_id"]);
+        assert!(DeviceEdit::default().columns().is_empty());
+    }
+
+    /// A column outside the user-owned set is not named by any edit, whatever
+    /// it is asked about — the same guarantee the statement builder makes, made
+    /// one layer earlier so the card cannot display one either.
+    #[test]
+    fn an_edit_never_names_a_daemon_column() {
+        let full = DeviceEdit::from_overlay(&DeviceOverlay::default());
+        for daemon in crate::columns::DAEMON_OWNED {
+            assert!(!full.names(daemon), "an edit claims to name {daemon}");
+        }
+        assert!(!full.names("trovato_item_id"));
+        assert!(!full.names(""));
+    }
+
+    /// A row's overlay carries what the projection read and stays silent about
+    /// the rest: a narrower read must not assert `notify = false` about a device
+    /// whose `notify` column it never looked at.
+    #[test]
+    fn a_rows_overlay_is_silent_about_a_column_the_projection_did_not_read() {
+        let mut row = DeviceRow::new(1, "aa:bb:cc:dd:ee:ff");
+        assert!(row.overlay().is_empty());
+
+        row.notify = Some(true);
+        row.hidden = Some(false);
+        row.notes = Some("in the hall cupboard".into());
+        let overlay = row.overlay();
+        assert_eq!(overlay.columns(), ["hidden", "notes", "notify"]);
+        assert_eq!(overlay.notify, Some(true));
+        // Still silent about the owner, which this row has not read.
+        assert!(!overlay.names("owner_item_id"));
+        // And never about the title: a row's `display_name` is what the sync
+        // derives a title FROM, not something a mint writes back.
+        assert!(!overlay.names("display_name"));
     }
 
     #[test]

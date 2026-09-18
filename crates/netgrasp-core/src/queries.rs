@@ -34,9 +34,24 @@
 ///
 /// Ordered by the timestamp rather than by its epoch twin: they sort
 /// identically, and the daemon indexes the timestamp.
-pub const SELECT_DIRTY_DEVICES: &str = "SELECT id, mac, hostname, vendor, device_type, os_family, \
-     state, last_ip, current_location, first_seen_at_epoch AS first_seen, \
-     last_seen_at_epoch AS last_seen, display_name, trovato_item_id \
+///
+/// It reads the **whole user-owned set**, not just `display_name`, for the one
+/// step of the pass that needs it: minting an Item for a row that has none. An
+/// Item created carrying only its MAC reads every other user-owned field back
+/// as absent, and `field_bool` reads an absent boolean as `false` — so the next
+/// whole-Item write-back turned `notify` off on a column the daemon defaults to
+/// `TRUE`. The mint carries the row's values instead, so the two tiers agree
+/// from the moment the Item exists (`docs/JOINT-RUN.md`, plugin finding 1).
+///
+/// `resolved_name` and `mdns_name` are read for the title: they are what the
+/// daemon's identity resolution settled on, and the derivation that skipped
+/// them titled a Brother printer after the OUI holder it bought its address
+/// block from (finding 2).
+pub const SELECT_DIRTY_DEVICES: &str = "SELECT id, mac, resolved_name, hostname, mdns_name, \
+     vendor, device_type, os_family, state, last_ip, current_location, \
+     first_seen_at_epoch AS first_seen, last_seen_at_epoch AS last_seen, \
+     display_name, notes, hidden, notify, owner_item_id::text AS owner_item_id, \
+     trovato_item_id \
      FROM ng_devices WHERE sync_state = 'dirty' ORDER BY last_seen_at DESC LIMIT $1";
 
 /// Point a device row at its Item. `$1` is the Item id, `$2` the device id.
@@ -52,8 +67,14 @@ pub const UPDATE_MARK_CLEAN: &str =
 
 /// The daemon's own naming inputs for the device behind an Item. `$1` is the
 /// Item id.
-pub const SELECT_DAEMON_TITLE_FIELDS: &str =
-    "SELECT mac, hostname, vendor FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1";
+///
+/// Every column [`crate::sync::daemon_title`] reads, which is the point: the
+/// write-back compares an admin's title against what the daemon alone would
+/// call the device, and a projection missing a name column makes that
+/// comparison answer "the admin typed this" about a name the admin never
+/// touched — pinning it as `display_name`.
+pub const SELECT_DAEMON_TITLE_FIELDS: &str = "SELECT mac, resolved_name, hostname, mdns_name, \
+     vendor FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1";
 
 /// Unassign every device owned by a person being retired. `$1` is their Item id.
 pub const UPDATE_CLEAR_OWNER: &str =
@@ -116,6 +137,26 @@ pub const SELECT_OWNER_NAME: &str = "SELECT name FROM ng_people WHERE item_id = 
 
 /// The database's clock, in unix seconds.
 pub const SELECT_CLOCK: &str = "SELECT EXTRACT(EPOCH FROM NOW())::bigint AS ts";
+
+/// The earliest observation the database holds, in unix seconds, or null when it
+/// holds none.
+///
+/// The oldest of the two tables that record *when*: a presence session's start
+/// and an event's timestamp. `LEAST` ignores nulls and answers null only when
+/// both do, so a database with events and no presence still answers, and an
+/// empty one answers "nothing yet" rather than zero.
+///
+/// It aggregates the `timestamptz` and extracts the epoch from the **one**
+/// resulting value, rather than aggregating the generated epoch twin. Both give
+/// the same number and only this one can use the daemon's indexes: the twins are
+/// `GENERATED … STORED` columns the daemon does not index, so `MIN` over one is
+/// a sequential scan of the whole table, and `ng_events` is the largest table
+/// here and the one with a 5 s statement timeout in front of it. Extracting
+/// after the aggregate is what keeps the `null` decode problem to a value that
+/// has already become a `bigint`.
+pub const SELECT_MONITORING_START: &str = "SELECT LEAST(\
+     (SELECT EXTRACT(EPOCH FROM MIN(started_at))::bigint FROM ng_presence), \
+     (SELECT EXTRACT(EPOCH FROM MIN(\"timestamp\"))::bigint FROM ng_events)) AS earliest";
 
 // ===========================================================================
 // The assistant scopes
@@ -311,6 +352,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_ADDRESS_SPANS", SELECT_ADDRESS_SPANS),
     ("SELECT_OWNER_NAME", SELECT_OWNER_NAME),
     ("SELECT_CLOCK", SELECT_CLOCK),
+    ("SELECT_MONITORING_START", SELECT_MONITORING_START),
     // The assistant scopes.
     ("SELECT_DEVICE_BY_MAC", SELECT_DEVICE_BY_MAC),
     ("SELECT_DEVICE_BY_ID", SELECT_DEVICE_BY_ID),

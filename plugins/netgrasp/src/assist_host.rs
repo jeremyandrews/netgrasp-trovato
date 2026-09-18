@@ -12,20 +12,27 @@
 //! 1. **Resolve the row**, and mint its Item if there is none. Only rows the
 //!    daemon marked `dirty` ever get an Item from the cron sync, so a device that
 //!    has been `clean` since before the plugin existed — or that the demo seed
-//!    created — has `trovato_item_id NULL`, and `write_back_device` addresses the
-//!    row *by that link*. Writing without minting would update zero rows and
-//!    report success.
+//!    created — has `trovato_item_id NULL`, and the write-back addresses the row
+//!    *by that link*. Writing without minting would update zero rows and report
+//!    success.
 //! 2. **Build the whole Item**, all five fields. `Item::update` reads `fields` as
 //!    `input.fields.unwrap_or(current.fields)` and replaces it wholesale, so a
-//!    partial `fields` object silently deletes every field it omits.
+//!    partial `fields` object silently deletes every field it omits. A field the
+//!    call did not name is carried forward from the Item, and from the device row
+//!    where the Item has no such key — the sync used to mint Items carrying only
+//!    `field_mac`, and reading those absent fields as their zero values is what
+//!    made a rename turn a device's alerts off.
 //! 3. **Apply the coercions `tap_item_presave` would have applied.** The plugin's
 //!    own `save-item` bypasses `ItemService`, so no presave and no
 //!    `tap_item_update` fire — which is what makes the sync loop terminate
 //!    (`DESIGN.md` Drift 3) and what makes this function responsible for
 //!    everything those taps would have done.
-//! 4. **Write back**, through `netgrasp_core::writeback::build_update`, which
-//!    builds its `SET` list from `columns::USER_OWNED` and can therefore not name
-//!    a daemon column even by accident.
+//! 4. **Write back the columns the call named, and no others**, through
+//!    `netgrasp_core::writeback::build_partial_update`, which builds its `SET`
+//!    list from the intersection of `columns::USER_OWNED` and the edit — so it
+//!    can name neither a daemon column nor a user column nobody asked about.
+//!    The card is built from that same list, so what somebody clicks Apply on is
+//!    what happens.
 //!
 //! A person write is the same shape with `mirror_person` in place of the
 //! write-back. Nothing here writes `sync_state`: the two statements that do are
@@ -41,8 +48,7 @@ use netgrasp_core::assist::{
     self, DeviceFacts, DeviceFilter, DeviceRef, EventFacts, PersonCandidate, PersonFacts,
     PresenceWindowFacts, TimelineRow,
 };
-use netgrasp_core::model::{Span, SpanRow};
-use netgrasp_core::sync::daemon_title;
+use netgrasp_core::model::{DeviceEdit, Span, SpanRow};
 use netgrasp_core::{DEVICE_TYPE, PERSON_TYPE, queries};
 use serde_json::{Value, json};
 use trovato_sdk::host;
@@ -225,35 +231,28 @@ fn ensure_device_item(facts: &DeviceFacts) -> Result<String, String> {
     }
 
     // The same title the cron sync would have given it, from the same function,
-    // so a device named by this path and a device named by that one agree.
-    let mut probe = netgrasp_core::model::DeviceRow::new(facts.id, facts.mac.clone());
-    probe.hostname = facts.hostname.clone();
-    probe.vendor = facts.vendor.clone();
-    let title = facts
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map_or_else(|| daemon_title(&probe), str::to_string);
-
-    let item_id = sync_host::create_device_item(&facts.mac, &title)
+    // so a device named by this path and a device named by that one agree — and
+    // the row's own user-owned values, for the same reason.
+    let item_id = sync_host::create_device_item(&facts.mac, &facts.title(), &facts.overlay())
         .map_err(|e| format!("could not create the device's item: {e}"))?;
     sync_host::link_item(facts.id, &item_id)
         .map_err(|e| format!("could not link the device to its item: {e}"))?;
     Ok(item_id)
 }
 
-/// The user-owned overlay a device write is about to change.
-#[derive(Debug, Clone, Default)]
-struct DeviceEdit {
-    title: Option<String>,
-    owner: Option<Option<String>>,
-    notes: Option<String>,
-    hidden: Option<bool>,
-    notify: Option<bool>,
-}
-
-/// Apply an edit to a device: mint the Item if needed, save it whole, write back.
+/// Apply an edit to a device: mint the Item if needed, save it, write back the
+/// columns the edit named.
+///
+/// Four steps, as the module header says, and the last two are where the
+/// asymmetry lives. The **Item** has to be saved whole, because `Item::update`
+/// replaces `fields` wholesale and an omitted key is a deleted value. The
+/// **row** must not be: an `UPDATE` naming a column the tool call never
+/// mentioned is a change nobody asked for and the card did not show.
+///
+/// So the Item's unnamed fields are filled in from the Item itself, and from the
+/// device row where the Item carries no such key — which, on an Item the cron
+/// sync minted before this build, is every field but the MAC — and the
+/// write-back names only [`DeviceEdit::columns`].
 fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, String> {
     let item_id = ensure_device_item(facts)?;
     let existing = sync_host::load_item(&item_id)
@@ -261,7 +260,7 @@ fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, Stri
         .ok_or_else(|| format!("the device's item {item_id} has gone"))?;
 
     let title = edit
-        .title
+        .display_name
         .clone()
         .or_else(|| {
             existing
@@ -271,53 +270,34 @@ fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, Stri
         })
         .unwrap_or_else(|| facts.mac.clone());
 
-    // Every field, every time: `Item::update` replaces `fields` wholesale, so an
-    // omitted key is a deleted value rather than an unchanged one.
-    let owner = match &edit.owner {
-        Some(Some(id)) => id.clone(),
-        Some(None) => String::new(),
-        None => field_str(&existing, "field_owner").unwrap_or_default(),
-    };
-    let notes = edit
-        .notes
-        .clone()
-        .or_else(|| field_str(&existing, "field_notes"))
-        .unwrap_or_default();
-    let hidden = edit
-        .hidden
-        .unwrap_or_else(|| field_bool(&existing, "field_hidden"));
-    let notify = edit
-        .notify
-        .unwrap_or_else(|| field_bool(&existing, "field_notify"));
-
-    // The coercions `tap_item_presave` applies, applied here because no presave
-    // fires on this path.
+    // The coercions `tap_item_presave` would have applied, applied here because
+    // no presave fires on this path.
     let mac = assist::normalize_mac(
         &field_str(&existing, "field_mac").unwrap_or_else(|| facts.mac.clone()),
     );
-    let owner = if owner.is_empty() || assist::is_uuid_shaped(&owner) {
-        owner
-    } else {
-        String::new()
-    };
+    let mut fields =
+        netgrasp_core::writeback::merged_device_fields(&mac, &existing, &facts.overlay(), edit);
+    if let Some(owner) = fields.get_mut("field_owner")
+        && owner
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && !assist::is_uuid_shaped(id))
+    {
+        // An owner that is not a uuid would reach `owner_item_id`, a uuid
+        // column, and fail the write-back with a cast error nobody sees.
+        *owner = json!("");
+    }
 
     let payload = json!({
         "id": item_id,
         "type": DEVICE_TYPE,
         "title": title,
         "status": existing.get("status").and_then(Value::as_i64).unwrap_or(1),
-        "fields": {
-            "field_mac": mac,
-            "field_owner": owner,
-            "field_notes": notes,
-            "field_hidden": hidden,
-            "field_notify": notify,
-        }
+        "fields": fields,
     });
 
-    let saved = item_host::save_item(&payload)
+    item_host::save_item(&payload)
         .map_err(|code| format!("could not save the device's item (host error {code})"))?;
-    sync_host::write_back_device(&saved)
+    sync_host::write_back_device_edit(&item_id, edit)
         .map_err(|e| format!("could not write the change back to the device: {e}"))
 }
 
@@ -848,7 +828,20 @@ fn network_context(clock: i64) -> AssistantContext {
     let people = load_people().unwrap_or_default();
     let devices = load_devices(&DeviceFilter::All).unwrap_or_default();
     let security = security_event_count(clock).unwrap_or(0);
-    let snapshot = assist::render_network_snapshot(&people, &devices, security, clock);
+    // When the data starts. A failed read degrades to `None`, which says
+    // "nothing has been observed yet" — wrong in the same direction the rest of
+    // this function degrades, and still better than the silence that had the
+    // model explaining an empty window as an outage.
+    let monitoring_since = sync_host::monitoring_start().unwrap_or_else(|e| {
+        host::log(
+            "warning",
+            "netgrasp",
+            &format!("network context: earliest observation: {e}"),
+        );
+        None
+    });
+    let snapshot =
+        assist::render_network_snapshot(&people, &devices, security, monitoring_since, clock);
 
     AssistantContext::new("Netgrasp network", snapshot)
         .link("Devices", "/devices")
@@ -1071,9 +1064,10 @@ fn who_was_online(arguments: &Value) -> Result<AssistantToolResult, String> {
 // --- writes ---------------------------------------------------------------
 //
 // Every one of these has the same shape: work out what would happen, build the
-// sentence, and then either stop (Describe) or do it (Execute). The sentence is
-// built from the SAME values the write uses, so a card cannot describe one
-// change and apply another.
+// edit, build the sentence, and then either stop (Describe) or do it (Execute).
+// The sentence is built from the SAME `DeviceEdit` the write uses — before the
+// Describe branch, not after it — so a card cannot describe one change and apply
+// another, and `described` names the columns that edit will write.
 
 /// Assign a device to somebody, or to nobody.
 ///
@@ -1107,15 +1101,15 @@ fn assign_device(
         new_owner.as_ref().map(|p| p.name.as_str()),
         current.as_ref().map(|p| p.name.as_str()),
     );
-
-    if describing {
-        return Ok(described(&facts, &description));
-    }
-
     let edit = DeviceEdit {
-        owner: Some(new_owner.as_ref().map(|p| p.item_id.clone())),
+        owner_item_id: Some(new_owner.as_ref().map(|p| p.item_id.clone())),
         ..DeviceEdit::default()
     };
+
+    if describing {
+        return Ok(described(&facts, &description, &edit));
+    }
+
     apply_device_edit(&facts, &edit)?;
 
     Ok(AssistantToolResult::ok(
@@ -1136,13 +1130,22 @@ fn person_candidate(item_id: &str) -> Result<PersonCandidate, String> {
     })
 }
 
-/// What a Describe returns: the sentence, and a note when the write will have to
-/// create the device's Item first.
+/// What a Describe returns: the sentence, what will change, and a note when the
+/// write will have to create the device's Item first.
 ///
-/// Saying so matters: minting an Item is a visible side effect (the device
-/// appears in the content listing and gets a page), and somebody applying a
-/// rename should not discover it by accident.
-fn described(facts: &DeviceFacts, description: &str) -> AssistantToolResult {
+/// **What will change** is [`DeviceEdit::columns`] — the same list the statement
+/// builder builds its `SET` clause from — rendered in the words the tools use.
+/// The card is the whole basis on which somebody clicks Apply, and a card that
+/// said "Rename this device" while the write also turned its alerts off is
+/// precisely what happened (`docs/JOINT-RUN.md`, plugin finding 1). Reading one
+/// value twice is what makes the displayed change set and the executed change
+/// set the same thing rather than two claims that can disagree.
+///
+/// Minting is said too: it is a visible side effect (the device appears in the
+/// content listing and gets a page), and somebody applying a rename should not
+/// discover it by accident.
+fn described(facts: &DeviceFacts, description: &str, edit: &DeviceEdit) -> AssistantToolResult {
+    let changes = assist::describe_change_set(&edit.columns());
     let mints = facts
         .trovato_item_id
         .as_deref()
@@ -1150,11 +1153,14 @@ fn described(facts: &DeviceFacts, description: &str) -> AssistantToolResult {
         .is_none_or(str::is_empty);
     if mints {
         AssistantToolResult::ok(
-            format!("{description}. This also creates its Trovato item."),
-            format!("{description} (creates its Trovato item)"),
+            format!("{description}. {changes}. This also creates its Trovato item."),
+            format!("{description}. {changes} (creates its Trovato item)"),
         )
     } else {
-        AssistantToolResult::ok(format!("{description}."), description.to_string())
+        AssistantToolResult::ok(
+            format!("{description}. {changes}."),
+            format!("{description}. {changes}"),
+        )
     }
 }
 
@@ -1180,15 +1186,15 @@ fn rename_device(
 ) -> Result<AssistantToolResult, String> {
     let new_name = assist::require_str(arguments, "display_name")?;
     let description = assist::describe_rename_device(&facts.mac, &facts.label(), &new_name);
-
-    if describing {
-        return Ok(described(facts, &description));
-    }
-
     let edit = DeviceEdit {
-        title: Some(new_name.clone()),
+        display_name: Some(new_name.clone()),
         ..DeviceEdit::default()
     };
+
+    if describing {
+        return Ok(described(facts, &description, &edit));
+    }
+
     apply_device_edit(facts, &edit)?;
 
     Ok(AssistantToolResult::ok(
@@ -1209,15 +1215,15 @@ fn set_device_notes(
         .ok_or_else(|| "'text' is required and must be a string".to_string())?
         .to_string();
     let description = assist::describe_set_notes(&facts.descriptive(), &facts.mac, &text);
-
-    if describing {
-        return Ok(described(&facts, &description));
-    }
-
     let edit = DeviceEdit {
         notes: Some(text.clone()),
         ..DeviceEdit::default()
     };
+
+    if describing {
+        return Ok(described(&facts, &description, &edit));
+    }
+
     apply_device_edit(&facts, &edit)?;
 
     Ok(AssistantToolResult::ok(
@@ -1259,16 +1265,16 @@ fn set_device_flags(
         return Err("set the `hidden` flag, the `notify` flag, or both".to_string());
     }
     let description = assist::describe_set_flags(&facts.descriptive(), &facts.mac, hidden, notify);
-
-    if describing {
-        return Ok(described(facts, &description));
-    }
-
     let edit = DeviceEdit {
         hidden,
         notify,
         ..DeviceEdit::default()
     };
+
+    if describing {
+        return Ok(described(facts, &description, &edit));
+    }
+
     apply_device_edit(facts, &edit)?;
 
     Ok(AssistantToolResult::ok(
@@ -1505,14 +1511,15 @@ fn set_owner(
         current.as_ref().map(|p| p.name.as_str()),
     );
 
-    if describing {
-        return Ok(described(&facts, &description));
-    }
-
     let edit = DeviceEdit {
-        owner: Some(new_owner.as_ref().map(|p| p.item_id.clone())),
+        owner_item_id: Some(new_owner.as_ref().map(|p| p.item_id.clone())),
         ..DeviceEdit::default()
     };
+
+    if describing {
+        return Ok(described(&facts, &description, &edit));
+    }
+
     apply_device_edit(&facts, &edit)?;
 
     Ok(AssistantToolResult::ok(

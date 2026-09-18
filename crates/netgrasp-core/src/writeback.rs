@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use crate::columns::USER_OWNED;
 use crate::error::{CoreError, CoreResult};
-use crate::model::DeviceOverlay;
+use crate::model::{DeviceEdit, DeviceOverlay};
 
 /// Item field names carrying the device overlay.
 ///
@@ -32,6 +32,8 @@ use crate::model::DeviceOverlay;
 /// pre-existing netgrasp skeleton used bare names, and this build moves to the
 /// prefixed form because the skeleton's types had never been registered against
 /// real data.
+pub const FIELD_MAC: &str = "field_mac";
+/// Item id of the owning `ng_person`.
 pub const FIELD_OWNER: &str = "field_owner";
 /// Free-text notes an admin keeps about the device.
 pub const FIELD_NOTES: &str = "field_notes";
@@ -162,43 +164,93 @@ pub fn build_update(
     overlay: &DeviceOverlay,
     daemon_fallback: Option<&str>,
 ) -> CoreResult<Statement> {
+    build_partial_update(item_id, &DeviceEdit::from_overlay(overlay), daemon_fallback)
+}
+
+/// Build the statement one **sparse** device edit produces.
+///
+/// The same statement as [`build_update`] with one difference that is the whole
+/// point: the `SET` list names only the columns [`DeviceEdit::columns`] names.
+/// A column the edit is silent about is not assigned, so no value has to be
+/// invented for it — which is what a rename that turned a device's alerts off
+/// was doing (`docs/JOINT-RUN.md`, plugin finding 1; the argument is on
+/// [`DeviceEdit`]).
+///
+/// [`build_update`] is this function over a full edit, so there is one `SET`
+/// builder and one cast per column rather than two of each to drift apart.
+///
+/// `daemon_fallback` is read only when the edit names `display_name`, and means
+/// what it means above: a title equal to what the daemon's own observations
+/// imply is stored as `NULL`, so editing a device does not pin its name.
+///
+/// # Errors
+///
+/// [`CoreError::Invalid`] when `item_id` is blank, when the edit names no
+/// column at all (an `UPDATE` with an empty `SET` is not a statement), or when
+/// [`USER_OWNED`] gains a column this builder has no value for.
+pub fn build_partial_update(
+    item_id: &str,
+    edit: &DeviceEdit,
+    daemon_fallback: Option<&str>,
+) -> CoreResult<Statement> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err(CoreError::Invalid("write-back needs an item id".into()));
     }
-
-    let display_name = match daemon_fallback {
-        Some(f) if f == overlay.display_name => Value::Null,
-        _ => json!(overlay.display_name),
-    };
+    if edit.is_empty() {
+        return Err(CoreError::Invalid(
+            "a device write-back must name at least one user-owned column".into(),
+        ));
+    }
 
     let mut assignments = Vec::with_capacity(USER_OWNED.len());
     let mut params: Vec<Value> = Vec::with_capacity(USER_OWNED.len() + 1);
     let mut columns = Vec::with_capacity(USER_OWNED.len());
 
+    // Iterated over USER_OWNED rather than over the edit's own fields, so a
+    // column outside that set cannot be assigned however the edit is built.
     for column in USER_OWNED {
+        if !edit.names(column) {
+            continue;
+        }
         // Cast at the placeholder rather than trusting the driver to infer a
         // type for a JSON null: `owner_item_id` is a uuid column and an
         // untyped NULL against it is the `invalid input syntax for type uuid`
         // failure mode that G-EXPOSED-FILTER-NO-MATCH-ALL turns up elsewhere.
         let (value, cast) = match *column {
-            "display_name" => (display_name.clone(), "text"),
+            "display_name" => {
+                let name = edit.display_name.clone().unwrap_or_default();
+                let value = match daemon_fallback {
+                    Some(fallback) if fallback == name => Value::Null,
+                    _ => json!(name),
+                };
+                (value, "text")
+            }
             "owner_item_id" => (
-                overlay
-                    .owner_item_id
-                    .as_ref()
+                edit.owner_item_id
+                    .clone()
+                    .flatten()
                     .map_or(Value::Null, |v| json!(v)),
                 "uuid",
             ),
+            // A blank note is `NULL`, not `''`: the column is nullable, an
+            // admin clearing the notes means "there are none", and the whole
+            // -Item path has always written NULL for a blank field.
             "notes" => (
-                overlay.notes.as_ref().map_or(Value::Null, |v| json!(v)),
+                edit.notes
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|notes| !notes.is_empty())
+                    .map_or(Value::Null, |notes| json!(notes)),
                 "text",
             ),
-            "hidden" => (json!(overlay.hidden), "boolean"),
-            "notify" => (json!(overlay.notify), "boolean"),
-            // Unreachable while USER_OWNED and DeviceOverlay agree; the compiler
-            // cannot prove that, so the mismatch is reported rather than
-            // silently writing a wrong column.
+            "hidden" => (json!(edit.hidden.unwrap_or_default()), "boolean"),
+            "notify" => (json!(edit.notify.unwrap_or_default()), "boolean"),
+            // Unreachable while USER_OWNED and DeviceEdit agree — `names`
+            // answers false for anything else, so this arm is only reached by a
+            // column added to USER_OWNED and to `names` but not to here. The
+            // compiler cannot prove that, so the mismatch is reported rather
+            // than silently writing a wrong column.
             other => {
                 return Err(CoreError::Invalid(format!(
                     "user-owned column '{other}' has no overlay value"
@@ -221,6 +273,102 @@ pub fn build_update(
         sql,
         params,
         columns,
+    })
+}
+
+/// The `fields` object an `ng_device` Item carries: the MAC, plus each
+/// user-owned field an overlay names.
+///
+/// Used where an Item is **created**. A device Item minted carrying only
+/// `field_mac` disagrees with its row about every other user-owned value, and
+/// the disagreement is not visible until something writes the whole Item back
+/// and `field_bool` turns an absent `field_notify` into `notify = false` over a
+/// column the daemon defaults to `TRUE` (`docs/JOINT-RUN.md`, plugin finding 1).
+/// A field the overlay does not name is left out rather than defaulted: the
+/// caller that could not read a column must not assert a value for it.
+#[must_use]
+pub fn device_item_fields(mac: &str, overlay: &DeviceEdit) -> Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(FIELD_MAC.to_string(), json!(mac));
+    if let Some(owner) = overlay.owner_item_id.as_ref() {
+        fields.insert(
+            FIELD_OWNER.to_string(),
+            json!(owner.clone().unwrap_or_default()),
+        );
+    }
+    if let Some(notes) = overlay.notes.as_ref() {
+        fields.insert(FIELD_NOTES.to_string(), json!(notes));
+    }
+    if let Some(hidden) = overlay.hidden {
+        fields.insert(FIELD_HIDDEN.to_string(), json!(hidden));
+    }
+    if let Some(notify) = overlay.notify {
+        fields.insert(FIELD_NOTIFY.to_string(), json!(notify));
+    }
+    Value::Object(fields)
+}
+
+/// The `fields` object for an **edit** of an existing device Item.
+///
+/// Every field, every time, because `Item::update` reads `fields` as
+/// `input.fields.unwrap_or(current.fields)` and replaces it wholesale
+/// (`G-ITEM-NO-MERGE`): an omitted key is a deleted value, not an unchanged
+/// one. So the question is not which fields to send but what to send for a
+/// field the edit is silent about, and the order here is the whole fix:
+///
+/// 1. what the edit says, when it names the field;
+/// 2. what the Item already carries, when the key is **present** — present, not
+///    non-blank, so notes an admin cleared stay cleared;
+/// 3. what the device row carries, when the Item has no such key at all. This is
+///    the case that was wrong: the cron sync mints Items carrying only
+///    `field_mac`, and reading an absent `field_notify` as `false` is what
+///    silently muted a device on the first rename.
+///
+/// Only then the type's zero, which after (3) is reachable only for a caller
+/// that read neither the Item's field nor the row's column.
+///
+/// The values are normalised on the way through — a MAC to its canonical form
+/// is the caller's job, but a checkbox's `"1"` becomes a real `true` here —
+/// because this path writes through `save-item` and fires no
+/// `tap_item_presave` to do it (`DESIGN.md` Drift 3).
+#[must_use]
+pub fn merged_device_fields(
+    mac: &str,
+    existing: &Value,
+    row: &DeviceEdit,
+    edit: &DeviceEdit,
+) -> Value {
+    let owner = match &edit.owner_item_id {
+        Some(owner) => owner.clone().unwrap_or_default(),
+        None if field(existing, FIELD_OWNER).is_some() => {
+            field_str(existing, FIELD_OWNER).unwrap_or_default()
+        }
+        None => row.owner_item_id.clone().flatten().unwrap_or_default(),
+    };
+    let notes = match &edit.notes {
+        Some(notes) => notes.clone(),
+        None if field(existing, FIELD_NOTES).is_some() => {
+            field_str(existing, FIELD_NOTES).unwrap_or_default()
+        }
+        None => row.notes.clone().unwrap_or_default(),
+    };
+    let hidden = match edit.hidden {
+        Some(hidden) => hidden,
+        None if field(existing, FIELD_HIDDEN).is_some() => field_bool(existing, FIELD_HIDDEN),
+        None => row.hidden.unwrap_or_default(),
+    };
+    let notify = match edit.notify {
+        Some(notify) => notify,
+        None if field(existing, FIELD_NOTIFY).is_some() => field_bool(existing, FIELD_NOTIFY),
+        None => row.notify.unwrap_or_default(),
+    };
+
+    json!({
+        FIELD_MAC: mac,
+        FIELD_OWNER: owner,
+        FIELD_NOTES: notes,
+        FIELD_HIDDEN: hidden,
+        FIELD_NOTIFY: notify,
     })
 }
 
@@ -459,6 +607,351 @@ mod tests {
         assert_eq!(stmt.params[owner_at], Value::Null);
         assert!(stmt.sql.contains("owner_item_id = $"));
         assert!(stmt.sql.contains("::uuid"));
+    }
+
+    // --- partial writes ---------------------------------------------------
+    //
+    // The defect these exist for: a `rename` built a whole overlay, filled the
+    // fields it did not name from an Item that had never carried them, and
+    // wrote `notify = false` over a column the daemon defaults to TRUE. So what
+    // is asserted here is about the STATEMENT — a column nobody named is not in
+    // it — rather than about the value it would have written, because a value
+    // that cannot be written cannot be wrong.
+
+    /// A rename names one column, so the statement sets one column.
+    #[test]
+    fn a_rename_writes_the_name_and_nothing_else() {
+        let edit = DeviceEdit {
+            display_name: Some("Office printer".into()),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+
+        assert_eq!(stmt.columns, ["display_name"]);
+        assert_eq!(stmt.params, vec![json!("Office printer"), json!(ITEM)]);
+        for untouched in ["notify", "hidden", "notes", "owner_item_id"] {
+            assert!(
+                !stmt.sql.contains(&format!("{untouched} =")),
+                "a rename assigns {untouched}: {}",
+                stmt.sql
+            );
+        }
+    }
+
+    /// An owner assignment is the other half of the same observation: it flipped
+    /// `notify` too, on a second device, in the same run.
+    #[test]
+    fn an_owner_assignment_writes_the_owner_and_nothing_else() {
+        let edit = DeviceEdit {
+            owner_item_id: Some(Some(OWNER.into())),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+
+        assert_eq!(stmt.columns, ["owner_item_id"]);
+        assert!(stmt.sql.contains("owner_item_id = $1::uuid"));
+        assert!(!stmt.sql.contains("notify"), "{}", stmt.sql);
+        assert!(!stmt.sql.contains("display_name"), "{}", stmt.sql);
+    }
+
+    /// Unassigning is a named change to one column, not the absence of one.
+    #[test]
+    fn unassigning_names_the_owner_column_and_binds_a_typed_null() {
+        let edit = DeviceEdit {
+            owner_item_id: Some(None),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+        assert_eq!(stmt.columns, ["owner_item_id"]);
+        assert_eq!(stmt.params[0], Value::Null);
+        assert!(stmt.sql.contains("::uuid"));
+    }
+
+    /// "Mute this device" says nothing about hiding it.
+    #[test]
+    fn muting_a_device_leaves_the_hidden_flag_out_of_the_statement() {
+        let edit = DeviceEdit {
+            notify: Some(false),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+        assert_eq!(stmt.columns, ["notify"]);
+        assert_eq!(stmt.params[0], json!(false));
+        assert!(!stmt.sql.contains("hidden"), "{}", stmt.sql);
+    }
+
+    /// Both flags at once is still exactly both flags.
+    #[test]
+    fn setting_both_flags_names_both_and_still_no_third_column() {
+        let edit = DeviceEdit {
+            hidden: Some(true),
+            notify: Some(false),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+        // USER_OWNED order, which is where the order comes from.
+        assert_eq!(stmt.columns, ["hidden", "notify"]);
+        assert_eq!(stmt.params, vec![json!(true), json!(false), json!(ITEM)]);
+    }
+
+    #[test]
+    fn clearing_the_notes_writes_null_rather_than_an_empty_string() {
+        for blank in ["", "   "] {
+            let edit = DeviceEdit {
+                notes: Some(blank.into()),
+                ..DeviceEdit::default()
+            };
+            let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+            assert_eq!(stmt.columns, ["notes"]);
+            assert_eq!(stmt.params[0], Value::Null, "{blank:?} should clear");
+        }
+    }
+
+    /// An `UPDATE` with an empty `SET` is not a statement, and an edit that
+    /// names nothing is a tool call that should have been refused earlier.
+    #[test]
+    fn an_edit_that_names_no_column_is_refused_rather_than_built() {
+        let err = build_partial_update(ITEM, &DeviceEdit::default(), None).unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+    }
+
+    /// Column discipline holds on the partial path too, for every shape of
+    /// edit: the `SET` list is the intersection of `USER_OWNED` and the edit, so
+    /// there is no edit that can name anything else.
+    #[test]
+    fn no_partial_write_can_name_a_daemon_or_link_column() {
+        let edits = [
+            DeviceEdit {
+                display_name: Some("x".into()),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit {
+                owner_item_id: Some(Some(OWNER.into())),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit {
+                notes: Some("x".into()),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit {
+                hidden: Some(true),
+                notify: Some(true),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit::from_overlay(&overlay_from_item(&device_item()).unwrap()),
+        ];
+        for edit in edits {
+            let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+            for column in &stmt.columns {
+                assert!(
+                    USER_OWNED.contains(&column.as_str()),
+                    "{column} is not user-owned"
+                );
+            }
+            for daemon in DAEMON_OWNED {
+                assert!(
+                    !stmt.columns.contains(&(*daemon).to_string()),
+                    "a partial write assigns daemon column '{daemon}'"
+                );
+            }
+            for link in LINK_OWNED {
+                assert!(
+                    !stmt.columns.contains(&(*link).to_string()),
+                    "a partial write assigns link column '{link}'"
+                );
+            }
+            assert!(!stmt.sql.contains("sync_state"), "{}", stmt.sql);
+        }
+    }
+
+    /// The property the proposal card depends on: the change set an edit
+    /// reports and the change set its statement carries out are one list.
+    #[test]
+    fn an_edits_reported_change_set_is_the_statements_column_list() {
+        let edits = [
+            DeviceEdit {
+                display_name: Some("Office printer".into()),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit {
+                notify: Some(false),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit {
+                hidden: Some(true),
+                notes: Some("spare".into()),
+                owner_item_id: Some(None),
+                ..DeviceEdit::default()
+            },
+            DeviceEdit::from_overlay(&overlay_from_item(&device_item()).unwrap()),
+        ];
+        for edit in edits {
+            let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+            assert_eq!(
+                edit.columns(),
+                stmt.columns.iter().map(String::as_str).collect::<Vec<_>>(),
+                "the card would name a different set than the write touches"
+            );
+        }
+    }
+
+    /// The whole-Item path is the partial path over a full edit, so it has to
+    /// still produce exactly what it produced before: every user column, in
+    /// `USER_OWNED` order, one placeholder each plus the `WHERE`.
+    #[test]
+    fn the_whole_item_path_is_the_partial_path_over_every_column() {
+        let overlay = overlay_from_item(&device_item()).unwrap();
+        assert_eq!(
+            build_update(ITEM, &overlay, Some("aa:bb:cc:dd:ee:ff")).unwrap(),
+            build_partial_update(
+                ITEM,
+                &DeviceEdit::from_overlay(&overlay),
+                Some("aa:bb:cc:dd:ee:ff")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            DeviceEdit::from_overlay(&overlay).columns(),
+            USER_OWNED.to_vec()
+        );
+    }
+
+    // --- the Item's fields ------------------------------------------------
+
+    /// The mint carries the row's user-owned values, so the Item and the row
+    /// agree from the moment the Item exists.
+    #[test]
+    fn a_minted_items_fields_carry_the_rows_overlay() {
+        let overlay = DeviceEdit {
+            owner_item_id: Some(Some(OWNER.into())),
+            notes: Some("kept".into()),
+            hidden: Some(false),
+            notify: Some(true),
+            ..DeviceEdit::default()
+        };
+        let fields = device_item_fields("aa:bb:cc:dd:ee:ff", &overlay);
+        assert_eq!(fields[FIELD_MAC], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(fields[FIELD_OWNER], OWNER);
+        assert_eq!(fields[FIELD_NOTES], "kept");
+        assert_eq!(fields[FIELD_HIDDEN], false);
+        assert_eq!(
+            fields[FIELD_NOTIFY], true,
+            "the Item was minted claiming alerts are off on a device whose row says they are on"
+        );
+    }
+
+    /// A column the caller could not read is left out rather than asserted as
+    /// its zero value — the whole mistake being corrected here, made again one
+    /// layer down.
+    #[test]
+    fn a_mint_omits_a_field_its_caller_did_not_read() {
+        let fields = device_item_fields("aa:bb:cc:dd:ee:ff", &DeviceEdit::default());
+        assert_eq!(fields[FIELD_MAC], "aa:bb:cc:dd:ee:ff");
+        assert!(fields.get(FIELD_NOTIFY).is_none(), "{fields}");
+        assert!(fields.get(FIELD_HIDDEN).is_none(), "{fields}");
+        assert!(fields.get(FIELD_NOTES).is_none(), "{fields}");
+        assert!(fields.get(FIELD_OWNER).is_none(), "{fields}");
+    }
+
+    /// The Item-side half of finding 1, at the layer it happened: an edit that
+    /// names only the title, against the Item the cron sync used to mint, must
+    /// take the unnamed values from the ROW rather than from the Item's silence.
+    #[test]
+    fn an_edit_fills_an_absent_item_field_from_the_device_row() {
+        let minted_the_old_way = json!({"id": ITEM, "title": "aa:bb:cc:dd:ee:ff",
+                                        "fields": {FIELD_MAC: "aa:bb:cc:dd:ee:ff"}});
+        let row = DeviceEdit {
+            owner_item_id: Some(Some(OWNER.into())),
+            notes: Some("in the hall cupboard".into()),
+            hidden: Some(true),
+            notify: Some(true),
+            ..DeviceEdit::default()
+        };
+        let rename = DeviceEdit {
+            display_name: Some("Office printer".into()),
+            ..DeviceEdit::default()
+        };
+
+        let fields = merged_device_fields("aa:bb:cc:dd:ee:ff", &minted_the_old_way, &row, &rename);
+        assert_eq!(
+            fields[FIELD_NOTIFY], true,
+            "a rename muted the device, which is the defect"
+        );
+        assert_eq!(fields[FIELD_HIDDEN], true);
+        assert_eq!(fields[FIELD_NOTES], "in the hall cupboard");
+        assert_eq!(fields[FIELD_OWNER], OWNER);
+    }
+
+    /// The Item wins over the row when it carries the key, whatever the value:
+    /// notes an admin cleared through the content form are cleared, not
+    /// resurrected from a row the write-back has not reached yet.
+    #[test]
+    fn a_present_but_blank_item_field_beats_the_rows_value() {
+        let cleared = json!({"id": ITEM, "title": "printer",
+                             "fields": {FIELD_NOTES: "", FIELD_NOTIFY: false}});
+        let row = DeviceEdit {
+            notes: Some("stale".into()),
+            notify: Some(true),
+            ..DeviceEdit::default()
+        };
+        let fields = merged_device_fields(
+            "aa:bb:cc:dd:ee:ff",
+            &cleared,
+            &row,
+            &DeviceEdit {
+                hidden: Some(true),
+                ..DeviceEdit::default()
+            },
+        );
+        assert_eq!(fields[FIELD_NOTES], "");
+        assert_eq!(fields[FIELD_NOTIFY], false);
+        assert_eq!(fields[FIELD_HIDDEN], true, "the named change was dropped");
+    }
+
+    /// A checkbox's `"1"` and a plugin's `true` mean the same thing, and this
+    /// path is the one that has to say so: it writes through `save-item`, which
+    /// fires no presave to normalise anything.
+    #[test]
+    fn an_edit_normalises_the_spellings_a_form_round_trip_leaves_behind() {
+        let from_a_form = json!({"id": ITEM, "title": "printer",
+                                 "fields": {FIELD_NOTIFY: "1", FIELD_HIDDEN: "off"}});
+        let fields = merged_device_fields(
+            "aa:bb:cc:dd:ee:ff",
+            &from_a_form,
+            &DeviceEdit::default(),
+            &DeviceEdit {
+                notes: Some("x".into()),
+                ..DeviceEdit::default()
+            },
+        );
+        assert_eq!(fields[FIELD_NOTIFY], true);
+        assert_eq!(fields[FIELD_HIDDEN], false);
+    }
+
+    /// Every field, every time: `Item::update` replaces `fields` wholesale, so
+    /// a merge that omitted a key would delete a value rather than keep it.
+    #[test]
+    fn an_edit_sends_every_field_because_an_omitted_key_is_a_deletion() {
+        let fields = merged_device_fields(
+            "aa:bb:cc:dd:ee:ff",
+            &json!({}),
+            &DeviceEdit::default(),
+            &DeviceEdit {
+                notify: Some(true),
+                ..DeviceEdit::default()
+            },
+        );
+        let object = fields.as_object().unwrap();
+        assert_eq!(object.len(), 5, "{fields}");
+        for name in [
+            FIELD_MAC,
+            FIELD_OWNER,
+            FIELD_NOTES,
+            FIELD_HIDDEN,
+            FIELD_NOTIFY,
+        ] {
+            assert!(object.contains_key(name), "{name} is missing: {fields}");
+        }
     }
 
     // --- name pinning -----------------------------------------------------

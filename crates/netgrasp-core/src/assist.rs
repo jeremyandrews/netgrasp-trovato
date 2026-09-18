@@ -353,11 +353,35 @@ pub fn parse_device_filter(raw: &str) -> Result<DeviceFilter, String> {
 // Naming
 // =============================================================================
 
+/// The naming inputs, as the four name columns plus the MAC.
+///
+/// A small adapter so the two labelling functions below ask
+/// [`crate::sync::observed_name`] rather than re-listing the ladder. There is
+/// one precedence in this plugin and it lives in `sync`; a second copy here is
+/// exactly how the Item title and the proposal card came to disagree about a
+/// printer's name.
+fn inputs<'a>(
+    display_name: Option<&'a str>,
+    resolved_name: Option<&'a str>,
+    hostname: Option<&'a str>,
+    mdns_name: Option<&'a str>,
+    mac: &'a str,
+) -> crate::sync::TitleInputs<'a> {
+    crate::sync::TitleInputs {
+        display_name,
+        resolved_name,
+        hostname,
+        mdns_name,
+        vendor: None,
+        mac,
+    }
+}
+
 /// What to call a device, in a sentence a person reads.
 ///
-/// The ladder is the one the rest of the plugin uses: the name a human typed,
-/// then the daemon's resolved name, then its hostname, then its mDNS name, then
-/// the MAC. A device always has a MAC, so this always answers.
+/// The ladder is [`crate::sync::observed_name`] — the name a human typed, then
+/// the daemon's resolved name, then its hostname, then its mDNS name — ending
+/// at the MAC, which always exists, so this always answers.
 #[must_use]
 pub fn device_label(
     display_name: Option<&str>,
@@ -366,25 +390,23 @@ pub fn device_label(
     mdns_name: Option<&str>,
     mac: &str,
 ) -> String {
-    [display_name, resolved_name, hostname, mdns_name]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|name| !name.is_empty())
-        .unwrap_or(mac)
-        .to_string()
+    crate::sync::observed_name(&inputs(
+        display_name,
+        resolved_name,
+        hostname,
+        mdns_name,
+        mac,
+    ))
+    .unwrap_or(mac)
+    .to_string()
 }
 
 /// The label for a [`DeviceRow`], using the columns it carries.
 #[must_use]
 pub fn row_label(row: &DeviceRow) -> String {
-    device_label(
-        row.display_name.as_deref(),
-        None,
-        row.hostname.as_deref(),
-        None,
-        &row.mac,
-    )
+    crate::sync::observed_name(&row.into())
+        .unwrap_or(&row.mac)
+        .to_string()
 }
 
 /// What to call a device on a **proposal card**, where a bare MAC is not enough.
@@ -409,12 +431,13 @@ pub fn descriptive_label(
     device_type: Option<&str>,
     mac: &str,
 ) -> String {
-    let named = [display_name, resolved_name, hostname, mdns_name]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|name| !name.is_empty());
-    if let Some(name) = named {
+    if let Some(name) = crate::sync::observed_name(&inputs(
+        display_name,
+        resolved_name,
+        hostname,
+        mdns_name,
+        mac,
+    )) {
         return name.to_string();
     }
 
@@ -561,6 +584,50 @@ pub fn describe_set_notify(name: &str, arrive: bool, depart: bool) -> String {
         (false, false) => "never",
     };
     format!("Notify about {name} {what}")
+}
+
+/// What a proposal card says it will change, column by column.
+///
+/// The card is the whole basis on which somebody clicks Apply, so it has to
+/// name the columns the write will touch and no others. It is built from
+/// [`crate::model::DeviceEdit::columns`] — the same list
+/// [`crate::writeback::build_partial_update`] builds its `SET` clause from — so
+/// the displayed change set and the executed change set are one value read
+/// twice rather than two descriptions that can disagree. They did disagree: a
+/// rename's card said it would rename a device, and the write also turned its
+/// alerts off (`docs/JOINT-RUN.md`, plugin finding 1).
+///
+/// Column names are given in the words the tools use, because the reader of a
+/// card is a person and `owner_item_id` is not a thing they were offered.
+#[must_use]
+pub fn describe_change_set(columns: &[&str]) -> String {
+    if columns.is_empty() {
+        return "Changes nothing".to_string();
+    }
+    let named: Vec<&str> = columns
+        .iter()
+        .map(|column| match *column {
+            "display_name" => "the name",
+            "owner_item_id" => "the owner",
+            "notes" => "the notes",
+            "hidden" => "whether it is hidden",
+            "notify" => "the arrival and departure alerts",
+            // A column outside the user-owned set cannot reach here from a
+            // `DeviceEdit`, and if one ever does the card says so rather than
+            // quietly leaving it off the list.
+            other => other,
+        })
+        .collect();
+    format!("Changes {}, and nothing else", join_clauses(&named))
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_clauses(parts: &[&str]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
 }
 
 /// "Set the notes on X" / "Clear the notes on X".
@@ -803,6 +870,42 @@ pub fn person_phrase(name: &str, item_id: &str) -> String {
     format!("{name} ({item_id})")
 }
 
+/// When the data starts, and what time it is now.
+///
+/// Two sentences a model cannot work out for itself and will otherwise
+/// invent an explanation for. Asked "who was online yesterday" against a
+/// database an hour old, the model correctly found zero presence spans and then
+/// speculated about "a gap in monitoring" — because nothing in its context said
+/// the daemon's earliest observation was that morning
+/// (`docs/JOINT-RUN.md`, plugin finding 3).
+///
+/// An empty window before the first observation and an empty window over a
+/// monitored period are the same zero rows and different answers. This is what
+/// tells them apart, so it says so in as many words rather than leaving the
+/// inference to be made.
+///
+/// The current time is here for the same reason: "yesterday" is not a value the
+/// daemon stores, and a model given presence data with no clock has to guess
+/// which day it is in order to ask about the right one.
+#[must_use]
+pub fn render_monitoring_window(earliest: Option<i64>, now: i64) -> String {
+    let mut out = String::new();
+    match earliest {
+        Some(earliest) => out.push_str(&format!(
+            "Monitoring data begins at {}. There is no data before that, so a \
+             question about an earlier time has no answer rather than a gap in \
+             monitoring.\n",
+            stamp(Some(earliest), now)
+        )),
+        None => out.push_str(
+            "Monitoring data begins at: nothing has been observed yet, so every \
+             window is empty for that reason.\n",
+        ),
+    }
+    out.push_str(&format!("Current time: {}\n", format_utc(now)));
+    out
+}
+
 // =============================================================================
 // Snapshots
 // =============================================================================
@@ -884,6 +987,47 @@ pub struct DeviceFacts {
 }
 
 impl DeviceFacts {
+    /// The naming inputs this row carries, vendor included.
+    #[must_use]
+    pub fn title_inputs(&self) -> crate::sync::TitleInputs<'_> {
+        crate::sync::TitleInputs {
+            display_name: self.display_name.as_deref(),
+            resolved_name: self.resolved_name.as_deref(),
+            hostname: self.hostname.as_deref(),
+            mdns_name: self.mdns_name.as_deref(),
+            vendor: self.vendor.as_deref(),
+            mac: &self.mac,
+        }
+    }
+
+    /// The title this device's Item should carry.
+    ///
+    /// [`crate::sync::device_title`], the same function the sync's mint and its
+    /// title refresh use, so a device named by this path and a device named by
+    /// that one agree.
+    #[must_use]
+    pub fn title(&self) -> String {
+        crate::sync::device_title(&self.title_inputs())
+    }
+
+    /// The user-owned overlay this row carries, every column named.
+    ///
+    /// Fully named, unlike [`crate::model::DeviceRow::overlay`], because the
+    /// assistant's device reads project the whole user-owned set: there is no
+    /// column here that was not read, so "no notes" is a fact about the device
+    /// rather than a gap in the projection. It is what an edit falls back to for
+    /// a field the device's Item never carried.
+    #[must_use]
+    pub fn overlay(&self) -> crate::model::DeviceEdit {
+        crate::model::DeviceEdit {
+            display_name: self.display_name.clone(),
+            owner_item_id: Some(self.owner_item_id.clone()),
+            notes: Some(self.notes.clone().unwrap_or_default()),
+            hidden: Some(self.hidden),
+            notify: Some(self.notify),
+        }
+    }
+
     /// What to call this device in a listing, where the MAC is beside it.
     #[must_use]
     pub fn label(&self) -> String {
@@ -1046,6 +1190,10 @@ pub fn render_device_snapshot(
     out.push_str(&line("Location", facts.current_location.as_deref()));
     out.push_str(&format!("First seen: {}\n", stamp(facts.first_seen, now)));
     out.push_str(&format!("Last seen: {}\n", stamp(facts.last_seen, now)));
+    // The device scope's answer to "how far back can I ask": this device's own
+    // first sighting, which is where its history starts whatever the rest of
+    // the network has been recording.
+    out.push_str(&render_monitoring_window(facts.first_seen, now));
     out.push_str(&format!("Owner: {}\n", facts.owner_phrase()));
     out.push_str(&line_or("Notes", facts.notes.as_deref(), "none"));
     out.push_str(&flag_line("Hidden", facts.hidden));
@@ -1292,7 +1440,8 @@ pub fn render_person_snapshot(person: &PersonFacts, devices: &[DeviceFacts], now
 
 /// The `netgrasp_network` scope's snapshot.
 ///
-/// People first, then devices grouped by owner with an unowned group last, then
+/// When the data starts first (see [`render_monitoring_window`]), then people,
+/// then devices grouped by owner with an unowned group last, then
 /// the counts, then the security-event count. The grouping is the point: "which
 /// devices have no owner" is the question this scope exists to answer, and a
 /// flat list would make the model read every line to answer it.
@@ -1301,9 +1450,15 @@ pub fn render_network_snapshot(
     people: &[PersonFacts],
     devices: &[DeviceFacts],
     security_events_24h: i64,
+    monitoring_since: Option<i64>,
     now: i64,
 ) -> String {
     let mut out = String::with_capacity(4_096);
+
+    // First, because it bounds every answer below it: a window that starts
+    // before this has no data for a reason that is not an outage.
+    out.push_str(&render_monitoring_window(monitoring_since, now));
+    out.push('\n');
 
     if people.is_empty() {
         out.push_str("People: none\n");
@@ -1886,6 +2041,67 @@ mod tests {
         assert!(description.ends_with("…'"), "{description}");
     }
 
+    // --- the change set the card shows ------------------------------------
+
+    /// A card names the columns the write will touch, in the words the tools
+    /// use. "and nothing else" is the claim that was false: a rename's card
+    /// said it would rename a device, and the write also muted it.
+    #[test]
+    fn a_card_names_the_columns_that_will_change_and_says_there_are_no_others() {
+        assert_eq!(
+            describe_change_set(&["display_name"]),
+            "Changes the name, and nothing else"
+        );
+        assert_eq!(
+            describe_change_set(&["notify"]),
+            "Changes the arrival and departure alerts, and nothing else"
+        );
+        assert_eq!(
+            describe_change_set(&["hidden", "notify"]),
+            "Changes whether it is hidden and the arrival and departure alerts, and nothing else"
+        );
+        assert_eq!(
+            describe_change_set(&["display_name", "notes", "owner_item_id"]),
+            "Changes the name, the notes and the owner, and nothing else"
+        );
+        assert_eq!(describe_change_set(&[]), "Changes nothing");
+    }
+
+    /// The card is written for a person, so it says "the owner" rather than
+    /// `owner_item_id` — a column name is not something anybody was offered.
+    /// Asserted as "no snake_case token", which is what a raw column name looks
+    /// like and what an English clause never does.
+    #[test]
+    fn a_card_names_no_column_in_its_database_spelling() {
+        let all = describe_change_set(crate::columns::USER_OWNED);
+        assert!(
+            !all.contains('_'),
+            "the card shows a raw column name: {all}"
+        );
+        for column in crate::columns::USER_OWNED {
+            let clause = describe_change_set(&[column]);
+            assert_ne!(
+                clause,
+                format!("Changes {column}, and nothing else"),
+                "{column} reached the card unrendered"
+            );
+        }
+    }
+
+    /// A change set built from a `DeviceEdit` is the edit's own column list, so
+    /// the sentence cannot name something the statement will not write.
+    #[test]
+    fn a_cards_change_set_comes_from_the_edit_the_write_uses() {
+        let edit = crate::model::DeviceEdit {
+            display_name: Some("Office printer".into()),
+            ..crate::model::DeviceEdit::default()
+        };
+        let card = describe_change_set(&edit.columns());
+        assert_eq!(card, "Changes the name, and nothing else");
+        assert!(!card.contains("alert"), "{card}");
+        assert!(!card.contains("owner"), "{card}");
+    }
+
     // -------------------------------------------------------------------------
     // Time rendering
     // -------------------------------------------------------------------------
@@ -1978,6 +2194,96 @@ mod tests {
         // A field the daemon never filled in is absent, not "none": a snapshot of
         // eight "none"s reads as a device nobody knows anything about.
         assert!(!snapshot.contains("Hostname:"), "{snapshot}");
+    }
+
+    // --- the one title ----------------------------------------------------
+
+    /// The assistant's view of a device and the sync's view of the same row
+    /// produce the same title, because they are the same function. When they
+    /// were two, a printer's Item was titled after the OUI holder while the
+    /// card called it by the name the daemon had resolved.
+    #[test]
+    fn the_title_the_assistant_computes_is_the_one_the_sync_derives() {
+        let printer = DeviceFacts {
+            id: 31,
+            mac: "aa:bb:cc:00:01:02".into(),
+            resolved_name: Some("Brother HL-L8360CDW series".into()),
+            vendor: Some("CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.".into()),
+            ..DeviceFacts::default()
+        };
+        assert_eq!(printer.title(), "Brother HL-L8360CDW series");
+        assert_eq!(printer.title(), printer.label());
+
+        // And the same inputs through the sync's own entry point.
+        let mut row = DeviceRow::new(31, "aa:bb:cc:00:01:02");
+        row.resolved_name = Some("Brother HL-L8360CDW series".into());
+        row.vendor = Some("CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.".into());
+        assert_eq!(crate::sync::derive_title(&row), printer.title());
+    }
+
+    /// The title falls back to the vendor where the card falls back to the
+    /// vendor *and the type*: a title is a name, a card is a sentence somebody
+    /// has to recognise the thing from. Both stop at the MAC.
+    #[test]
+    fn an_unnamed_device_is_titled_by_its_vendor_and_carded_by_its_type() {
+        let tablet = facts();
+        assert_eq!(tablet.title(), "Amazon Technologies device");
+        assert_eq!(tablet.descriptive(), "Amazon tablet");
+
+        let bare = DeviceFacts {
+            mac: "02:00:5e:00:00:04".into(),
+            ..DeviceFacts::default()
+        };
+        assert_eq!(bare.title(), "02:00:5e:00:00:04");
+        assert_eq!(bare.label(), "02:00:5e:00:00:04");
+    }
+
+    // --- when the data starts ---------------------------------------------
+
+    /// The sentence the network scope was missing. A model that finds zero
+    /// presence spans and has not been told when monitoring began explains the
+    /// emptiness as an outage, which is what happened.
+    #[test]
+    fn the_monitoring_window_says_when_the_data_starts_and_what_time_it_is() {
+        let rendered = render_monitoring_window(Some(NOW - 3_600), NOW);
+        assert!(
+            rendered.contains("Monitoring data begins at 2026-08-24 11:00:00 UTC (1 hour ago)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("no data before that"),
+            "the model is left to infer what an empty earlier window means: {rendered}"
+        );
+        assert!(
+            rendered.contains("Current time: 2026-08-24 12:00:00 UTC"),
+            "{rendered}"
+        );
+    }
+
+    /// A database with nothing in it says so, rather than saying monitoring
+    /// began at the epoch.
+    #[test]
+    fn a_database_with_no_observations_says_that_rather_than_a_timestamp() {
+        let rendered = render_monitoring_window(None, NOW);
+        assert!(
+            rendered.contains("nothing has been observed yet"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("1970"), "{rendered}");
+        assert!(rendered.contains("Current time:"), "{rendered}");
+    }
+
+    /// The device scope gets the same sentence about its own device: its
+    /// history starts at its first sighting whatever the rest of the network
+    /// has been recording.
+    #[test]
+    fn a_device_snapshot_says_when_that_devices_history_starts() {
+        let snapshot = render_device_snapshot(&facts(), &[], &[], &[], NOW);
+        assert!(
+            snapshot.contains("Monitoring data begins at 2026-02-15 12:00:00 UTC"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("Current time:"), "{snapshot}");
     }
 
     #[test]
@@ -2132,8 +2438,12 @@ mod tests {
             ),
         ];
 
-        let snapshot = render_network_snapshot(&people, &devices, 3, NOW);
+        let snapshot = render_network_snapshot(&people, &devices, 3, Some(NOW - 86_400), NOW);
 
+        assert!(
+            snapshot.contains("Monitoring data begins at 2026-08-23 12:00:00 UTC (1 day ago)"),
+            "{snapshot}"
+        );
         assert!(snapshot.contains("People (2):"), "{snapshot}");
         assert!(snapshot.contains("Jamie (5eed0000"), "{snapshot}");
         assert!(snapshot.contains("1 device, home at Studio"), "{snapshot}");
@@ -2154,7 +2464,11 @@ mod tests {
 
     #[test]
     fn an_empty_network_still_renders_something_a_model_can_read() {
-        let snapshot = render_network_snapshot(&[], &[], 0, NOW);
+        let snapshot = render_network_snapshot(&[], &[], 0, None, NOW);
+        assert!(
+            snapshot.contains("nothing has been observed yet"),
+            "{snapshot}"
+        );
         assert!(snapshot.contains("People: none"), "{snapshot}");
         assert!(snapshot.contains("Unowned devices: none"), "{snapshot}");
         assert!(
