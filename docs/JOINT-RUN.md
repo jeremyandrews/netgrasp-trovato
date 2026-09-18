@@ -209,6 +209,15 @@ untouched.
 
 ## Findings
 
+**Since this run:** the three plugin findings below are fixed, with regression
+tests at the layer each one happened at; `CHANGELOG.md` has the root cause of
+each. The seven kernel findings are reported and not patched — nothing in this
+repository changes the kernel — and are now ledger items in
+`plugins/netgrasp/FRICTION.md` rather than only a record of one run. The daemon
+findings belong to the `netgraspd` repository and are untouched here.
+
+The text below is left as it was written, as the record of what the run found.
+
 ### Plugin
 
 1. **Any assistant device edit silently turns alerts off.**

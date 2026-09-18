@@ -84,50 +84,119 @@ impl SyncAction {
 /// every page that lists devices. Truncation is on the way in.
 pub const MAX_TITLE_LEN: usize = 128;
 
-/// The label a device should carry, given what is known about it.
+/// Everything a device's name can be derived from.
 ///
-/// Precedence is user-first: the admin's `display_name` (which the write-back
-/// put there from the Item's title) beats anything the daemon observed, so a
-/// named device keeps its name however much the daemon learns later. Below that,
-/// most-informative-first, ending at the MAC, which always exists.
-///
-/// This precedence is also half of the loop-termination argument: after one
-/// write-back, `display_name` is the title, so re-deriving the title yields the
-/// title. See [`is_fixed_point`].
-#[must_use]
-pub fn derive_title(row: &DeviceRow) -> String {
-    match non_blank(row.display_name.as_deref()) {
-        Some(name) => truncate_chars(name, MAX_TITLE_LEN),
-        None => daemon_title(row),
+/// One struct, so that "what to call this device" is one question asked of one
+/// set of inputs. Before it there were two ladders over two row shapes — the
+/// sync derived a title from a [`DeviceRow`] and the assistant labelled a
+/// `DeviceFacts` — and they disagreed: the sync's skipped `resolved_name` and
+/// `mdns_name`, which the daemon's identity resolution had already settled and
+/// every page already showed. So a Brother printer's Item was titled
+/// "CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD. device" while the proposal
+/// card for the same row said "Brother HL-L8360CDW series"
+/// (`docs/JOINT-RUN.md`, plugin finding 2). The better name was in the
+/// database; nothing was reading it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TitleInputs<'a> {
+    /// The name a human typed, from `ng_devices.display_name`.
+    pub display_name: Option<&'a str>,
+    /// The daemon's resolved identity, from `ng_devices.resolved_name`.
+    pub resolved_name: Option<&'a str>,
+    /// Reverse-DNS or DHCP hostname.
+    pub hostname: Option<&'a str>,
+    /// mDNS name.
+    pub mdns_name: Option<&'a str>,
+    /// OUI vendor.
+    pub vendor: Option<&'a str>,
+    /// Hardware address. Always present, so a title always exists.
+    pub mac: &'a str,
+}
+
+impl<'a> From<&'a DeviceRow> for TitleInputs<'a> {
+    fn from(row: &'a DeviceRow) -> Self {
+        Self {
+            display_name: row.display_name.as_deref(),
+            resolved_name: row.resolved_name.as_deref(),
+            hostname: row.hostname.as_deref(),
+            mdns_name: row.mdns_name.as_deref(),
+            vendor: row.vendor.as_deref(),
+            mac: &row.mac,
+        }
     }
 }
 
-/// The label the **daemon's** observations alone imply, ignoring any name a
+/// The name somebody actually gave this device, or that something on the wire
+/// did. `None` when nothing has named it.
+///
+/// The ladder, and it is the only one: the name a human typed, then the name
+/// the daemon resolved, then the hostname it was given, then the name it
+/// advertised over mDNS. A vendor is deliberately **not** here — a vendor is
+/// not a name, and the two callers that fall back to one say so differently
+/// (a title says "Apple device", a proposal card says "Apple tablet").
+#[must_use]
+pub fn observed_name<'a>(inputs: &TitleInputs<'a>) -> Option<&'a str> {
+    [
+        inputs.display_name,
+        inputs.resolved_name,
+        inputs.hostname,
+        inputs.mdns_name,
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|name| !name.is_empty())
+}
+
+/// The title a device's Item carries.
+///
+/// One function for the sync's mint, the sync's title refresh and the
+/// assistant's context alike, so a device is called the same thing wherever it
+/// is named. `display_name` first, then whatever the daemon resolved, then the
+/// vendor qualified as a device, then the MAC, which always exists.
+///
+/// The user-first precedence is also half of the loop-termination argument:
+/// after one write-back, `display_name` is the title, so re-deriving the title
+/// yields the title. See [`is_fixed_point`].
+#[must_use]
+pub fn device_title(inputs: &TitleInputs) -> String {
+    let title = match observed_name(inputs) {
+        Some(name) => name.to_string(),
+        None => match non_blank(inputs.vendor) {
+            // A vendor is qualified, because a vendor is not a name: an OUI
+            // holder called "Apple, Inc." is not what anybody calls the thing
+            // on their desk.
+            Some(vendor) => format!("{vendor} device"),
+            None => inputs.mac.trim().to_string(),
+        },
+    };
+    truncate_chars(&title, MAX_TITLE_LEN)
+}
+
+/// The label a device should carry, given what a row says about it.
+#[must_use]
+pub fn derive_title(row: &DeviceRow) -> String {
+    device_title(&row.into())
+}
+
+/// The title the **daemon's** observations alone imply, ignoring any name a
 /// human gave the device.
 ///
 /// This is the value the write-back compares an admin's title against: if the
 /// admin saved the Item without changing its name, the title still equals this,
 /// and storing it as `display_name` would pin the device's name forever —
-/// freezing it against every hostname the daemon later resolves, as a
-/// side effect of editing an unrelated field.
-/// [`crate::writeback::build_update`] stores `NULL` in that case instead.
+/// freezing it against every name the daemon later resolves, as a side effect
+/// of editing an unrelated field. [`crate::writeback::build_partial_update`]
+/// stores `NULL` in that case instead.
 ///
 /// Keeping it a function rather than a `CASE` expression in the write-back's SQL
 /// is what stops the two derivations from drifting: there is one definition of
 /// "what the daemon would call this device", and both callers use it.
 #[must_use]
-pub fn daemon_title(row: &DeviceRow) -> String {
-    // Each candidate is resolved in its own slot, so the "a vendor is not a
-    // name" qualification attaches to the vendor and to nothing else.
-    let title = if let Some(host) = non_blank(row.hostname.as_deref()) {
-        host.to_string()
-    } else if let Some(vendor) = non_blank(row.vendor.as_deref()) {
-        format!("{vendor} device")
-    } else {
-        row.mac.trim().to_string()
-    };
-
-    truncate_chars(&title, MAX_TITLE_LEN)
+pub fn daemon_title(inputs: &TitleInputs) -> String {
+    device_title(&TitleInputs {
+        display_name: None,
+        ..*inputs
+    })
 }
 
 /// The value, trimmed, if it is present and not blank.
@@ -230,6 +299,98 @@ mod tests {
         r.vendor = Some("Apple".into());
         r.hostname = Some("jeremys-phone".into());
         assert_eq!(derive_title(&r), "jeremys-phone");
+    }
+
+    /// The defect this ladder was widened for: the daemon had resolved
+    /// "Brother HL-L8360CDW series" and the title read the OUI holder instead.
+    #[test]
+    fn the_daemons_resolved_name_beats_the_vendor_it_bought_its_oui_from() {
+        let mut r = row();
+        r.vendor = Some("CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.".into());
+        r.resolved_name = Some("Brother HL-L8360CDW series".into());
+        assert_eq!(derive_title(&r), "Brother HL-L8360CDW series");
+    }
+
+    #[test]
+    fn a_resolved_name_beats_a_hostname_and_an_mdns_name() {
+        let mut r = row();
+        r.mdns_name = Some("Filbert-3".into());
+        r.hostname = Some("dhcp-claimed".into());
+        r.resolved_name = Some("studio-nas".into());
+        assert_eq!(derive_title(&r), "studio-nas");
+    }
+
+    /// Every step of the ladder, in order, each one falling through to the next
+    /// as its input is removed. One test rather than five, because what is
+    /// being asserted is the *order* and not the individual answers.
+    #[test]
+    fn each_step_of_the_ladder_falls_through_to_the_next() {
+        let mut r = row();
+        r.display_name = Some("Office printer".into());
+        r.resolved_name = Some("Brother HL-L8360CDW series".into());
+        r.hostname = Some("brother-printer".into());
+        r.mdns_name = Some("Brother._ipp".into());
+        r.vendor = Some("Brother Industries".into());
+
+        assert_eq!(derive_title(&r), "Office printer");
+        r.display_name = None;
+        assert_eq!(derive_title(&r), "Brother HL-L8360CDW series");
+        r.resolved_name = None;
+        assert_eq!(derive_title(&r), "brother-printer");
+        r.hostname = None;
+        assert_eq!(derive_title(&r), "Brother._ipp");
+        r.mdns_name = None;
+        assert_eq!(derive_title(&r), "Brother Industries device");
+        r.vendor = None;
+        assert_eq!(derive_title(&r), "aa:bb:cc:dd:ee:ff");
+    }
+
+    /// A name a human typed is not overtaken by anything the daemon learns
+    /// afterwards — including an mDNS name, which on a real LAN is attributed
+    /// to the wrong device constantly (`docs/JOINT-RUN.md`, daemon finding 11).
+    #[test]
+    fn a_hand_set_display_name_wins_over_a_later_mdns_name() {
+        let mut r = row();
+        r.display_name = Some("Office printer".into());
+        assert_eq!(derive_title(&r), "Office printer");
+
+        r.mdns_name = Some("Jeremy's MacBook Pro (2)".into());
+        r.resolved_name = Some("Jeremy's MacBook Pro (2)".into());
+        assert_eq!(
+            derive_title(&r),
+            "Office printer",
+            "a misattributed mDNS name took a device's typed name"
+        );
+    }
+
+    /// `daemon_title` is the same ladder with the human's name taken out — the
+    /// comparison the write-back makes to decide whether a title was typed or
+    /// merely left alone.
+    #[test]
+    fn the_daemon_title_ignores_the_name_a_human_typed() {
+        let mut r = row();
+        r.display_name = Some("Office printer".into());
+        r.resolved_name = Some("Brother HL-L8360CDW series".into());
+        assert_eq!(
+            daemon_title(&(&r).into()),
+            "Brother HL-L8360CDW series",
+            "the daemon's own view must not include the human's name"
+        );
+        assert_eq!(derive_title(&r), "Office printer");
+    }
+
+    /// A vendor is not a name, so it is not on the named ladder at all: a
+    /// caller that wants to fall back to one does it itself, and says so in its
+    /// own words.
+    #[test]
+    fn the_named_ladder_stops_before_the_vendor() {
+        let mut r = row();
+        r.vendor = Some("Apple".into());
+        assert_eq!(observed_name(&(&r).into()), None);
+        r.mdns_name = Some("  ".into());
+        assert_eq!(observed_name(&(&r).into()), None, "a blank name is no name");
+        r.mdns_name = Some(" living-room-tv ".into());
+        assert_eq!(observed_name(&(&r).into()), Some("living-room-tv"));
     }
 
     #[test]

@@ -1945,9 +1945,9 @@ fn describing_an_assignment_changes_nothing_at_all() {
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(
             result["summary"].as_str().unwrap_or_default(),
-            "Assign Amazon tablet (02:00:5e:00:00:04) to Jamie (currently Arlo) \
-             (creates its Trovato item)",
-            "the card names the device, the new owner and the one it replaces"
+            "Assign Amazon tablet (02:00:5e:00:00:04) to Jamie (currently Arlo). \
+             Changes the owner, and nothing else (creates its Trovato item)",
+            "the card names the device, the new owner, the one it replaces, and what changes"
         );
 
         // Nothing moved. Not the owner, not the link, not a daemon column.
@@ -2403,6 +2403,609 @@ fn who_was_online_answers_from_the_seeded_presence_rows() {
                 .as_str()
                 .unwrap_or_default()
                 .contains("7 days")
+        );
+    });
+}
+
+// ===========================================================================
+// An edit changes only what it was asked to change
+// ===========================================================================
+//
+// `docs/JOINT-RUN.md`, plugin finding 1. A rename built a whole overlay and
+// filled the columns it had not been asked about from the device's Item; the
+// cron sync mints Items carrying only `field_mac`; `field_bool` reads an absent
+// boolean as `false`; so a rename wrote `notify = false` over a column the
+// daemon's schema defaults to TRUE, and the card said nothing about it.
+// Observed twice in one run, and 33 of 34 device Items were still in the state
+// that reproduces it.
+//
+// These tests are at this layer because that is where it happened: the value
+// came out of a real Item, through a real `save-item`, into a real row. The
+// statement-level half is in `netgrasp_core::writeback`.
+
+/// The user-owned columns of a device row, as a row an assertion can compare
+/// whole.
+///
+/// Whole, rather than column by column: the defect was a column nobody was
+/// looking at, so a test that names only the columns it expects to move would
+/// have passed while `notify` flipped underneath it.
+async fn user_owned_state(
+    pool: &PgPool,
+    device_id: i64,
+) -> (Option<String>, Option<Uuid>, Option<String>, bool, bool) {
+    let row = sqlx::query(
+        "SELECT display_name, owner_item_id, notes, hidden, notify \
+         FROM ng_devices WHERE id = $1",
+    )
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        row.try_get("display_name").unwrap(),
+        row.try_get("owner_item_id").unwrap(),
+        row.try_get("notes").unwrap(),
+        row.try_get("hidden").unwrap(),
+        row.try_get("notify").unwrap(),
+    )
+}
+
+/// Put a device Item back into the shape the cron sync used to mint: the MAC
+/// and nothing else.
+///
+/// Written with SQL rather than through `ItemService`, because going through
+/// the service would fire `tap_item_update` and write the stripped Item back
+/// over the row — which is the neighbouring defect and would destroy the
+/// starting state this test needs.
+async fn strip_item_to_mac_only(pool: &PgPool, item_id: Uuid, mac: &str) {
+    sqlx::query("UPDATE item SET fields = $2 WHERE id = $1")
+        .bind(item_id)
+        .bind(serde_json::json!({ "field_mac": mac }))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A device in the state the run found: owned, with notes, alerts on, hidden
+/// off, and an Item carrying only its MAC. Returns the device id and its Item.
+async fn device_with_a_bare_item(pool: &PgPool, mac: &str, owner: Uuid) -> (i64, Uuid) {
+    let device = seed_clean_device(pool, mac, Some(owner), "online").await;
+    sqlx::query(
+        "UPDATE ng_devices SET notes = 'in the hall cupboard', hidden = FALSE, \
+         notify = TRUE, sync_state = 'dirty' WHERE id = $1",
+    )
+    .bind(device)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    run_cron(pool).await;
+    let (_, item_id, _, _) = device_state(pool, device).await;
+    let item_id = item_id.expect("the sync minted an item");
+    strip_item_to_mac_only(pool, item_id, mac).await;
+    (device, item_id)
+}
+
+#[test]
+fn a_rename_changes_the_name_and_leaves_every_other_user_column_alone() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let (device, item_id) = device_with_a_bare_item(&pool, "02:00:5e:00:00:04", arlo).await;
+        let before_daemon = daemon_snapshot(&pool, device).await;
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id.to_string()),
+            "rename",
+            serde_json::json!({"display_name": "Office printer"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        let (display_name, owner, notes, hidden, notify) = user_owned_state(&pool, device).await;
+        assert_eq!(display_name.as_deref(), Some("Office printer"));
+        assert!(
+            notify,
+            "the rename turned the device's alerts off — finding 1, reproduced"
+        );
+        assert!(!hidden, "the rename hid the device");
+        assert_eq!(
+            notes.as_deref(),
+            Some("in the hall cupboard"),
+            "the rename cleared the notes"
+        );
+        assert_eq!(owner, Some(arlo), "the rename unassigned the device");
+        assert_eq!(
+            daemon_snapshot(&pool, device).await,
+            before_daemon,
+            "a daemon-owned column moved"
+        );
+
+        // The Item agrees, which is the other half: the row is right and the
+        // Item still claims the alerts are off would be a state the next edit
+        // resolves the wrong way again.
+        let item = item_json(&pool, item_id).await;
+        assert_eq!(item["title"], "Office printer");
+        assert_eq!(item["fields"]["field_notify"], true, "{item}");
+        assert_eq!(item["fields"]["field_hidden"], false, "{item}");
+        assert_eq!(item["fields"]["field_notes"], "in the hall cupboard");
+        assert_eq!(item["fields"]["field_owner"], arlo.to_string());
+        assert_eq!(item["fields"]["field_mac"], "02:00:5e:00:00:04");
+    });
+}
+
+#[test]
+fn an_owner_assignment_changes_the_owner_and_leaves_the_flags_alone() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let (device, item_id) = device_with_a_bare_item(&pool, "02:00:5e:00:00:05", arlo).await;
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id.to_string()),
+            "set_owner",
+            serde_json::json!({"person": "Jamie"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        let (display_name, owner, notes, hidden, notify) = user_owned_state(&pool, device).await;
+        assert_eq!(owner, Some(jamie));
+        assert!(notify, "the assignment turned the alerts off — finding 1");
+        assert!(!hidden);
+        assert_eq!(notes.as_deref(), Some("in the hall cupboard"));
+        assert_eq!(
+            display_name, None,
+            "the assignment pinned a name nobody typed"
+        );
+    });
+}
+
+/// "Mute alerts for this device" says nothing about hiding it, and the write
+/// must say nothing either — including on a device that is hidden, where
+/// writing the flag's absent value would unhide it.
+#[test]
+fn setting_one_flag_leaves_the_other_flag_alone() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let (device, item_id) = device_with_a_bare_item(&pool, "02:00:5e:00:00:06", arlo).await;
+        sqlx::query("UPDATE ng_devices SET hidden = TRUE WHERE id = $1")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id.to_string()),
+            "set_flags",
+            serde_json::json!({"notify": false}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        let (_, owner, notes, hidden, notify) = user_owned_state(&pool, device).await;
+        assert!(!notify, "the flag the call named was not written");
+        assert!(hidden, "muting a device also unhid it");
+        assert_eq!(notes.as_deref(), Some("in the hall cupboard"));
+        assert_eq!(owner, Some(arlo));
+    });
+}
+
+/// The card and the write are one change set. Every write tool in the device
+/// scope is described, and the columns the card names are the columns the
+/// following Execute actually moves.
+#[test]
+fn the_card_names_exactly_the_columns_the_write_then_changes() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        seed_person_item(&pool, "Jamie").await;
+        let (device, item_id) = device_with_a_bare_item(&pool, "02:00:5e:00:00:07", arlo).await;
+        let item_id = item_id.to_string();
+
+        // (tool, arguments, the clause the card must carry, the columns that
+        // may move). One case per write tool the device scope declares.
+        let cases: Vec<(&str, serde_json::Value, &str, &[&str])> = vec![
+            (
+                "rename",
+                serde_json::json!({"display_name": "Office printer"}),
+                "Changes the name, and nothing else",
+                &["display_name"],
+            ),
+            (
+                "set_owner",
+                serde_json::json!({"person": "Jamie"}),
+                "Changes the owner, and nothing else",
+                &["owner_item_id"],
+            ),
+            (
+                "set_notes",
+                serde_json::json!({"text": "moved to the study"}),
+                "Changes the notes, and nothing else",
+                &["notes"],
+            ),
+            (
+                "set_flags",
+                serde_json::json!({"notify": false}),
+                "Changes the arrival and departure alerts, and nothing else",
+                &["notify"],
+            ),
+            (
+                "set_flags",
+                serde_json::json!({"hidden": true, "notify": true}),
+                "Changes whether it is hidden and the arrival and departure alerts, \
+                 and nothing else",
+                &["hidden", "notify"],
+            ),
+        ];
+
+        for (tool, arguments, clause, may_move) in cases {
+            let described = call_tool(
+                &pool,
+                &admin,
+                SCOPE_DEVICE,
+                Some(&item_id),
+                tool,
+                arguments.clone(),
+                "describe",
+            )
+            .await;
+            assert_eq!(described["ok"], true, "{tool}: {described}");
+            let summary = described["summary"].as_str().unwrap_or_default();
+            assert!(
+                summary.contains(clause),
+                "{tool}'s card does not say what it changes.\n  card: {summary}\n  wanted: {clause}"
+            );
+
+            let before = user_owned_state(&pool, device).await;
+            let applied = call_tool(
+                &pool,
+                &admin,
+                SCOPE_DEVICE,
+                Some(&item_id),
+                tool,
+                arguments,
+                "execute",
+            )
+            .await;
+            assert_eq!(applied["ok"], true, "{tool}: {applied}");
+            let after = user_owned_state(&pool, device).await;
+
+            // Exactly the columns the card named are allowed to differ.
+            let moved = [
+                ("display_name", before.0 != after.0),
+                ("owner_item_id", before.1 != after.1),
+                ("notes", before.2 != after.2),
+                ("hidden", before.3 != after.3),
+                ("notify", before.4 != after.4),
+            ];
+            for (column, changed) in moved {
+                assert!(
+                    !changed || may_move.contains(&column),
+                    "{tool} changed {column}, which its card did not name"
+                );
+            }
+        }
+    });
+}
+
+/// The mint's half of the same finding: an Item created for a row that already
+/// has user-owned values carries them, so the two tiers never disagree in the
+/// first place.
+#[test]
+fn a_minted_device_item_carries_the_rows_user_owned_values() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:09", Some(arlo), "online").await;
+        sqlx::query(
+            "UPDATE ng_devices SET notes = 'in the hall cupboard', hidden = TRUE, \
+             notify = TRUE, sync_state = 'dirty' WHERE id = $1",
+        )
+        .bind(device)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let report = run_cron(&pool).await;
+        assert_eq!(report["sync"]["created"], 1, "{report}");
+
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item = item_json(&pool, item_id.expect("the sync minted an item")).await;
+        assert_eq!(
+            item["fields"]["field_notify"], true,
+            "a minted Item claims the alerts are off on a device whose row says they are on: {item}"
+        );
+        assert_eq!(item["fields"]["field_hidden"], true, "{item}");
+        assert_eq!(item["fields"]["field_notes"], "in the hall cupboard");
+        assert_eq!(item["fields"]["field_owner"], arlo.to_string());
+    });
+}
+
+// ===========================================================================
+// One title, and it prefers the name a human would use
+// ===========================================================================
+
+/// `docs/JOINT-RUN.md`, plugin finding 2: the printer's Item was titled
+/// "CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD. device" while the proposal
+/// card for the same row said "Brother HL-L8360CDW series". The better name was
+/// already in the database.
+#[test]
+fn a_synced_title_prefers_the_name_the_daemon_resolved_over_the_oui_vendor() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:0a", None, "online").await;
+        sqlx::query(
+            "UPDATE ng_devices SET vendor = 'CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.', \
+             resolved_name = 'Brother HL-L8360CDW series', identity_source = 'mdns', \
+             hostname = NULL, sync_state = 'dirty' WHERE id = $1",
+        )
+        .bind(device)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_cron(&pool).await;
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item_id = item_id.expect("the sync minted an item");
+        let item = item_json(&pool, item_id).await;
+        assert_eq!(
+            item["title"], "Brother HL-L8360CDW series",
+            "the Item is titled after the OUI holder instead of the resolved name"
+        );
+
+        // The assistant's context calls it the same thing, which is the
+        // agreement that was missing.
+        let context = open_context(&pool, &admin, SCOPE_DEVICE, Some(&item_id.to_string())).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(
+            snapshot.contains("Device: Brother HL-L8360CDW series"),
+            "{snapshot}"
+        );
+
+        // A later resolution re-titles the Item on the next pass, because the
+        // derived title moved and nothing pinned the old one.
+        sqlx::query(
+            "UPDATE ng_devices SET resolved_name = 'Brother HL-L8360CDW (study)', \
+             sync_state = 'dirty' WHERE id = $1",
+        )
+        .bind(device)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let report = run_cron(&pool).await;
+        assert_eq!(report["sync"]["refreshed"], 1, "{report}");
+        assert_eq!(
+            item_json(&pool, item_id).await["title"],
+            "Brother HL-L8360CDW (study)"
+        );
+    });
+}
+
+/// A name a human typed is not re-titled by a later daemon resolution. This is
+/// how the plugin tells a hand-set title from a derived one: the write-back
+/// stores it as `display_name`, and `display_name` is the first step of the
+/// ladder — so there is no need to guess whether a title was edited.
+#[test]
+fn a_hand_set_name_survives_every_later_sync_pass() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:0b", None, "online").await;
+        sqlx::query(
+            "UPDATE ng_devices SET resolved_name = 'Brother HL-L8360CDW series', \
+             sync_state = 'dirty' WHERE id = $1",
+        )
+        .bind(device)
+        .execute(&pool)
+        .await
+        .unwrap();
+        run_cron(&pool).await;
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item_id = item_id.expect("the sync minted an item");
+
+        let result = call_tool(
+            &pool,
+            &admin,
+            SCOPE_DEVICE,
+            Some(&item_id.to_string()),
+            "rename",
+            serde_json::json!({"display_name": "Office printer"}),
+            "execute",
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+
+        // The daemon resolves something else, twice, and marks the row dirty
+        // each time — the mDNS flapping a real LAN produces.
+        for name in ["Jeremy's MacBook Pro (2)", "Filbert-3"] {
+            sqlx::query(
+                "UPDATE ng_devices SET mdns_name = $2, resolved_name = $2, \
+                 sync_state = 'dirty' WHERE id = $1",
+            )
+            .bind(device)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+            run_cron(&pool).await;
+        }
+
+        assert_eq!(
+            item_json(&pool, item_id).await["title"],
+            "Office printer",
+            "a misattributed mDNS name took a device's typed name"
+        );
+        let (_, _, display_name, _) = device_state(&pool, device).await;
+        assert_eq!(display_name.as_deref(), Some("Office printer"));
+    });
+}
+
+// ===========================================================================
+// The model is told when monitoring began
+// ===========================================================================
+
+/// `docs/JOINT-RUN.md`, plugin finding 3: asked who was online yesterday
+/// against a database an hour old, the model found zero spans and speculated
+/// about a gap in monitoring, because nothing told it the daemon's earliest
+/// observation was that morning.
+///
+/// The read tool's answer is unchanged — zero spans is the truth. What changed
+/// is that the context says why, so the two empty windows a model cannot
+/// otherwise tell apart are distinguishable.
+#[test]
+fn the_network_context_says_when_monitoring_began() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        // A fresh install says so rather than implying a monitored silence.
+        let context = open_context(&pool, &admin, SCOPE_NETWORK, None).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(
+            snapshot.contains("nothing has been observed yet"),
+            "{snapshot}"
+        );
+
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:0c", Some(jamie), "online").await;
+        let now = now();
+        let began = now - 3_600;
+        sqlx::query(
+            "INSERT INTO ng_presence (device_id, ip, started_at, ended_at, is_summary) \
+             VALUES ($1, '10.0.1.24', to_timestamp($2), NULL, FALSE)",
+        )
+        .bind(device)
+        .bind(began as f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let context = open_context(&pool, &admin, SCOPE_NETWORK, None).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        let expected = netgrasp_core::assist::format_utc(began);
+        assert!(
+            snapshot.contains(&format!("Monitoring data begins at {expected}")),
+            "the context does not say when the data starts: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("no data before that"),
+            "the context does not say what an earlier window means: {snapshot}"
+        );
+        assert!(snapshot.contains("Current time:"), "{snapshot}");
+
+        // The question that produced the finding: a window that ends before the
+        // first observation. The tool still answers "nothing", and the context
+        // the model holds while reading that answer explains it.
+        let iso = |ts: i64| {
+            netgrasp_core::assist::format_utc(ts)
+                .replace(" UTC", "Z")
+                .replace(' ', "T")
+        };
+        let yesterday = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "who_was_online",
+            serde_json::json!({"from": iso(now - 86_400 * 2), "to": iso(now - 86_400)}),
+            "execute",
+        )
+        .await;
+        assert_eq!(yesterday["ok"], true, "{yesterday}");
+        assert_eq!(
+            yesterday["content"].as_str().unwrap_or_default(),
+            "Nothing was online in that window."
+        );
+
+        // And a window inside the monitored period is not empty, which is what
+        // makes the sentence above a distinction rather than a disclaimer.
+        let recent = call_tool(
+            &pool,
+            &admin,
+            SCOPE_NETWORK,
+            None,
+            "who_was_online",
+            serde_json::json!({"from": iso(now - 1_800), "to": iso(now)}),
+            "execute",
+        )
+        .await;
+        assert!(
+            recent["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Jamie"),
+            "{recent}"
+        );
+    });
+}
+
+/// The device scope gets the same sentence about its own device, from its own
+/// `first_seen`.
+#[test]
+fn the_device_context_says_when_that_device_was_first_seen() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:0e", None, "online").await;
+        let first_seen = now() - 86_400 * 3;
+        sqlx::query(
+            "UPDATE ng_devices SET first_seen_at = to_timestamp($2), sync_state = 'dirty' \
+             WHERE id = $1",
+        )
+        .bind(device)
+        .bind(first_seen as f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        run_cron(&pool).await;
+        let (_, item_id, _, _) = device_state(&pool, device).await;
+        let item_id = item_id.expect("the sync minted an item").to_string();
+
+        let context = open_context(&pool, &admin, SCOPE_DEVICE, Some(&item_id)).await;
+        let snapshot = context["snapshot"].as_str().unwrap_or_default();
+        assert!(
+            snapshot.contains(&format!(
+                "Monitoring data begins at {}",
+                netgrasp_core::assist::format_utc(first_seen)
+            )),
+            "{snapshot}"
         );
     });
 }

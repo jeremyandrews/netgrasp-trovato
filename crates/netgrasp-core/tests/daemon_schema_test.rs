@@ -272,6 +272,67 @@ async fn the_sync_pass_reads_a_dirty_device_row_with_both_timestamps() {
     );
     assert_eq!(row.first_seen, Some(seen - 900_000));
     assert!(row.trovato_item_id.is_none());
+
+    // The name columns the title derivation reads. The seed writes the same
+    // value into `hostname` and `resolved_name`, so what is asserted here is
+    // that the column is projected at all — the derivation's precedence is
+    // settled in `sync`'s own tests.
+    assert_eq!(
+        row.resolved_name.as_deref(),
+        Some("nas"),
+        "resolved_name is not projected, so the title cannot read it"
+    );
+
+    // And the rest of the user-owned set, which the mint carries onto a new
+    // Item. `notify` is the one that matters: the column is NOT NULL DEFAULT
+    // TRUE, so a projection that omitted it would have the mint claim `false`
+    // about every device the daemon has ever seen.
+    assert_eq!(
+        row.notify,
+        Some(true),
+        "notify is not projected, so a minted Item cannot carry it"
+    );
+    assert_eq!(row.hidden, Some(false));
+    assert_eq!(row.notes, None);
+    assert_eq!(row.owner_item_id, None);
+    assert_eq!(row.overlay().columns(), ["hidden", "notify"]);
+}
+
+/// The whole user-owned set survives the round trip the mint depends on: a
+/// device the daemon marked dirty, with an owner and notes and both flags set,
+/// read back as the overlay a new Item is created carrying.
+#[tokio::test]
+async fn the_sync_pass_reads_the_user_owned_columns_a_mint_has_to_carry() {
+    let mut conn = daemon_db("dirty_overlay").await;
+    let id = seed_device(&mut conn, "aa:bb:cc:00:00:0a", None, now()).await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET owner_item_id = $1::uuid, notes = $2::text, \
+         hidden = TRUE, notify = FALSE WHERE id = $3::bigint",
+        &[json!(PERSON), json!("in the hall cupboard"), json!(id)],
+    )
+    .await;
+
+    let rows: Vec<DeviceRow> =
+        query_rows(&mut conn, queries::SELECT_DIRTY_DEVICES, &[json!(10)]).await;
+    let row = rows.into_iter().next().expect("the dirty row");
+
+    // `owner_item_id` is a uuid column and is projected `::text`, so it decodes
+    // into the `Option<String>` the overlay carries rather than as null.
+    assert_eq!(row.owner_item_id.as_deref(), Some(PERSON));
+    assert_eq!(row.notes.as_deref(), Some("in the hall cupboard"));
+    assert_eq!(row.hidden, Some(true));
+    assert_eq!(row.notify, Some(false));
+
+    let overlay = row.overlay();
+    assert_eq!(
+        overlay.columns(),
+        ["hidden", "notes", "notify", "owner_item_id"]
+    );
+    let fields = netgrasp_core::writeback::device_item_fields(&row.mac, &overlay);
+    assert_eq!(fields["field_owner"], PERSON);
+    assert_eq!(fields["field_notify"], false);
+    assert_eq!(fields["field_hidden"], true);
 }
 
 /// The two statements that address a device row by its primary key. A `::uuid`
@@ -362,7 +423,9 @@ async fn the_write_back_reads_the_daemons_naming_inputs() {
     #[derive(serde::Deserialize)]
     struct FallbackRow {
         mac: String,
+        resolved_name: Option<String>,
         hostname: Option<String>,
+        mdns_name: Option<String>,
         vendor: Option<String>,
     }
     let rows: Vec<FallbackRow> = query_rows(
@@ -375,6 +438,85 @@ async fn the_write_back_reads_the_daemons_naming_inputs() {
     assert_eq!(row.mac, "aa:bb:cc:00:00:04");
     assert_eq!(row.hostname.as_deref(), Some("roku"));
     assert_eq!(row.vendor.as_deref(), Some("Apple"));
+
+    // Every column `daemon_title` reads. A probe missing one of these answers
+    // the write-back's question wrongly: it compares the admin's title against
+    // the daemon's own name for the device, and a name it could not see makes a
+    // title that was merely left alone look like one a human typed.
+    assert_eq!(row.resolved_name.as_deref(), Some("roku"));
+    assert_eq!(row.mdns_name, None);
+    assert_eq!(
+        netgrasp_core::sync::daemon_title(&netgrasp_core::sync::TitleInputs {
+            display_name: None,
+            resolved_name: row.resolved_name.as_deref(),
+            hostname: row.hostname.as_deref(),
+            mdns_name: row.mdns_name.as_deref(),
+            vendor: row.vendor.as_deref(),
+            mac: &row.mac,
+        }),
+        "roku",
+        "the daemon's own name for the device is not what the probe implies"
+    );
+}
+
+/// When the data starts, from the two tables that record a time.
+///
+/// The statement aggregates the `timestamptz` and extracts the epoch from the
+/// one resulting value, so what has to be checked against a real schema is that
+/// the value arrives as a `bigint` and not as the `null` a `timestamptz` decodes
+/// to through the `db` host.
+#[tokio::test]
+async fn the_monitoring_start_is_the_earliest_of_the_two_recorded_times() {
+    let mut conn = daemon_db("monitoring_start").await;
+
+    #[derive(serde::Deserialize)]
+    struct EarliestRow {
+        earliest: Option<i64>,
+    }
+    async fn earliest(conn: &mut PgConnection) -> Option<i64> {
+        let rows: Vec<EarliestRow> = query_rows(conn, queries::SELECT_MONITORING_START, &[]).await;
+        rows.into_iter().next().expect("one row").earliest
+    }
+
+    // An empty database answers "nothing yet" rather than the epoch.
+    assert_eq!(earliest(&mut conn).await, None);
+
+    let seen = now();
+    let id = seed_device(&mut conn, "aa:bb:cc:00:00:0b", None, seen).await;
+
+    // An event alone answers, because LEAST ignores the null side.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+         VALUES ($1::bigint, 'new_device', to_timestamp($2::bigint))",
+        &[json!(id), json!(seen - 3_600)],
+    )
+    .await;
+    assert_eq!(
+        earliest(&mut conn).await,
+        Some(seen - 3_600),
+        "the earliest observation came back null — the query read a timestamptz"
+    );
+
+    // A presence session older than the event moves the answer back.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_presence (device_id, started_at, is_summary) \
+         VALUES ($1::bigint, to_timestamp($2::bigint), FALSE)",
+        &[json!(id), json!(seen - 86_400)],
+    )
+    .await;
+    assert_eq!(earliest(&mut conn).await, Some(seen - 86_400));
+
+    // A later row does not.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_presence (device_id, started_at, ended_at, is_summary) \
+         VALUES ($1::bigint, to_timestamp($2::bigint), to_timestamp($3::bigint), FALSE)",
+        &[json!(id), json!(seen - 600), json!(seen)],
+    )
+    .await;
+    assert_eq!(earliest(&mut conn).await, Some(seen - 86_400));
 }
 
 // ===========================================================================

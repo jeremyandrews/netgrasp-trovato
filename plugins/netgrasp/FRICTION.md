@@ -17,6 +17,12 @@ Verified at `KERNEL_API_VERSION (1,0)` (`crates/kernel/src/plugin/mod.rs:51`)
 with **no kernel, WIT, SDK or kernel-migration change** in the build session. The
 design decisions these findings forced are argued in `DESIGN.md`.
 
+Seven findings are grouped under their own heading below: they were met during
+the first joint run of the daemon and the plugin against a live LAN
+(`docs/JOINT-RUN.md`), and every one of them is in the kernel rather than in
+this plugin. The three plugin defects from that run were fixed rather than
+logged; see `CHANGELOG.md`.
+
 Two findings (`G-USER-API-NO-ADMIN-BYPASS`, `G-ITEM-API-NO-DELETE-BINDING`) were
 added by the pass that made Netgrasp configurable by conversation against the
 0.102 assistant taps. Both are about the same thing from two sides: a plugin
@@ -438,6 +444,97 @@ default and skip the `ORDER BY` when `changed_column` is absent; and validate
 declared columns against `information_schema` once at startup, after migrations,
 where the answer is cheap and the error can name the plugin, the record type and
 the column.
+
+---
+
+## Findings from the first joint run (kernel 0.102.0, reported not patched)
+
+Seven kernel defects were met while running the daemon and this plugin together
+against a live LAN with the assistant on, and they are recorded here because
+`docs/JOINT-RUN.md` is the record of one run while this file is the ledger. None
+of them is patched: no kernel, WIT, SDK or kernel-migration change was made,
+here or in the pass that fixed the three plugin findings from the same run.
+
+Evidence for each is the run itself (`docs/JOINT-RUN.md`, kernel findings 4 to
+10), with the kernel `file:line` the run identified.
+
+### G-ASSISTANT-TEMPERATURE-ALWAYS-SENT — **[High, NEW]** the assistant cannot use any model that rejects `temperature`
+
+`AssistantConfig.temperature` is a plain `f32` with no "unset", and
+`chat_complete` passes it on every call
+(`crates/kernel/src/services/ai_assistant.rs:794`), so `build_anthropic_request`
+always sends the field. Claude Sonnet 5, Opus 5, Opus 4.7/4.8 and Fable reject
+it: the identical request returns
+`400 invalid_request_error: "temperature is deprecated for this model."`, and
+returns 200 without the field. This is what blocked the joint run on
+`claude-sonnet-5`; it ran on `claude-sonnet-4-6` instead.
+
+**Decidable item:** make the field `Option<f32>` and omit it when unset. A site
+that has never set a temperature cannot currently use the models Anthropic
+ships.
+
+### G-PROVIDER-ERROR-BODY-DISCARDED — **[Medium, NEW]** the provider's own error message is never recorded
+
+The kernel logs `assistant model call failed … error=the AI provider returned
+HTTP 400` and the chat shows "Something went wrong talking to the model
+provider." The provider's body, which names the offending field, is discarded.
+Diagnosing the finding above took a reproduction outside the kernel for exactly
+this reason.
+
+**Decidable item:** log the response body, truncated, at `warning`.
+
+### G-SAVE-PERMISSIONS-DROPS-PLUGIN-GRANTS — **[High, NEW]** saving the permissions page deletes every plugin permission from every role
+
+`save_permissions` rebuilds each role's grants from `KERNEL_PERMISSIONS` alone,
+so `Role::set_permissions` removes everything else. One save removed 29 grants
+across seven roles: `administer netgrasp` from `network_admin`, the anonymous
+role's `view netgrasp devices` (which the demo depends on), every `ng_device`
+and `ng_person` content grant, and the kernel's own `view own profile`, which is
+not in that list either. Restored with SQL.
+
+**Decidable item:** build the form's column set from the registry that
+`tap_perm` feeds, not from a constant. Any plugin that declares a permission is
+one admin save away from losing it.
+
+### G-NO-ROLE-ASSIGNMENT-UI — **[Medium, NEW]** there is no way to put a user in a role
+
+The admin user forms carry name, email, password, status and an `is_admin`
+checkbox, with no role selector; the role form carries only a name; `trovato
+user` has one subcommand, `reset-password`; and `Role::assign_to_user` has no
+caller outside tests. The joint run put its `netadmin` user into
+`network_admin` with SQL.
+
+**Decidable item:** a role selector on the user form, or a `trovato user
+add-role`. A plugin permission that can only be granted through a role nobody
+can be put in is a permission that cannot be used.
+
+### G-ASSISTANT-CSRF-TOKEN-SINGLE-USE — **[High, NEW]** the chat page reuses a token the kernel consumes
+
+`static/js/assistant.js` reads `data-csrf-token` once and sends it on every
+message, Apply and Discard, but `verify_csrf_token` consumes the token on
+success. Reproduced at the HTTP level: the message succeeded, Apply with the
+same token returned `403 Invalid or missing CSRF token` and changed nothing, and
+Apply with a token from a fresh page render worked. In a browser, Apply on a
+proposal card should fail until the page is reloaded. The form fallback posts
+the same consumed token.
+
+This one bounds what the assistant taps can be trusted to have been exercised
+by: every write in the joint run was applied through a freshly rendered token.
+
+**Decidable item:** either issue a token per response or make the assistant
+routes' verification non-consuming.
+
+### G-STREAM-DONE-USAGE-ZERO — **[Low, NEW]** the stream's `done` event reports zero usage
+
+`{"type":"done","usage":{"completion_tokens":0,"prompt_tokens":0,"total_tokens":0}}`
+on every turn, while the same event's `tokens_used` and the conversation row
+carry the real figure.
+
+### G-PROVIDER-TEST-ACCEPTS-404 — **[Low, NEW]** the provider connection test calls a 404 a success
+
+"Connected successfully (HTTP 404 Not Found)", latency 294 ms, against a base
+URL that was in fact correct. Any reachable host passes, so the test cannot
+distinguish a working provider from a typo that resolves.
 
 ---
 

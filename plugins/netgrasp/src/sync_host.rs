@@ -31,10 +31,13 @@
 //! The **150 s background epoch** is the third bound, and the same page size
 //! serves it: one `get-item` plus at most one `save-item` per row.
 
-use netgrasp_core::model::{DeviceRow, Span, SpanRow};
+use netgrasp_core::model::{DeviceEdit, DeviceRow, Span, SpanRow};
 use netgrasp_core::queries;
-use netgrasp_core::sync::{SyncAction, daemon_title, plan};
-use netgrasp_core::writeback::{Statement, build_person_upsert, build_update, overlay_from_item};
+use netgrasp_core::sync::{SyncAction, TitleInputs, daemon_title, plan};
+use netgrasp_core::writeback::{
+    Statement, build_partial_update, build_person_upsert, build_update, device_item_fields,
+    overlay_from_item,
+};
 use netgrasp_core::{CoreError, CoreResult, DEVICE_TYPE, retention};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -138,7 +141,11 @@ fn sync_one(row: &DeviceRow) -> CoreResult<SyncAction> {
 
     match &action {
         SyncAction::Create { title } | SyncAction::Relink { title, .. } => {
-            let item_id = create_device_item(&row.mac, title)?;
+            // The row's own user-owned values go onto the new Item. Minting it
+            // with the MAC alone left the two tiers disagreeing about four
+            // columns, and the first whole-Item write-back resolved the
+            // disagreement in favour of the Item's absent values.
+            let item_id = create_device_item(&row.mac, title, &row.overlay())?;
             link_item(row.id, &item_id)?;
         }
         SyncAction::Refresh { item_id, title } => refresh_title(item_id, title)?,
@@ -160,17 +167,29 @@ pub fn load_item(id: &str) -> CoreResult<Option<Value>> {
 
 /// Create a device Item and return its id.
 ///
-/// The Item carries the MAC and nothing else the daemon owns: every other field
-/// is the admin's to fill in (`DESIGN.md` Decision 1). Created **unpublished**
-/// (`status: 0`) is deliberately *not* done — a device the daemon just found
-/// should appear in the lists immediately, and an admin hides it with the
-/// `hidden` field rather than by unpublishing.
-pub fn create_device_item(mac: &str, title: &str) -> CoreResult<String> {
+/// The Item carries the MAC and nothing else the **daemon** owns: every other
+/// field is the admin's (`DESIGN.md` Decision 1). It does carry the row's
+/// user-owned values, and that is not a contradiction of the same rule — those
+/// columns are the admin's, the daemon never writes them, and copying them onto
+/// the Item is the only way the two tiers can agree about them from the start.
+///
+/// They did not agree. An Item minted with `field_mac` alone reads every other
+/// user-owned field back as absent, `field_bool` reads an absent boolean as
+/// `false`, and the first write of the whole Item wrote `notify = false` over a
+/// column whose schema default is `TRUE` — so a device's alerts went off the
+/// first time anybody renamed it (`docs/JOINT-RUN.md`, plugin finding 1). The
+/// partial write-back stops that write; this stops the disagreement that made
+/// it wrong.
+///
+/// Created **unpublished** (`status: 0`) is deliberately *not* done — a device
+/// the daemon just found should appear in the lists immediately, and an admin
+/// hides it with the `hidden` field rather than by unpublishing.
+pub fn create_device_item(mac: &str, title: &str, overlay: &DeviceEdit) -> CoreResult<String> {
     let payload = json!({
         "type": DEVICE_TYPE,
         "title": title,
         "status": 1,
-        "fields": { "field_mac": mac },
+        "fields": device_item_fields(mac, overlay),
     });
     let saved = item_host::save_item(&payload)
         .map_err(|code| CoreError::Item(format!("save-item create: host error {code}")))?;
@@ -222,7 +241,13 @@ fn mark_clean(device_id: i64) -> CoreResult<()> {
 // Kernel → daemon
 // ===========================================================================
 
-/// Write an admin's device edit back to the daemon's table.
+/// Write an admin's **whole-Item** device edit back to the daemon's table.
+///
+/// This is the `tap_item_update` path, and the whole Item is the right input
+/// for it: the admin content form submits every field, so the saved Item is the
+/// new state of every user-owned column and there is nothing for it to be
+/// silent about. An assistant tool call is the opposite shape and goes through
+/// [`write_back_device_edit`] instead.
 ///
 /// The statement is built by [`build_update`] from the user-owned column list, so
 /// this function has no opportunity to name a daemon column even by accident. It
@@ -241,22 +266,50 @@ pub fn write_back_device(item: &Value) -> CoreResult<u64> {
         .ok_or_else(|| CoreError::Invalid("device item has no id".into()))?;
     let overlay = overlay_from_item(item)?;
 
-    // What the daemon alone would call this device. Read here rather than
-    // computed in SQL so there is one definition of it (`daemon_title`) rather
-    // than a Rust one and a `CASE` expression that can drift apart. A failed
-    // read degrades to `None`, which stores the title unconditionally — losing
-    // hostname tracking rather than losing a name a human typed.
-    let fallback = daemon_fallback_title(item_id).unwrap_or_else(|e| {
+    let Statement { sql, params, .. } =
+        build_update(item_id, &overlay, fallback_title(item_id).as_deref())?;
+    exec(&sql, &params)
+}
+
+/// Write one **sparse** device edit back to the daemon's table.
+///
+/// The assistant path. The statement names the columns the edit names and no
+/// others, so a tool call asked to rename a device cannot also write its
+/// `notify` flag — which is what the whole-Item version of this did, off the
+/// back of an Item that had never carried one (`docs/JOINT-RUN.md`, plugin
+/// finding 1).
+///
+/// Column discipline is unchanged and comes from the same place: the `SET` list
+/// is generated from [`netgrasp_core::columns::USER_OWNED`], so this cannot name
+/// a daemon column however the edit was built, and `sync_state` is not in that
+/// set.
+///
+/// # Errors
+///
+/// [`CoreError::Invalid`] when the edit names no user-owned column;
+/// [`CoreError::Store`] when the update fails.
+pub fn write_back_device_edit(item_id: &str, edit: &DeviceEdit) -> CoreResult<u64> {
+    let Statement { sql, params, .. } =
+        build_partial_update(item_id, edit, fallback_title(item_id).as_deref())?;
+    exec(&sql, &params)
+}
+
+/// What the daemon alone would call this device, for the name-pinning rule.
+///
+/// Read here rather than computed in SQL so there is one definition of it
+/// (`daemon_title`) rather than a Rust one and a `CASE` expression that can
+/// drift apart. A failed read degrades to `None`, which stores the title
+/// unconditionally — losing name tracking rather than losing a name a human
+/// typed.
+fn fallback_title(item_id: &str) -> Option<String> {
+    daemon_fallback_title(item_id).unwrap_or_else(|e| {
         host::log(
             "warning",
             "netgrasp",
             &format!("write-back: daemon title for {item_id}: {e}"),
         );
         None
-    });
-
-    let Statement { sql, params, .. } = build_update(item_id, &overlay, fallback.as_deref())?;
-    exec(&sql, &params)
+    })
 }
 
 /// The title the daemon's own observations imply for the device behind an Item.
@@ -267,19 +320,43 @@ fn daemon_fallback_title(item_id: &str) -> CoreResult<Option<String>> {
     #[derive(Deserialize)]
     struct FallbackRow {
         mac: String,
+        resolved_name: Option<String>,
         hostname: Option<String>,
+        mdns_name: Option<String>,
         vendor: Option<String>,
     }
     let rows: Vec<FallbackRow> =
         query_rows(queries::SELECT_DAEMON_TITLE_FIELDS, &[json!(item_id)])?;
     Ok(rows.into_iter().next().map(|r| {
-        // Id 0 is never a real identity value; nothing derived from this probe
-        // reads it, and `daemon_title` looks only at mac, hostname and vendor.
-        let mut probe = DeviceRow::new(0, r.mac);
-        probe.hostname = r.hostname;
-        probe.vendor = r.vendor;
-        daemon_title(&probe)
+        daemon_title(&TitleInputs {
+            display_name: None,
+            resolved_name: r.resolved_name.as_deref(),
+            hostname: r.hostname.as_deref(),
+            mdns_name: r.mdns_name.as_deref(),
+            vendor: r.vendor.as_deref(),
+            mac: &r.mac,
+        })
     }))
+}
+
+/// The earliest observation the database holds, in unix seconds.
+///
+/// `None` when it holds none — a fresh install, or one whose retention window
+/// has swept everything. The assistant's network scope states this in its
+/// context: a model that finds zero presence spans and has not been told when
+/// monitoring began explains the emptiness as an outage instead
+/// (`docs/JOINT-RUN.md`, plugin finding 3).
+///
+/// # Errors
+///
+/// [`CoreError::Store`] when the query fails.
+pub fn monitoring_start() -> CoreResult<Option<i64>> {
+    #[derive(Deserialize)]
+    struct EarliestRow {
+        earliest: Option<i64>,
+    }
+    let rows: Vec<EarliestRow> = query_rows(queries::SELECT_MONITORING_START, &[])?;
+    Ok(rows.into_iter().next().and_then(|r| r.earliest))
 }
 
 /// Mirror a person Item into `ng_people` for the daemon to read.

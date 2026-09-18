@@ -99,7 +99,7 @@ So:
 | Tier | What it holds | Written by |
 |---|---|---|
 | `ng_devices` table, declared as record type `ng_device_state` | daemon-owned identity + volatile state | the daemon; the plugin writes only the user columns and the link |
-| `ng_device` Item | the user's overlay: label, owner, notes, hidden, notify | an admin, through the kernel's content forms; created once by sync |
+| `ng_device` Item | the user's overlay: label, owner, notes, hidden, notify | an admin, through the kernel's content forms; created once by sync, carrying whatever the row's user-owned columns already say |
 
 The two column sets are **fixed and disjoint**, which is what makes "the two
 writers never collide" a schema property rather than a promise:
@@ -181,10 +181,23 @@ bounded pages. For each:
   device Item (`save-item` with no id), write the id back, set `sync_state = 'clean'`;
 - an existing Item → refresh the derived title only, then set `sync_state = 'clean'`.
 
-The Item's title is `COALESCE(display_name, hostname, vendor || ' device', mac)`
-(`netgrasp_core::sync::derive_title`), which is the only thing the daemon side has
-to say about an Item whose fields are otherwise all user-owned. This is why the
-update branch has real work and is not scaffolding.
+The Item's title is
+`COALESCE(display_name, resolved_name, hostname, mdns_name, vendor || ' device', mac)`
+(`netgrasp_core::sync::device_title`, over the ladder
+`netgrasp_core::sync::observed_name`), which is the only thing the daemon side
+has to say about an Item whose fields are otherwise all user-owned. This is why
+the update branch has real work and is not scaffolding.
+
+It is **one** function, and that is the decision rather than the implementation.
+It was two: the sync derived a title from a `DeviceRow` whose projection read
+`hostname` and `vendor`, and the assistant labelled a `DeviceFacts` whose
+projection read `resolved_name` and `mdns_name` too. So a printer's Item was
+titled after the Singapore OUI holder its address block came from while every
+page and every proposal card called it "Brother HL-L8360CDW series"
+(`docs/JOINT-RUN.md`, plugin finding 2). `resolved_name` is the answer the
+daemon's own identity resolution settled on, with `identity_source` saying which
+signal produced it; a derivation that skips it is preferring a corporate name to
+a device's own.
 
 **Kernel → daemon** (`tap_item_update` on `ng_device`): writes exactly
 `USER_OWNED` into `ng_devices WHERE trovato_item_id = $id`, and
@@ -192,10 +205,10 @@ update branch has real work and is not scaffolding.
 
 One subtlety, found by the integration test rather than by design, and worth
 recording because the naive version is silently wrong: **an unchanged title must
-clear `display_name`, not store it.** `display_name` outranks `hostname` in
-`derive_title`, so if every save stored the title, an admin who edited only the
-*notes* of a device still called `aa:bb:cc:dd:ee:ff` would pin that MAC as its
-label forever — the daemon could resolve a hostname the next minute and the
+clear `display_name`, not store it.** `display_name` outranks every observed
+name in `device_title`, so if every save stored the title, an admin who edited
+only the *notes* of a device still called `aa:bb:cc:dd:ee:ff` would pin that MAC
+as its label forever — the daemon could resolve a hostname the next minute and the
 device would never take it. So the write-back compares the title against
 `netgrasp_core::sync::daemon_title` (what the daemon's observations alone imply)
 and stores `NULL` when they match. A name a human actually typed is stored and
@@ -328,6 +341,22 @@ but two consequences are the plugin's:
    person, and states the value being replaced: *"Assign Amazon tablet
    (02:00:5e:00:00:04) to Jamie (currently Arlo)"*. `netgrasp_core::assist` builds
    those strings and is exhaustively tested without a database.
+3. **An edit is sparse, and the card names its columns.** A tool call is about
+   one thing — "rename this to Office printer" says nothing about the alerts —
+   so `netgrasp_core::model::DeviceEdit` says, per user-owned column, either
+   "set it to this" or nothing at all, and `writeback::build_partial_update`
+   builds its `SET` list from the columns the edit names. The card's change set
+   is `DeviceEdit::columns`, the same list that statement is built from, so the
+   displayed change set and the executed change set are one value read twice.
+
+   This is a correction, not a flourish. The first version built a **whole**
+   overlay and filled the columns the call had not named from the device's Item
+   — which the sync minted carrying only `field_mac`, and where an absent
+   boolean reads as `false`. So a rename wrote `notify = false` over a column
+   whose schema default is `TRUE`, twice in one run, and the card said nothing
+   about it (`docs/JOINT-RUN.md`, plugin finding 1). The Item still has to be
+   saved whole, because `Item::update` replaces `fields` wholesale; the **row**
+   must not be.
 
 **A device write may have to mint an Item first.** `write_back_device` addresses
 the row by `trovato_item_id`, and only a `dirty` row ever gets an Item from the
@@ -337,6 +366,16 @@ and report success. Every device write therefore resolves the row, mints the Ite
 the way `sync_one` does when there is none, and says so on the card ("This also
 creates its Trovato item"). It is the first thing this feature got wrong in
 testing and the reason that test exists.
+
+**A scope's context says when its data starts.** The network scope's snapshot
+opens with the earliest observation the database holds and the current time; the
+device scope's says the same about that device's `first_seen`. Asked who was
+online yesterday against a database an hour old, a model finds zero presence
+spans — the truth — and, told nothing else, explains it as a gap in monitoring,
+which is what happened (`docs/JOINT-RUN.md`, plugin finding 3). An empty window
+before the first observation and an empty window over a monitored period are the
+same zero rows and different answers, and the context is the only place that
+difference can be stated.
 
 **Nothing an assistant does writes `sync_state`.** The two statements that write
 it are both in `sync_host.rs` and neither is reachable from a tool, so Decision
