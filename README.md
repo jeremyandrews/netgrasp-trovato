@@ -216,6 +216,40 @@ authenticated viewer keeps the navigation with no further change.
 `site_front_page`, which Trovato serves as a redirect for any internal path. It
 uses `ON CONFLICT DO NOTHING`, so an operator's own choice is never overwritten.
 
+### The row menu
+
+Every device row, every event row and every person card carries an actions menu,
+opened with the `⋯` button at the end of the row or by right-clicking anywhere in
+it.
+
+| Entry | On | What it opens |
+|---|---|---|
+| Rename | devices, people | a one-field form for the name |
+| Assign owner | devices | a select of people, plus "nobody" |
+| Hide / Unhide | devices | a confirmation, labelled with the direction it is going |
+| Mute / Unmute alerts | devices | the same, for arrival and departure alerts |
+| Arrival alerts | people | that person's two notification flags |
+| Ask the assistant about this | everything | a conversation scoped to the row |
+
+**It is a menu that works with scripting off.** The menu itself is a `<details>`
+element, so the browser opens it on click and on Enter or Space with no script
+involved, and every entry in it is an ordinary link. The right-click handler in
+`static/js/netgrasp.js` opens that same element under the pointer and closes any
+other; Escape closes it and puts focus back on the button. Touch gets the visible
+button, which is why the button is visible rather than appearing on hover.
+
+Each entry links to a small page the plugin serves rather than posting straight
+from the row, and that is forced rather than chosen: a write has to carry the
+kernel's `_token`, and a gather content template is rendered in a context that
+does not contain one — the same context limitation the auto-reload section below
+describes, met from a second direction. The page the link opens is served by
+`tap_api`, which *is* handed a token, so it renders the form and the POST goes
+from there. `plugins/netgrasp/FRICTION.md`, `G-GATHER-TEMPLATE-NO-CSRF`.
+
+An event row's menu acts on the **device** the event is about, because an event
+has nothing of its own to configure. It reaches that device by the `device_id` on
+the row, since a gather reads one record type and the MAC is not on it.
+
 ### Auto-reload
 
 The device, event and presence pages reload themselves. **Ten seconds** by
@@ -232,6 +266,12 @@ forbids for something netgrasp can answer itself.
 Only netgrasp's own pages carry the timer. `static/js/netgrasp.js` returns
 immediately unless it finds an `.ng-page` element, so nothing else on a host site
 reloads.
+
+The reload **defers** while the page is in use — a menu standing open, or focus
+in a field — and arms itself again rather than cancelling. Reloading a page ten
+seconds after somebody opened a menu would close it before they had read it;
+cancelling outright would leave a wall display frozen because somebody walked
+past and opened one.
 
 The same script rewrites every timestamp into the viewer's timezone. The server
 renders UTC from the daemon's `_epoch` columns and the browser, which knows where

@@ -394,6 +394,44 @@ permission for real is the answer until the kernel's is.
 
 ---
 
+### Decision 10 — the row menu exists without a right-click, and without JavaScript
+
+Every listing row carries an actions menu. The menu is a `<details>` element and
+every entry in it is a link; the browser opens it on click, on Enter and on
+Space, and nothing in that path is scripted.
+
+**Right-click is a convenience over a menu that already exists.** The
+`contextmenu` handler in `static/js/netgrasp.js` opens the same `<details>` the
+button opens, closes any other, and adds no entry, no destination and no
+capability that is not reachable with scripting switched off. That is the test it
+has to pass: if turning JavaScript off removed a way to do something, the feature
+would be wrong, not merely degraded. Touch, which has no contextmenu event worth
+binding, is why the button is visible rather than revealed on hover — on a touch
+screen the button is the whole interface.
+
+**No entry writes from the row.** Each one links to a page the plugin serves,
+which renders the actual form. This is forced by the kernel and is the same
+context limitation that put the auto-reload interval in a template literal: a
+gather content template is rendered in its own Tera context —
+`query`, `rows`, `total`, `page`, `per_page`, `total_pages`, `has_next`,
+`has_prev`, `base_path`, `exposed_filters`, `filter_values`, `pager` — and the
+site context carrying `csrf_token` is built afterwards, for the page wrapper
+(`crates/kernel/src/routes/gather.rs`, `render_gather_with_theme`;
+`routes/helpers.rs`, `inject_site_context`). A `<form method="post">` written into
+a row would therefore post without a token and be refused by the kernel with 403
+before this plugin was dispatched at all — a feature that could not have worked
+rather than one that broke. `tap_api` is handed a freshly minted token in
+`ApiRequest::csrf_token`, so the page the link opens can carry one.
+
+The same gap decides two smaller things. "Assign owner" is a select of people,
+and the people list is not in a device gather's context either, because a gather
+reads one record type — so the page the link opens is also the first place that
+select could be built. And an event row's menu acts on the **device** the event
+is about, reached by the `device_id` the row does carry, because an event is a
+read-only record with nothing of its own to configure (Decision 2).
+
+---
+
 ## What is not in this build
 
 - **No kernel modification.** Every friction item is reported, not fixed
