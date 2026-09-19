@@ -449,8 +449,8 @@ the column.
 
 ## Findings from building the row actions menu (kernel 0.102.0, reported not patched)
 
-Five findings met while putting a per-row actions menu on the listing pages and
-a set of no-JavaScript forms behind it. Four of the five are one fault seen from
+Six findings met while putting a per-row actions menu on the listing pages and a
+set of no-JavaScript forms behind it. Four of the six are one fault seen from
 four sides: **a gather content template is rendered in a context that contains
 only its own query's data**, so anything the surrounding page knows — the
 viewer, their permissions, a form token, whether the assistant is on — is
@@ -546,6 +546,35 @@ not match it, and neither will match the kernel's own admin listings.
 list of `{href, label}` and an accessible name, with the CSS in the theme. The
 hard part is not the markup; it is that the entries in it want a form token,
 which is `G-GATHER-TEMPLATE-NO-CSRF` again.
+
+### G-API-RESPONSE-NO-HEADERS — **[Medium, NEW]** a plugin cannot set a response header, so a form cannot redirect and a page cannot link its own stylesheet
+
+`ApiResponse` carries `status`, `body`, `content_type`, `theme` and `title`
+(`crates/plugin-sdk/src/types.rs`) and no headers. The kernel builds the response
+from the status and the body and sets exactly one header, `Content-Type`
+(`crates/kernel/src/routes/plugin_api.rs`). The type's own documentation says
+"The kernel serves `status`, `headers` and `body` as-is", which names a field
+that does not exist.
+
+**Impact.** Two things a served page normally does are unavailable.
+
+A form cannot **redirect**. POST-redirect-GET is the shape every form on the web
+has, and it is what stops a reload from re-submitting; without a `Location` there
+is no way to return to the listing a write came from. These forms answer with a
+themed confirmation carrying `<meta http-equiv="refresh">`, which returns without
+JavaScript and is not the same thing: the write's own URL stays in history, and a
+browser that ignores the meta leaves the reader on a page that is not the list.
+
+A page also cannot put anything in `<head>`, so a plugin-served page links its
+stylesheet from the body. That works in every browser and is what
+`templates/gather/netgrasp/page.html` already does for the same reason, but it
+is a workaround in both places rather than once.
+
+**Recommendation (post-1.0, small):** either add the `headers` map the docs
+already describe — allowlisted to response headers a plugin may set, with
+`Location` the obvious first — or a `redirect(status, location)` constructor,
+which covers the whole of this finding's first half and cannot be used to smuggle
+anything else. Correct the doc comment either way.
 
 ### G-THEME-NO-DARK-TOKENS — **[Low, NEW]** the theme is light-only, so a plugin that wants dark mode invents its own palette
 

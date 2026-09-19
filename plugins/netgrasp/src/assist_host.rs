@@ -76,7 +76,7 @@ const NO_PERMISSION: &str = "You do not have permission to change Netgrasp.";
 /// **literally**: the host's `current-user-has-permission` has no
 /// `administer site` bypass, unlike every kernel route, so a site that wants an
 /// administrator to use this has to grant `administer netgrasp` for real.
-fn may_administer() -> bool {
+pub(crate) fn may_administer() -> bool {
     host::current_user_has_permission(PERM_ADMINISTER)
 }
 
@@ -90,7 +90,7 @@ fn refuse(message: impl Into<String>) -> AssistantToolResult {
 // ===========================================================================
 
 /// One device by however the instruction named it.
-fn load_device(reference: &DeviceRef) -> Result<DeviceFacts, String> {
+pub(crate) fn load_device(reference: &DeviceRef) -> Result<DeviceFacts, String> {
     let rows: Vec<DeviceFacts> = match reference {
         DeviceRef::Mac(mac) => query_rows(queries::SELECT_DEVICE_BY_MAC, &[json!(mac)]),
         DeviceRef::Id(id) => query_rows(queries::SELECT_DEVICE_BY_ID, &[json!(id)]),
@@ -113,13 +113,13 @@ fn load_device_by_item(item_id: &str) -> Result<DeviceFacts, String> {
 }
 
 /// Everybody, with their device counts.
-fn load_people() -> Result<Vec<PersonFacts>, String> {
+pub(crate) fn load_people() -> Result<Vec<PersonFacts>, String> {
     query_rows(queries::SELECT_PEOPLE_WITH_COUNTS, &[json!(LIST_LIMIT)])
         .map_err(|e| format!("could not read the people: {e}"))
 }
 
 /// One person by their Item id.
-fn load_person(item_id: &str) -> Result<PersonFacts, String> {
+pub(crate) fn load_person(item_id: &str) -> Result<PersonFacts, String> {
     let rows: Vec<PersonFacts> = query_rows(queries::SELECT_PERSON_WITH_COUNT, &[json!(item_id)])
         .map_err(|e| format!("could not read the person: {e}"))?;
     rows.into_iter()
@@ -253,7 +253,7 @@ fn ensure_device_item(facts: &DeviceFacts) -> Result<String, String> {
 /// device row where the Item carries no such key — which, on an Item the cron
 /// sync minted before this build, is every field but the MAC — and the
 /// write-back names only [`DeviceEdit::columns`].
-fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, String> {
+pub(crate) fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, String> {
     let item_id = ensure_device_item(facts)?;
     let existing = sync_host::load_item(&item_id)
         .map_err(|e| format!("could not read the device's item: {e}"))?
@@ -302,7 +302,7 @@ fn apply_device_edit(facts: &DeviceFacts, edit: &DeviceEdit) -> Result<u64, Stri
 }
 
 /// Save a person Item and mirror it.
-fn apply_person_save(payload: &Value) -> Result<Value, String> {
+pub(crate) fn apply_person_save(payload: &Value) -> Result<Value, String> {
     let saved = item_host::save_item(payload)
         .map_err(|code| format!("could not save the person (host error {code})"))?;
     sync_host::mirror_person(&saved)
@@ -321,14 +321,14 @@ fn field_bool(item: &Value, name: &str) -> bool {
 }
 
 /// The Item behind a person, whole, for an edit that has to preserve its fields.
-fn load_person_item(item_id: &str) -> Result<Value, String> {
+pub(crate) fn load_person_item(item_id: &str) -> Result<Value, String> {
     sync_host::load_item(item_id)
         .map_err(|e| format!("could not read the person: {e}"))?
         .ok_or_else(|| format!("no person item with the id {item_id}"))
 }
 
 /// The person Item payload for an edit, with every field carried forward.
-fn person_payload(
+pub(crate) fn person_payload(
     item_id: &str,
     existing: &Value,
     name: Option<&str>,

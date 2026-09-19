@@ -250,6 +250,38 @@ An event row's menu acts on the **device** the event is about, because an event
 has nothing of its own to configure. It reaches that device by the `device_id` on
 the row, since a gather reads one record type and the MAC is not on it.
 
+#### The pages behind it
+
+| Route | Methods | What it does |
+|---|---|---|
+| `/netgrasp/device/rename` | GET, POST | the device's display name |
+| `/netgrasp/device/owner` | GET, POST | a select of people, plus "nobody" |
+| `/netgrasp/device/hidden` | GET, POST | hide or unhide, whichever it is not |
+| `/netgrasp/device/notify` | GET, POST | mute or unmute its arrival alerts |
+| `/netgrasp/person/rename` | GET, POST | the person's name |
+| `/netgrasp/person/notify` | GET, POST | their two notification flags |
+
+Every one is registered by `tap_menu` as an invisible `api` entry gated on
+`administer netgrasp` and served by `tap_api`. The `GET` renders one field with
+the kernel's `_token` in a hidden input; the `POST` writes and comes back. A
+device is named by its MAC **or** by its `ng_devices` row id, which is how an
+event row reaches the same forms.
+
+**The writes go through the assistant's own code**, not beside it —
+`apply_device_edit` and `apply_person_save`, the same functions the assistant's
+tools call. A device renamed from a menu and a device renamed in a conversation
+mint the Item the same way, write the same single column, and leave `sync_state`
+alone the same way, because they are one function called twice. The edit is
+sparse: renaming a device names `display_name` and nothing else, which is what
+stops a rename from turning the device's alerts off.
+
+Two things these pages cannot do, both recorded in `FRICTION.md`. They cannot
+redirect — `ApiResponse` has no headers, so there is no `Location` to send, and a
+confirmation with a `<meta refresh>` is the closest no-JavaScript equivalent. And
+the permission is checked twice by two checks that disagree: the kernel's gate
+honours `administer site`, the plugin's host call does not, so a site that wants
+somebody using this grants `administer netgrasp` for real.
+
 ### Auto-reload
 
 The device, event and presence pages reload themselves. **Ten seconds** by
@@ -280,12 +312,14 @@ scripting off.
 
 ## Verifying a change
 
-- `cargo test --workspace` — 170 tests, including drift checks that tie the
+- `cargo test --workspace` — 289 tests, including drift checks that tie the
   templates, the manifest, the migrations and the demo compose file to each
   other. Several exist because
   a Tera render that reaches for an undefined variable does not warn: it aborts,
   and the route falls back to dumping every column of the base table. Those tests
-  are what notice.
+  are what notice — and one of them now *renders* all three listing templates
+  with the rows they really get, nulls included, rather than searching them for
+  strings. A string search cannot tell a working template from one that raises.
 - `scripts/check-host-imports.sh` — the manifest's declared capabilities against
   the compiled module's actual imports, in both directions.
 - `docker compose -f docker-compose.demo.yml up --build` then load the pages.
