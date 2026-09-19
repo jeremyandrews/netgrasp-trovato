@@ -41,6 +41,32 @@ render nothing, so the failure and the intended behaviour look identical.
 `G-ASSISTANT-LAUNCHER-NEVER-RENDERS-ON-A-GATHER`, `G-ASSISTANT-NO-SEED`,
 `G-NO-ROW-ACTIONS-PARTIAL`, `G-THEME-NO-DARK-TOKENS`.
 
+**The six forms the menu opens.** `plugins/netgrasp/src/forms.rs`,
+`plugins/netgrasp/netgrasp.info.toml`.
+
+`tap_api` serves `/netgrasp/device/{rename,owner,hidden,notify}` and
+`/netgrasp/person/{rename,notify}`, each as a `GET` that renders one field with
+the kernel's `_token` in it and a `POST` that writes. Every route is invisible in
+navigation, gated on `administer netgrasp`, and checked again inside the plugin
+at the moment of the change — the same two checks the assistant's tools make, and
+they still disagree about `administer site` for the reason
+`G-USER-API-NO-ADMIN-BYPASS` gives.
+
+A device is named by its MAC **or** by its `ng_devices` row id, parsed by the
+function the assistant's tools parse theirs with, which is what lets an event row
+— whose only handle on a device is `device_id` — reach the same forms a device
+row does.
+
+**The writes are the assistant's own, not a second copy of them.**
+`apply_device_edit` and `apply_person_save` are what the tools call, so a device
+renamed from a menu and one renamed in a conversation mint the Item identically,
+coerce the MAC identically, write the same columns and leave `sync_state` alone
+identically. The edit stays **sparse**: a rename names `display_name` and nothing
+else, which is the discipline that exists because a rename once turned a device's
+alerts off. A form posting a whole overlay would have brought that back, and the
+host-in-the-loop tests assert the columns nobody named are untouched rather than
+only that the named one is right.
+
 **The auto-reload defers instead of firing while the page is in use.** A menu
 standing open or a focused field re-arms the timer rather than reloading.
 Reloading ten seconds after somebody opens a menu closes it before it can be

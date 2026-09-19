@@ -594,3 +594,100 @@
         color: #94a3b8;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * The forms the row menu opens
+ * ------------------------------------------------------------------------ */
+
+/*
+ * These pages are served by the plugin, not by a gather, so they arrive inside
+ * the site's page template with `.ng-page--form` around them and this
+ * stylesheet linked from the body — a plugin's response carries a body and a
+ * title and cannot reach <head>, which is the same reason the gather chrome
+ * links it the same way.
+ */
+.ng-page--form {
+    max-width: 34rem;
+}
+
+.ng-form {
+    padding: 1.25rem;
+    border: 1px solid var(--ng-border);
+    border-radius: 0.5rem;
+    background: var(--ng-surface);
+}
+
+/* What is being changed, said before the field that changes it. The assistant's
+   proposal cards name a device the same way — its label and its MAC — and a
+   form that acts on one device should identify it as precisely as a sentence
+   somebody is asked to approve. */
+.ng-form__subject {
+    margin: 0 0 1rem 0;
+    font-weight: 600;
+}
+
+.ng-form label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.85rem;
+    color: var(--gray-700);
+}
+
+.ng-form input[type="text"],
+.ng-form select {
+    width: 100%;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--gray-300);
+    border-radius: 0.375rem;
+    background: var(--ng-surface);
+    color: var(--ng-text);
+    font: inherit;
+}
+
+.ng-form input[type="text"]:focus-visible,
+.ng-form select:focus-visible,
+.ng-form button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.ng-form label input[type="checkbox"] {
+    margin-inline-end: 0.4rem;
+}
+
+.ng-form button {
+    padding: 0.45rem 1rem;
+    border: 1px solid transparent;
+    border-radius: 0.375rem;
+    background: var(--primary);
+    color: white;
+    font: inherit;
+    cursor: pointer;
+}
+
+.ng-form button:hover {
+    background: var(--primary-dark);
+}
+
+.ng-form__done,
+.ng-form__problem {
+    padding: 0.85rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--ng-border);
+    background: var(--ng-surface);
+}
+
+.ng-form__problem {
+    border-color: var(--danger);
+}
+
+@media (prefers-color-scheme: dark) {
+    .ng-page--form .ng-form label {
+        color: #cbd5e1;
+    }
+
+    .ng-page--form .ng-form input[type="text"],
+    .ng-page--form .ng-form select {
+        border-color: #475569;
+    }
+}

@@ -159,6 +159,37 @@ jobs:
           grep -q "the_write_back_leaves_every_daemon_owned_column_untouched ... ok" test.log \
             || { echo "::error::the column-discipline test did not pass"; exit 1; }
 
+      # The row menu's forms are the plugin's only write path that a person
+      # reaches without the assistant, and the three things that matter about
+      # them are the three that are easy to lose: both tiers change, a caller
+      # without the permission changes nothing, and a POST with no token never
+      # arrives. Each is named rather than counted, because a suite that still
+      # runs while one of these quietly stops asserting is the case a count
+      # cannot see.
+      - name: The form suite proved both tiers, the permission and the token
+        run: |
+          for t in \
+            a_posted_rename_changes_the_item_and_the_daemon_row_and_mints_what_is_missing \
+            a_posted_owner_assignment_changes_the_owner_and_nothing_else \
+            a_posted_flag_change_moves_one_column_and_leaves_the_other \
+            a_form_post_from_a_caller_without_the_permission_changes_nothing \
+            a_post_with_no_token_never_reaches_the_plugin \
+            the_form_a_get_renders_carries_the_token_and_no_script \
+            a_back_parameter_pointing_off_the_site_is_not_reflected
+          do
+            grep -q "$t ... ok" test.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+      # The listing templates are rendered rather than grepped by this one, and
+      # it is the only thing anywhere that would notice a Tera error before a
+      # reader did — a template that raises falls back to the kernel's dump of
+      # every column, so the page still renders and nothing looks wrong.
+      - name: The templates were rendered, not just searched
+        run: |
+          grep -q "every_listing_template_renders_with_the_rows_it_will_really_get ... ok" test.log \
+            || { echo "::error::the template render test did not pass"; exit 1; }
+
   # Every migration is applied to a real Postgres, in order, exactly as the kernel
   # applies them. A migration that only ever runs on a developer's machine is a
   # migration that breaks on somebody else's install.

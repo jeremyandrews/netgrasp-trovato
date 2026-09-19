@@ -3009,3 +3009,429 @@ fn the_device_context_says_when_that_device_was_first_seen() {
         );
     });
 }
+
+// ===========================================================================
+// The row menu's forms, through the real module
+// ===========================================================================
+//
+// `tap_api` is the plugin's half of a plugin-served request. The kernel's half
+// — matching the path, checking the menu entry's permission, and verifying the
+// `_token` on a state-changing method — happens in `routes/plugin_api.rs`
+// BEFORE the tap is dispatched, so the two halves are tested separately here:
+// the tap through the real module against a real Postgres, and the token gate
+// against the kernel's own function with a real session.
+//
+// What matters about these tests is the *pair* of assertions each write makes.
+// A device is two tiers, and a form that updated the Item and not the row would
+// leave the daemon acting on stale values with a UI that says otherwise. Every
+// write below is checked on both sides.
+
+const FORM_RENAME: &str = "/netgrasp/device/rename";
+const FORM_OWNER: &str = "/netgrasp/device/owner";
+const FORM_HIDDEN: &str = "/netgrasp/device/hidden";
+const FORM_NOTIFY: &str = "/netgrasp/device/notify";
+
+/// Dispatch one `tap_api` request and return the `ApiResponse` as JSON.
+///
+/// `csrf_token` is whatever the kernel would have minted; the tap never checks
+/// it, because by the time a tap runs the kernel has already accepted it. That
+/// is the contract, and `a_post_with_no_token_never_reaches_the_plugin` below is
+/// what holds the other side of it.
+async fn call_form(
+    pool: &PgPool,
+    user: &UserContext,
+    callback: &str,
+    method: &str,
+    path: &str,
+    query: serde_json::Value,
+    body: &str,
+) -> serde_json::Value {
+    dispatch_as(
+        pool,
+        user,
+        "tap_api",
+        &serde_json::json!({
+            "callback": callback,
+            "method": method,
+            "path": path,
+            "params": {},
+            "query": query,
+            "body": body,
+            "user_id": user.id.to_string(),
+            "authenticated": true,
+            "csrf_token": "minted-by-the-kernel",
+        }),
+    )
+    .await
+}
+
+/// A device row's two flags, read straight from the daemon's table.
+async fn device_flags(pool: &PgPool, device: i64) -> (bool, bool) {
+    let row = sqlx::query("SELECT hidden, notify FROM ng_devices WHERE id = $1")
+        .bind(device)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (
+        row.try_get("hidden").unwrap(),
+        row.try_get("notify").unwrap(),
+    )
+}
+
+/// An Item's title and one of its fields.
+async fn item_title_and_field(
+    pool: &PgPool,
+    item_id: Uuid,
+    field: &str,
+) -> (String, serde_json::Value) {
+    let row = sqlx::query("SELECT title, fields FROM item WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let title: String = row.try_get("title").unwrap();
+    let fields: serde_json::Value = row.try_get("fields").unwrap();
+    let value = fields
+        .get(field)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    (title, value)
+}
+
+/// **A POST changes both tiers, and mints the Item the row never had.**
+///
+/// The device is seeded the way the demo seed and a long-running daemon both
+/// leave one: `clean`, so the cron sync has never looked at it, and therefore
+/// with no `trovato_item_id` at all. A write that addressed the row by its Item
+/// link would update zero rows and report success, which is the first thing this
+/// feature got wrong when the assistant grew it.
+#[test]
+fn a_posted_rename_changes_the_item_and_the_daemon_row_and_mints_what_is_missing() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:21", None, "online").await;
+
+        let (_, before, _, _) = device_state(&pool, device).await;
+        assert!(before.is_none(), "the fixture must start with no item");
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_rename_save",
+            "POST",
+            FORM_RENAME,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A00%3A21&back=%2Fdevices&value=Office+printer",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        // Tier one: the daemon's row.
+        let (_, item_id, display_name, sync_state) = device_state(&pool, device).await;
+        assert_eq!(display_name.as_deref(), Some("Office printer"));
+        assert_eq!(
+            sync_state, "clean",
+            "a form write must not raise sync_state, or the loop has an edge"
+        );
+
+        // Tier two: the Item, which did not exist when the request arrived.
+        let item_id = item_id.expect("the form minted the device's item");
+        let (title, mac) = item_title_and_field(&pool, item_id, "field_mac").await;
+        assert_eq!(title, "Office printer");
+        assert_eq!(
+            mac.as_str().or_else(|| mac.get("value")?.as_str()),
+            Some("02:00:5e:00:00:21"),
+            "the minted item carries the device's MAC"
+        );
+    });
+}
+
+/// The owner form writes the owner and leaves the flags alone.
+///
+/// The sparse-edit discipline, from the form side. A rename that turned a
+/// device's alerts off is what `DeviceEdit` was made sparse for, and a form
+/// posting a whole overlay would bring it back — so this asserts the two
+/// columns nobody named are untouched, not merely that the one named is right.
+#[test]
+fn a_posted_owner_assignment_changes_the_owner_and_nothing_else() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let person = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:22", None, "online").await;
+
+        // `notify` defaults to TRUE in the daemon's schema, which is exactly the
+        // value the old whole-overlay write used to clobber with a fabricated
+        // false.
+        let (hidden_before, notify_before) = device_flags(&pool, device).await;
+        assert!(notify_before, "the schema default is TRUE");
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_owner_save",
+            "POST",
+            FORM_OWNER,
+            serde_json::json!({}),
+            &format!("target=02%3A00%3A5e%3A00%3A00%3A22&back=%2Fdevices&value={person}"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        let (owner, item_id, _, _) = device_state(&pool, device).await;
+        assert_eq!(owner, Some(person), "the row names the new owner");
+
+        let (hidden_after, notify_after) = device_flags(&pool, device).await;
+        assert_eq!(
+            (hidden_before, notify_before),
+            (hidden_after, notify_after),
+            "assigning an owner changed a flag nobody named"
+        );
+
+        let item_id = item_id.expect("the form minted the device's item");
+        let (_, owner_field) = item_title_and_field(&pool, item_id, "field_owner").await;
+        let stored = owner_field
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| Some(owner_field.get("value")?.as_str()?.to_string()));
+        assert_eq!(
+            stored,
+            Some(person.to_string()),
+            "the item and the row disagree about the owner"
+        );
+    });
+}
+
+/// One flag moves and the other does not, on both tiers.
+#[test]
+fn a_posted_flag_change_moves_one_column_and_leaves_the_other() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:23", None, "online").await;
+
+        let (hidden_before, notify_before) = device_flags(&pool, device).await;
+        assert!(!hidden_before);
+        assert!(notify_before);
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_hidden_save",
+            "POST",
+            FORM_HIDDEN,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A00%3A23&back=%2Fdevices&value=1",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        let (hidden_after, notify_after) = device_flags(&pool, device).await;
+        assert!(hidden_after, "the device was not hidden");
+        assert_eq!(notify_after, notify_before, "hiding changed the alerts");
+
+        // And back the other way, through the other form, which must move the
+        // other column and leave the first one hidden.
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_notify_save",
+            "POST",
+            FORM_NOTIFY,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A00%3A23&back=%2Fdevices&value=0",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        let (hidden_end, notify_end) = device_flags(&pool, device).await;
+        assert!(hidden_end, "muting unhid the device");
+        assert!(!notify_end, "the device was not muted");
+    });
+}
+
+/// **A caller without the permission changes nothing.**
+///
+/// The kernel gates the route on the menu entry's `permission` and would not
+/// dispatch this at all; what is asserted here is the plugin's own check, which
+/// is the one that still bites when the conversation or the request outlives the
+/// grant. It is checked literally, with no `administer site` bypass
+/// (`G-USER-API-NO-ADMIN-BYPASS`), which is why `ng_nobody` is refused and why
+/// `ng_admin` has to carry the exact string.
+#[test]
+fn a_form_post_from_a_caller_without_the_permission_changes_nothing() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let nobody = ng_nobody(&pool).await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:00:24", None, "online").await;
+        let before = daemon_snapshot(&pool, device).await;
+
+        let response = call_form(
+            &pool,
+            &nobody,
+            "device_rename_save",
+            "POST",
+            FORM_RENAME,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A00%3A24&back=%2Fdevices&value=Should+not+happen",
+        )
+        .await;
+
+        assert_eq!(response["status"], 403, "{response}");
+        assert_eq!(
+            before,
+            daemon_snapshot(&pool, device).await,
+            "a refused caller changed the device row"
+        );
+        let (_, item_id, display_name, _) = device_state(&pool, device).await;
+        assert!(item_id.is_none(), "a refused caller minted an item");
+        assert!(
+            display_name.is_none(),
+            "a refused caller renamed the device"
+        );
+    });
+}
+
+/// The GET renders the field, carries the kernel's token, and contains no
+/// script — which is the whole claim the feature makes.
+#[test]
+fn the_form_a_get_renders_carries_the_token_and_no_script() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        seed_clean_device(&pool, "02:00:5e:00:00:25", None, "online").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_rename_form",
+            "GET",
+            FORM_RENAME,
+            serde_json::json!({"target": "02:00:5e:00:00:25", "back": "/devices/online"}),
+            "",
+        )
+        .await;
+
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(
+            response["theme"], true,
+            "a page a person reads must be themed"
+        );
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains(r#"name="_token" value="minted-by-the-kernel""#),
+            "{body}"
+        );
+        assert!(body.contains(r#"name="value""#), "{body}");
+        assert!(body.contains(r#"method="post""#), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+        assert!(!body.contains("onsubmit"), "{body}");
+        assert!(!body.contains("onclick"), "{body}");
+        // The listing it came from is carried through, so the way back is the
+        // page the person was actually on.
+        assert!(
+            body.contains(r#"name="back" value="/devices/online""#),
+            "{body}"
+        );
+    });
+}
+
+/// A `back` that points off the site is dropped rather than reflected.
+///
+/// It arrives in a URL somebody may have been handed and it lands in an `href`
+/// and in a `<meta refresh>`, so it is an open redirect if it is trusted. The
+/// unit test in `forms.rs` covers the classification; this one proves the
+/// hostile value never reaches the rendered page.
+#[test]
+fn a_back_parameter_pointing_off_the_site_is_not_reflected() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        seed_clean_device(&pool, "02:00:5e:00:00:26", None, "online").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_rename_form",
+            "GET",
+            FORM_RENAME,
+            serde_json::json!({
+                "target": "02:00:5e:00:00:26",
+                "back": "https://evil.example/steal",
+            }),
+            "",
+        )
+        .await;
+
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(!body.contains("evil.example"), "{body}");
+        assert!(body.contains(r#"name="back" value="/devices""#), "{body}");
+    });
+}
+
+/// **A POST with no token never reaches the plugin.**
+///
+/// This is the kernel's half of the contract and cannot be asserted through the
+/// tap, because the tap is what does not run: `routes/plugin_api.rs` verifies
+/// the token for any state-changing method before dispatching, and answers 403
+/// on its own. So the check itself is called here, with a real session and the
+/// real function the route calls, over the three bodies that matter.
+///
+/// The plugin's side of it is that its write routes really are POSTs — a form
+/// registered as a GET would skip this gate entirely — which the route
+/// declarations in `forms.rs` assert.
+#[test]
+fn a_post_with_no_token_never_reaches_the_plugin() {
+    serial(async {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        use tower_sessions::{MemoryStore, Session};
+
+        let session = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let token = trovato_kernel::form::csrf::generate_csrf_token(&session).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+
+        let check = |body: String| {
+            let session = session.clone();
+            let headers = headers.clone();
+            async move {
+                trovato_kernel::routes::helpers::require_csrf_header_or_field(
+                    &session, &headers, &body,
+                )
+                .await
+                .is_ok()
+            }
+        };
+
+        assert!(
+            !check("target=02%3A00%3A5e%3A00%3A00%3A27&value=Renamed".to_string()).await,
+            "a body with no _token was accepted"
+        );
+        assert!(
+            !check("_token=not-a-real-token&value=Renamed".to_string()).await,
+            "a forged _token was accepted"
+        );
+        // The valid one, last, because verification consumes it — which is also
+        // why a form re-rendered after a failure needs the fresh token the
+        // kernel minted for that request rather than the one that arrived.
+        assert!(
+            check(format!("_token={token}&value=Renamed")).await,
+            "the token the kernel minted was refused"
+        );
+        assert!(
+            !check(format!("_token={token}&value=Renamed")).await,
+            "a spent token was accepted a second time"
+        );
+    });
+}
