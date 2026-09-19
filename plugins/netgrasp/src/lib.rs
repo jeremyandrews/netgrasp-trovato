@@ -36,6 +36,7 @@ use trovato_sdk::prelude::*;
 mod assist_host;
 mod db;
 mod device_view;
+mod forms;
 mod item_host;
 mod sync_host;
 
@@ -153,15 +154,20 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// The order below is the order a person reads them in: what is here now, then
 /// everything, then who, then what happened.
 ///
-/// Navigation is all these are. `callback` is left empty on every one: the
-/// kernel routes an entry only when `handler_type` is `"api"` and a callback is
-/// set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
+/// Navigation is all the six below are. `callback` is left empty on every one:
+/// the kernel routes an entry only when `handler_type` is `"api"` and a callback
+/// is set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
 /// work because `002_netgrasp_gathers.sql` aliases each one onto a
 /// `/gather/<query_id>` route — the menu makes them findable, the URL aliases
 /// make them exist.
+///
+/// The row menu's forms follow them, and are the other kind of entry: invisible,
+/// each naming a callback, each routed to [`tap_api`]. `tap_menu` is where a
+/// plugin declares a served path at all, which is why two unrelated things come
+/// out of one tap.
 #[plugin_tap]
 pub fn tap_menu() -> Vec<MenuRoute> {
-    vec![
+    let mut menu = vec![
         MenuRoute::page("/devices/online", "Online now")
             .permission(PERM_VIEW_DEVICES)
             .weight(0),
@@ -180,7 +186,26 @@ pub fn tap_menu() -> Vec<MenuRoute> {
         MenuRoute::page("/events/security", "Security events")
             .permission(PERM_VIEW_DEVICES)
             .weight(5),
-    ]
+    ];
+    // The row menu's forms. Invisible, gated on `administer netgrasp`, and each
+    // one naming a callback — which is the only combination the kernel routes
+    // (`routes/plugin_api.rs`). They ride in the same tap because `tap_menu` is
+    // where the kernel learns about a plugin-served path at all; nothing about
+    // them is navigation.
+    menu.extend(forms::routes());
+    menu
+}
+
+/// Serve one of the row menu's forms.
+///
+/// The kernel dispatches here for any menu entry whose `handler_type` is `api`
+/// and whose `callback` is set, having already checked that entry's permission
+/// and, for a state-changing method, the `_token`. What is left for the plugin
+/// is the permission check the host does literally, the form, and the write —
+/// see `forms.rs` for why the write cannot start in the row itself.
+#[plugin_tap]
+pub fn tap_api(request: ApiRequest) -> ApiResponse {
+    forms::serve(&request)
 }
 
 // ===========================================================================
@@ -674,13 +699,57 @@ mod tests {
     /// exist; the skeleton set two.
     #[test]
     fn no_menu_entry_claims_a_callback_the_kernel_would_drop() {
-        for m in __inner_tap_menu() {
+        for m in navigation() {
             assert!(
                 m.callback.is_empty(),
-                "menu {} sets a callback, which the kernel drops",
+                "navigation entry {} sets a callback, which the kernel drops",
                 m.path
             );
         }
+    }
+
+    /// The other half of the same rule, from the other side. A callback is
+    /// dispatched only when `handler_type` is `"api"`, so an api entry with no
+    /// callback is a path that 404s, and a page entry WITH one is a handler the
+    /// kernel logs as unreachable at startup and never calls
+    /// (`routes/plugin_api.rs`, `unreachable_callbacks`). Two shipped plugins
+    /// were dead that way.
+    #[test]
+    fn every_served_route_names_a_handler_the_kernel_will_dispatch() {
+        let served = routes_only();
+        assert!(
+            !served.is_empty(),
+            "the row menu's forms are not registered"
+        );
+        for m in served {
+            assert!(
+                !m.callback.is_empty(),
+                "api route {} names no callback and will 404",
+                m.path
+            );
+            assert!(
+                !m.permission.is_empty(),
+                "api route {} is public, and every one of them writes or discloses",
+                m.path
+            );
+        }
+    }
+
+    /// The navigation entries, which are what the six assertions about ordering
+    /// and aliases are about.
+    fn navigation() -> Vec<MenuRoute> {
+        __inner_tap_menu()
+            .into_iter()
+            .filter(|m| m.handler_type == "page")
+            .collect()
+    }
+
+    /// The plugin-served routes, which are not navigation and are not aliased.
+    fn routes_only() -> Vec<MenuRoute> {
+        __inner_tap_menu()
+            .into_iter()
+            .filter(|m| m.handler_type == "api")
+            .collect()
     }
 
     /// The kernel sorts the navigation by weight out of a `HashMap`, so equal
@@ -690,7 +759,7 @@ mod tests {
     /// vec without reordering the weights is caught too.
     #[test]
     fn the_navigation_has_one_stable_order() {
-        let mut menus = __inner_tap_menu();
+        let mut menus = navigation();
         menus.sort_by_key(|m| m.weight);
         let ordered: Vec<&str> = menus.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(
@@ -705,19 +774,27 @@ mod tests {
             ]
         );
 
-        let mut weights: Vec<i32> = __inner_tap_menu().iter().map(|m| m.weight).collect();
+        let mut weights: Vec<i32> = navigation().iter().map(|m| m.weight).collect();
         weights.sort_unstable();
         weights.dedup();
         assert_eq!(weights.len(), 6, "two menu entries share a weight");
     }
 
-    /// Every entry must be visible, or it is filtered out of the navigation by
-    /// `root_menus()` before any permission is considered.
+    /// A navigation entry must be visible, or it is filtered out by
+    /// `root_menus()` before any permission is considered. A served route must
+    /// NOT be: the forms are reached from a row menu, and an invisible entry is
+    /// how a plugin says "route this, do not list it".
     #[test]
-    fn every_menu_entry_is_visible_navigation_rather_than_a_route() {
-        for m in __inner_tap_menu() {
+    fn navigation_is_visible_and_served_routes_are_not() {
+        for m in navigation() {
             assert!(m.visible, "menu {} is not visible", m.path);
-            assert_eq!(m.handler_type, "page", "menu {} is not a page", m.path);
+        }
+        for m in routes_only() {
+            assert!(
+                !m.visible,
+                "route {} would appear in the site navigation",
+                m.path
+            );
         }
     }
 
@@ -726,7 +803,7 @@ mod tests {
     #[test]
     fn every_menu_path_is_an_alias_the_migration_seeds() {
         let migration = include_str!("../migrations/002_netgrasp_gathers.sql");
-        for m in __inner_tap_menu() {
+        for m in navigation() {
             assert!(
                 migration.contains(&format!("'{}'", m.path)),
                 "menu path {} has no url_alias in 002_netgrasp_gathers.sql",
@@ -791,6 +868,47 @@ mod tests {
             assert!(
                 template.contains("ng_row_ref"),
                 "{what} includes the menu without telling it what the row is"
+            );
+        }
+    }
+
+    /// The menu's links and the plugin's routes are two lists that have to be
+    /// the same list.
+    ///
+    /// They are written in different languages in different files — hrefs in a
+    /// Tera partial, `MenuRoute`s in Rust — and nothing connects them at
+    /// compile time. A path renamed on one side gives a menu entry that 404s,
+    /// which looks exactly like a permission problem and is the first thing
+    /// anybody would go and check.
+    #[test]
+    fn every_menu_entry_links_to_a_route_the_plugin_serves() {
+        let partial = include_str!("../../../templates/gather/netgrasp/row-actions.html");
+        let served: Vec<String> = __inner_tap_menu()
+            .into_iter()
+            .filter(|m| m.handler_type == "api")
+            .map(|m| m.path)
+            .collect();
+
+        for path in &served {
+            assert!(
+                partial.contains(&format!("href=\"{path}?")),
+                "{path} is served and nothing in the menu links to it"
+            );
+        }
+
+        // And the other direction: every netgrasp path the menu links to is one
+        // of them. An entry pointing at a path nobody registered is the 404.
+        for line in partial.lines() {
+            let Some(rest) = line.split_once("href=\"/netgrasp") else {
+                continue;
+            };
+            let linked = format!(
+                "/netgrasp{}",
+                rest.1.split(['?', '"']).next().unwrap_or_default()
+            );
+            assert!(
+                served.contains(&linked),
+                "the menu links to {linked}, which the plugin does not serve"
             );
         }
     }
