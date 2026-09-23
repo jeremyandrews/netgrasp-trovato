@@ -6,7 +6,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.102.0"
+# The plugin's own version, semantic from 1.0.0 on. It says nothing about the
+# kernel: which Trovato this builds against is [workspace.metadata.trovato]
+# below, and CHANGELOG.md records the pin for every release.
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 authors = ["Jeremiah Andrews"]
@@ -28,14 +31,15 @@ repository = "https://github.com/jeremyandrews/netgrasp-trovato"
 #   KERNEL_API_VERSION  (0, 102)
 #
 # `api_version` in plugins/netgrasp/netgrasp.info.toml must equal the kernel's
-# KERNEL_API_VERSION or the kernel refuses to load the module. A test in the
-# plugin derives the expected `api_version` from this workspace's own version, so
-# the workspace bump above is what carries the manifest with it; when this rev
-# moves and the version does not, that assertion is what tells you.
+# KERNEL_API_VERSION or the kernel refuses to load the module. The Trovato
+# version is also recorded, machine readably, in [workspace.metadata.trovato] at
+# the end of this file, and a test in the plugin derives the expected
+# `api_version` from it; when this rev moves and that version does not, that
+# assertion is what tells you.
 #
 # BUMP PROTOCOL: move this rev only to a commit that is (a) pushed to
 # jeremyandrews/trovato main, and (b) a deliberate checkpoint. Record the new
-# triple above, rerun `cargo build --target wasm32-wasip1 --release`, and
+# triple above and in [workspace.metadata.trovato], rerun `cargo build --target wasm32-wasip1 --release`, and
 # reinstall the plugin against a kernel built from the same rev.
 #
 # `trovato-sdk` pulls `trovato-sdk-macros` through a repo-relative path
@@ -105,3 +109,11 @@ expect_used = "deny"
 manual_let_else = "warn"
 uninlined_format_args = "warn"
 semicolon_if_nothing_returned = "warn"
+
+# The Trovato this repository is built against, as data rather than prose, so a
+# test can read it. Before 1.0.0 the workspace version WAS the Trovato version;
+# the plugin now has a version of its own, and this is where the kernel's lives.
+# It moves with the `rev` above, by the bump protocol there.
+[workspace.metadata.trovato]
+version = "0.102.0"
+rev = "ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74"
