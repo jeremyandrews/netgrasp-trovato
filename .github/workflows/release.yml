@@ -1,0 +1,118 @@
+# Release: a `v*` tag becomes a GitHub Release carrying the assembled overlay.
+#
+# The overlay is everything a Trovato deployment appends to its three search
+# paths, in one tarball, so installing a release needs no Rust:
+#
+#   netgrasp-trovato-<version>/
+#     plugins/netgrasp/    netgrasp.wasm, netgrasp.info.toml, migrations/  → PLUGINS_DIR
+#     templates/                                                           → TEMPLATES_DIR
+#     static/                                                              → STATIC_DIR
+#     README.md  CHANGELOG.md  LICENSE
+#
+# The module is built exactly as CI's `standalone` job builds it, from the
+# pinned toolchain with no Trovato checkout, and the plugin directory is
+# assembled by scripts/build-overlay.sh, which is also where the manifest's
+# capabilities are checked against the module's real imports. Nothing here
+# reimplements either.
+#
+# The tag is `v1.2.3` and the tarball is `netgrasp-trovato-1.2.3.tar.gz`. A tag
+# that disagrees with the workspace version or with the manifest's `version`, or
+# that has no section in CHANGELOG.md, is refused before anything is built. The
+# notes are that changelog section, verbatim.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same pin as ci.yml and rust-toolchain.toml; the three move together.
+  RUST_TOOLCHAIN: 1.96.0
+
+jobs:
+  release:
+    name: overlay tarball and GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag matches the workspace, the manifest and the changelog
+        id: v
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          workspace="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          manifest="$(grep -m1 '^version' plugins/netgrasp/netgrasp.info.toml | cut -d'"' -f2)"
+          echo "tag $tag, workspace $workspace, manifest $manifest"
+          if [ "$tag" != "$workspace" ] || [ "$tag" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, workspace $workspace and manifest $manifest must agree"
+            exit 1
+          fi
+          scripts/release-notes.sh "$tag" > /dev/null
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1
+
+      - name: Build the module
+        run: cargo build --target wasm32-wasip1 --release
+
+      # The same floor as CI: a cdylib that compiled but exports nothing is a
+      # plugin the kernel loads and never calls.
+      - name: The module is real
+        run: |
+          size=$(wc -c < target/wasm32-wasip1/release/netgrasp.wasm)
+          echo "$size bytes"
+          test "$size" -gt 100000
+
+      - name: Assemble the overlay
+        run: scripts/build-overlay.sh --no-build
+
+      - name: Package
+        run: |
+          name="netgrasp-trovato-${{ steps.v.outputs.version }}"
+          mkdir -p "dist/$name"
+          cp -R overlay/plugins "dist/$name/plugins"
+          cp -R templates static "dist/$name/"
+          cp README.md CHANGELOG.md LICENSE "dist/$name/"
+          # The manifest inside the tarball is the one the tag names.
+          grep -q "^version = \"${{ steps.v.outputs.version }}\"" \
+            "dist/$name/plugins/netgrasp/netgrasp.info.toml"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+          tar -tzf "dist/$name.tar.gz" | sort
+
+      - name: Notes from CHANGELOG.md
+        run: |
+          version="${{ steps.v.outputs.version }}"
+          {
+            scripts/release-notes.sh "$version"
+            echo
+            echo "## Install"
+            echo
+            echo "Download \`netgrasp-trovato-$version.tar.gz\`, check it against its"
+            echo "\`.sha256\`, unpack it, and append its \`plugins\`, \`templates\` and"
+            echo "\`static\` directories to Trovato's \`PLUGINS_DIR\`, \`TEMPLATES_DIR\`"
+            echo "and \`STATIC_DIR\`. The README's Installing section has the rest."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="netgrasp-trovato-${{ steps.v.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Netgrasp for Trovato ${{ steps.v.outputs.version }}" \
+            --notes-file notes.md \
+            "dist/$name.tar.gz" "dist/$name.tar.gz.sha256"

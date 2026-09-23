@@ -1181,24 +1181,62 @@ mod tests {
     /// to, or the module is refused at load with a version mismatch and no page
     /// exists to debug.
     ///
-    /// Checked against this crate's own version rather than against a constant
-    /// imported from the kernel, because the SDK does not export one: Trovato's
-    /// version and its `KERNEL_API_VERSION` move in lock-step by its own
-    /// versioning protocol, and the workspace here carries the same number as
-    /// the revision it pins. So bumping the pinned `rev` without bumping the
-    /// workspace version, or bumping the workspace version without editing the
-    /// manifest, both fail here.
+    /// Checked against the Trovato version the workspace records in
+    /// `[workspace.metadata.trovato]` rather than against a constant imported
+    /// from the kernel, because the SDK does not export one: Trovato's version
+    /// and its `KERNEL_API_VERSION` move in lock-step by its own versioning
+    /// protocol. The recorded `rev` must also be the one the dependencies pin.
+    /// So bumping the pinned `rev` without the recorded version, or the
+    /// recorded version without the manifest, fails here.
+    ///
+    /// Before 1.0.0 this read `CARGO_PKG_VERSION`, because the workspace
+    /// version was the kernel's. The plugin now has a version of its own, and
+    /// the manifest's `version` must equal it.
     #[test]
     fn the_manifest_declares_the_pinned_kernels_api_version() {
         let manifest = include_str!("../netgrasp.info.toml");
-        let (major, rest) = env!("CARGO_PKG_VERSION")
-            .split_once('.')
-            .unwrap_or_default();
-        let minor = rest.split('.').next().unwrap_or_default();
+        let workspace = include_str!("../../../Cargo.toml");
+
+        // The table header on a line of its own: the comments above the
+        // dependencies name the table in prose too.
+        let field = |key: &str| {
+            workspace
+                .lines()
+                .map(str::trim)
+                .skip_while(|line| *line != "[workspace.metadata.trovato]")
+                .skip(1)
+                .take_while(|line| !line.starts_with('['))
+                .find_map(|line| line.strip_prefix(key)?.trim().strip_prefix('='))
+                .map(|value| value.trim().trim_matches('"').to_string())
+                .unwrap_or_default()
+        };
+        let kernel = field("version");
+        let rev = field("rev");
+        assert!(
+            !kernel.is_empty() && !rev.is_empty(),
+            "Cargo.toml has no [workspace.metadata.trovato] version and rev"
+        );
+
+        let pin = format!("rev = \"{rev}\"");
+        assert_eq!(
+            workspace.matches(&pin).count(),
+            3,
+            "trovato-sdk, trovato-kernel and [workspace.metadata.trovato] must all name {rev}"
+        );
+
+        let mut parts = kernel.split('.');
+        let major = parts.next().unwrap_or_default();
+        let minor = parts.next().unwrap_or_default();
         let expected = format!("api_version = \"{major}.{minor}\"");
         assert!(
             manifest.contains(&expected),
-            "manifest does not declare {expected}"
+            "manifest does not declare {expected} for Trovato {kernel}"
+        );
+
+        let own = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(
+            manifest.lines().any(|line| line.trim() == own),
+            "manifest does not declare the plugin's own {own}"
         );
     }
 
@@ -1552,8 +1590,8 @@ mod tests {
     /// == kernel major and plugin minor <= kernel minor, so this repository's
     /// `0.99` manifest runs unchanged on a `0.101` kernel. That is a fact worth
     /// pinning rather than rediscovering: the sibling test above ties
-    /// `api_version` to this workspace's version, and without this one nothing
-    /// says the released kernel in the demo can still load it.
+    /// `api_version` to the Trovato version the workspace pins, and without this
+    /// one nothing says the released kernel in the demo can still load it.
     ///
     /// `latest` is rejected on purpose. A demo whose kernel changes underneath
     /// it is a demo that breaks with no commit to blame.

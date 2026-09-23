@@ -66,6 +66,12 @@ feature here ever seems to require one, that is a bug in the feature.
 
 ## Status
 
+Version 1.0.0, the first release, paired with
+[netgraspd 1.0.0](https://github.com/jeremyandrews/netgraspd/releases/tag/v1.0.0);
+see [Compatibility](#compatibility). `CHANGELOG.md` has the history and the
+versioning rule: from 1.0.0 the plugin's version is its own, and the Trovato it
+is built against is recorded beside it rather than being it.
+
 Extracted from the Trovato monorepo via `git filter-repo`, preserving the
 per-commit history of every netgrasp file.
 
@@ -117,32 +123,87 @@ nothing.
 ### Which Trovato revision this builds against
 
 The pin is a commit, not a branch. The triple that moves together, recorded in
-the workspace `Cargo.toml` next to the dependency:
+the workspace `Cargo.toml` next to the dependency and again, as data, in
+`[workspace.metadata.trovato]`:
 
 | | |
 |---|---|
-| pinned `rev` | `611c1fb72a60cb8528b93db2c6ab40aa564bee39` |
-| Trovato version | 0.99.0 |
-| `KERNEL_API_VERSION` | (0, 99) |
+| pinned `rev` | `ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74` |
+| Trovato version | 0.102.0 |
+| `KERNEL_API_VERSION` | (0, 102) |
 
 `api_version` in `plugins/netgrasp/netgrasp.info.toml` tracks that kernel API
 version, and a test asserts the pair has not drifted. The bump protocol is in the
-`Cargo.toml` comment.
+`Cargo.toml` comment. The plugin's own `version` is separate and is not the
+kernel's.
 
 ### And which Trovato release it runs on
 
 A different question, with a different answer. The kernel's compatibility rule
 (`PluginInfo::check_api_compatibility`) is **plugin major equal, plugin minor at
-or below the kernel's**, so a module declaring `0.99` loads on any `0.x` kernel
-from 0.99 up. The demo runs the published `0.101.0` image with this manifest
-unchanged, and a test pins that pair so bumping the image cannot quietly outrun
-what the manifest claims.
+or below the kernel's**, so a module declaring `0.102` loads on any `0.x` kernel
+from 0.102 up. The demo runs the published `0.102.0` image, and a test pins that
+pair so bumping the image cannot quietly outrun what the manifest claims.
 
 What a newer kernel does *not* buy the plugin is host functions that did not
 exist when it was built. Nothing here needs one, which is why the demo needs no
 `api_version` bump and no rebuild against a newer SDK.
 
+## Compatibility
+
+This plugin is the web interface for
+[netgraspd](https://github.com/jeremyandrews/netgraspd), and the two share one
+database. They are separate releases that have to agree on one thing, the `ng_`
+tables.
+
+| netgrasp-trovato | netgraspd | `ng_` schema | Trovato kernel |
+|---|---|---|---|
+| 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql` in netgraspd) | 0.102.0 or a later 0.x |
+
+**The rule.** A plugin and a daemon pair when they are built for the same `ng_`
+schema version, which is the highest migration in the daemon's `migrations/`.
+The daemon owns that schema and its migrations are the canonical DDL. This
+repository carries the tables it reads twice: `crates/netgrasp-core/tests/
+fixtures/daemon_schema.sql` reproduces the daemon's DDL and is what the plugin's
+queries are tested against, and `plugins/netgrasp/migrations/001_netgrasp_schema.sql`
+is a guarded copy so the plugin can be enabled with no daemon.
+`the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema` checks the
+second against the first column by column, and CI fails if it does not run.
+
+**A schema change is a paired release.** Any change to an `ng_` table ships as a
+new daemon release and a new plugin release together, each naming the other in
+this table, and the daemon is upgraded and migrated first: `netgraspd migrate`
+against an empty database, then this plugin. A release of either that does not
+touch the schema pairs with the other side's current release, and says so here.
+
 ## Installing onto a stock Trovato
+
+### From a release
+
+Each [release](https://github.com/jeremyandrews/netgrasp-trovato/releases)
+attaches `netgrasp-trovato-<version>.tar.gz` and its `.sha256`: the built module
+with its manifest and migrations, the templates and the static files, laid out
+as the three directories Trovato's search paths take. No Rust needed.
+
+```bash
+v=1.0.0
+base=https://github.com/jeremyandrews/netgrasp-trovato/releases/download/v$v
+curl -fLO "$base/netgrasp-trovato-$v.tar.gz"
+curl -fLO "$base/netgrasp-trovato-$v.tar.gz.sha256"
+sha256sum --check "netgrasp-trovato-$v.tar.gz.sha256"
+tar -xzf "netgrasp-trovato-$v.tar.gz"
+NG="$PWD/netgrasp-trovato-$v"
+
+export PLUGINS_DIR="$TROVATO/plugins:$NG/plugins"
+export TEMPLATES_DIR="$TROVATO/templates:$NG/templates"
+export STATIC_DIR="$TROVATO/static:$NG/static"
+```
+
+Then install and serve as in steps 3 to 5 below. With the published kernel
+image, mount the three directories and set the same variables on the container;
+`docker-compose.demo.yml` shows how.
+
+### From source
 
 Trovato reads `PLUGINS_DIR`, `TEMPLATES_DIR` and `STATIC_DIR` as
 colon-separated **search paths**, and a later entry wins on a name collision.
@@ -158,7 +219,7 @@ export TEMPLATES_DIR="$TROVATO/templates:$PWD/templates"
 export STATIC_DIR="$TROVATO/static:$PWD/static"
 export DATABASE_URL=postgres://trovato:trovato@localhost:5432/netgrasp
 
-# 3. Install. Runs the five migrations and enables the plugin.
+# 3. Install. Runs the six migrations and enables the plugin.
 $TROVATO/target/release/trovato plugin install netgrasp
 
 # 4. Serve.

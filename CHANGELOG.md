@@ -5,9 +5,46 @@ each one says what was wrong underneath rather than what was edited: a line that
 reads "fixed the rename tool" tells the next person nothing about why the next
 tool will do it too.
 
-## Unreleased
+**Versioning.** From 1.0.0 the plugin has a version of its own, semantic over
+what an operator meets: the pages and their paths, the permissions, the
+assistant scopes, and the migrations. It does not describe the kernel. Each
+release records the Trovato it is built against, which is the triple in the
+workspace `Cargo.toml` (the `trovato-sdk` revision, the Trovato version and
+`KERNEL_API_VERSION`), and the daemon release it pairs with. Before 1.0.0 the
+version was the kernel's (0.99.0, then 0.102.0) and nothing was tagged.
+
+**Pairing with the daemon.** A plugin release and a
+[netgraspd](https://github.com/jeremyandrews/netgraspd) release pair when they
+are built for the same `ng_` schema version. A change to the schema is always a
+paired release, and the daemon is upgraded and migrated first. The README's
+Compatibility section has the table.
+
+## [1.0.0] - 2026-09-23
+
+The first release. Everything from the extraction out of the Trovato monorepo
+to the row menu, listed below this entry by pull request; this entry itself is
+what landed after the first joint run with the daemon.
+
+| | |
+|---|---|
+| Pairs with | netgraspd 1.0.0, `ng_` schema version 3 |
+| Built against | Trovato 0.102.0, `trovato-sdk` revision `ca76a96`, `KERNEL_API_VERSION` (0, 102) |
+| Manifest | `version = "1.0.0"`, `api_version = "0.102"` |
+| Runs on | Trovato 0.102.0 or a later 0.x; tested on the `0.102.0` image |
+
+The daemon it pairs with has never contacted a real UniFi controller; its own
+release notes say so first. Nothing on this side depends on the controller.
 
 ### Added
+
+**Releases.** `.github/workflows/release.yml`. A `v*` tag builds the module,
+assembles the overlay with `scripts/build-overlay.sh` (which also checks the
+manifest's capabilities against the module's imports), and attaches
+`netgrasp-trovato-<version>.tar.gz` and its `.sha256` to the GitHub Release. The
+tarball is the three directories a deployment appends to Trovato's search
+paths, `plugins/`, `templates/` and `static/`, so installing needs no Rust. A tag
+that disagrees with the workspace version or the manifest, or that has no
+section in this file, is refused before anything is built.
 
 **Every listing row has an actions menu, and it works with scripting off.**
 `templates/gather/netgrasp/row-actions.html`, `static/js/netgrasp.js`,
@@ -201,6 +238,14 @@ generated columns do not have.
 
 ### Changed
 
+- **The plugin's version is its own.** The workspace and the manifest move from
+  0.102.0, which was the kernel's version, to 1.0.0. The Trovato version now
+  lives in `[workspace.metadata.trovato]` beside the revision, and
+  `the_manifest_declares_the_pinned_kernels_api_version` reads it from there
+  instead of from `CARGO_PKG_VERSION`. It also checks that the recorded revision
+  is the one both Trovato dependencies pin, and that the manifest's `version`
+  is the workspace's. The kernel stores and displays a plugin's `version` and
+  compares nothing against it, so this changes no behaviour.
 - `model::DeviceRow` carries `resolved_name`, `mdns_name` and the rest of the
   user-owned set (`notes`, `hidden`, `notify`, `owner_item_id`). The two flags
   are `Option<bool>`, so "this projection did not read it" stays distinguishable
@@ -219,3 +264,56 @@ generated columns do not have.
   user in a role, the single-use CSRF token on the chat page, the zeroed usage in
   the stream's `done` event, and the provider test that calls a 404 a success).
   Reported, not patched: nothing in this repository changes the kernel.
+
+## Before 1.0.0
+
+No release was tagged, and the version tracked the Trovato kernel the plugin was
+pinned to. Listed by pull request, oldest first.
+
+**In the Trovato monorepo, 2026-08-01 to 2026-08-15.** The design gate (a device
+is two tiers, an Item for what a person edits and a record for what the daemon
+writes; an event is a record), the daemon bridge (sync, write-back, timelines),
+and the first friction log. On 2026-08-06 the plugin was reconciled with the
+daemon's real schema, which it had been written without: it had declared UUID
+keys, epoch integers and four column names the daemon does not use, so against a
+real daemon database every timeline query failed. On 2026-08-15 it was made to
+work against a live daemon database and given usable pages.
+
+**#1, 2026-08-18: its own repository.** Extracted with `git filter-repo`,
+keeping each file's history. `trovato-sdk` became a git dependency on the public
+Trovato repository, **pinned to revision `611c1fb` (Trovato 0.99.0)**, with
+`api_version = "0.99"`; the web interface was finished with no Trovato patch.
+Version 0.99.0.
+
+**#3 and #4, 2026-08-18.** The host-in-the-loop integration test moved here from
+Trovato, driving the real module through the real kernel against Postgres, with
+`trovato-kernel` as a dev-dependency on the same revision. The
+`ng_devices_with_owner` view, so a device page names its owner instead of
+printing a uuid.
+
+**#5, 2026-08-21: the one-command demo.** `docker-compose.demo.yml` on the
+published `ghcr.io/jeremyandrews/trovato:0.101.0` image, with the overlay
+assembled in a container, so a stranger needs only Docker. A `0.99` manifest
+loads on a `0.101` kernel, and a test pins that pairing.
+
+**#6, 2026-08-24: the pin moves to Trovato 0.102.0.** `trovato-sdk` and
+`trovato-kernel` to revision `ca76a96`, the workspace and manifest to 0.102.0
+and `api_version = "0.102"`, and the demo image to `0.102.0`, together. This is
+the pin 1.0.0 ships with.
+
+**#7, 2026-08-25: configuration by conversation.** Three assistant scopes, one
+device, one person and the whole network, using the assistant taps Trovato 0.102
+added, with write tools that check the permission at the moment of the change.
+
+**#8, 2026-09-18: the first joint run.** `docs/JOINT-RUN.md`: the daemon and this
+plugin against one database on a real home network, with the assistant on a
+real model. Its findings went to the kernel, this repository and the daemon;
+this repository's are fixed in 1.0.0 above.
+
+**#9, 2026-09-18.** An assistant edit changes only what it was asked to change.
+In 1.0.0 above, under Fixed.
+
+**#10, #11 and #12, 2026-09-19: the row menu and its six forms.** #10 landed the
+menu. #11 was merged into #10's branch after that branch had been squashed onto
+`main`, so its forms never reached `main`; #12 restored them. In 1.0.0 above,
+under Added.
