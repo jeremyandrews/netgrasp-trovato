@@ -264,10 +264,13 @@ jobs:
         run: docker compose -f docker-compose.demo.yml up -d --build
 
       # The installer is the last one-shot: it runs after the seed and exits 0
-      # only once /overview answers 200. `wait` prints its exit code.
+      # only once /overview answers 200. `wait` blocks until it stops; what it
+      # prints is a sentence, not a code, so the code is read off the container.
       - name: Wait for the first run to finish
         run: |
-          code=$(docker compose -f docker-compose.demo.yml wait installer)
+          docker compose -f docker-compose.demo.yml wait installer || true
+          code=$(docker inspect -f '{{.State.ExitCode}}' \
+            "$(docker compose -f docker-compose.demo.yml ps -aq installer)")
           echo "installer exited $code"
           test "$code" = "0"
 
