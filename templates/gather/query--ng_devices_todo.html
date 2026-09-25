@@ -1,0 +1,35 @@
+{#
+    The to-do. /devices/todo
+
+    Every device with neither a name a person typed nor an owner, newest first:
+    what is left to do after a new device appears. 010_netgrasp_new_devices.sql
+    says why a device the daemon has resolved a name for is still here, and why
+    a named but unassigned one is not.
+
+    The ordinary device table, whose row menu is the whole workflow: Rename and
+    Assign owner each take one form, and the device drops off this page on the
+    next reload after either. Hide is the third way to say "dealt with".
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item ng-summary__item--idle">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">device{{ total | pluralize }} to name or assign</span>
+    </span>
+    <span class="ng-summary__scope">
+        The name shown is the daemon's guess until somebody confirms one.
+        &middot; <a href="/events/new-devices">New device events</a>
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    A device leaves this list once it has a name or an owner, or is hidden.
+    <a href="/devices">All devices</a>.
+</span>
+{% endblock %}

@@ -1,0 +1,32 @@
+{#
+    New device events. /events/new-devices
+
+    The daemon's `new_device` events, in the event table every event page uses.
+    An event row carries `device_id` and nothing else about the device, so each
+    row's menu acts on the device by that id, as it does on /events, and the
+    Device cell links to that device's own events.
+
+    What to do about a new device is /devices/todo, which is about devices as
+    they are now rather than about the moment they appeared; the summary line
+    points there.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">new device{{ total | pluralize }} recorded</span>
+    </span>
+    <span class="ng-summary__scope"><a href="/devices/todo">Devices still to name or assign</a></span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/event-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    Events are kept for the retention window, so an old network can have no
+    new-device events and still have <a href="/devices/todo">devices to name</a>.
+</span>
+{% endblock %}

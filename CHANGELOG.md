@@ -97,6 +97,27 @@ were), `the_where_column_appears_only_when_something_on_the_page_is_somewhere`,
 `with_no_enrichment_the_page_omits_location_and_says_where_it_would_come_from`,
 and the daemon-schema test now decodes `current_ap` null and set.
 
+### Added (new devices)
+
+**A to-do for new devices, and the record of them.** `/devices/todo` lists every
+device nobody has named or given an owner, newest first, with the row menu that
+does both; it is in the navigation second, after the overview, and the overview's
+new-device section links to it. `/events/new-devices` is the daemon's
+`new_device` events on their own. `010_netgrasp_new_devices.sql`.
+
+The to-do is over devices as they are now, not over the event log: a device
+whose event was pruned at 90 days and never named is as unfinished as one that
+appeared an hour ago. "Unnamed" means no name a person typed, so a device the
+daemon guessed a name for stays on the list with the guess shown, and confirming
+it is one rename. A device needs both missing to be listed, because a named but
+unassigned device is usually infrastructure that belongs to nobody, and a list
+that never empties is one nobody reads.
+
+Tests: `the_todo_lists_unnamed_unowned_devices_until_somebody_names_or_assigns_them`
+(renames one through the row menu's real form and watches it leave),
+`the_new_device_event_page_lists_only_new_device_events` (host-in-the-loop; both
+fail without 010), `the_todo_and_the_new_device_events_render_and_point_at_each_other`.
+
 ## [1.0.0] - 2026-09-23
 
 The first release. Everything from the extraction out of the Trovato monorepo

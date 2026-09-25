@@ -19,7 +19,7 @@ docker compose -f docker-compose.demo.yml up
 ```
 
 Then open **http://localhost:3101/**, which redirects to `/overview`. The
-[seven-entry navigation](#the-pages) reaches every page from there.
+[eight-entry navigation](#the-pages) reaches every page from there.
 `scripts/verify-demo.sh` checks the same thing from a terminal, and CI runs it
 against this demo.
 
@@ -262,6 +262,8 @@ without being copied into the image.
 | `/people/home` | the people the daemon counts as home, with the time each arrived |
 | `/people/movements` | every arrival and departure; `?day=YYYY-MM-DD` for one day |
 | `/devices/new` | devices first seen in the last seven days, with the daemon's fingerprint and how sure it is |
+| `/devices/todo` | devices nobody has named or given an owner: what is left to do after a new device appears |
+| `/events/new-devices` | every `new_device` event the daemon recorded |
 | `/devices/online` | what is on the network right now |
 | `/devices/location` | devices grouped by where the daemon's UniFi enrichment placed them; empty, and saying why, when enrichment is off |
 | `/devices` | every device the daemon has seen |
@@ -273,7 +275,7 @@ without being copied into the image.
 | `/events/security` | scans, spoofs, rogue DHCP, conflicts, identity changes |
 | `/events/device?device=…` | one device's events; reached by clicking a Device chip |
 
-The navigation is seven `tap_menu` entries the kernel renders as the site menu.
+The navigation is eight `tap_menu` entries the kernel renders as the site menu.
 They appear because `005_netgrasp_web_interface.sql` grants
 `view netgrasp devices` to the anonymous role — the assumption being a localhost
 dashboard with no login. To put the whole thing behind a login, delete that one

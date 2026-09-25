@@ -151,14 +151,15 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// serialize to the same shape the registry reads, so this is a change of SDK
 /// type and not of contract.
 ///
-/// The order below is the order a person reads them in: the overview, then what
-/// is here now, then everything, then who, then what happened.
+/// The order below is the order a person reads them in: the overview, what is
+/// left to do, then what is here now, then everything, then who, then what
+/// happened.
 ///
-/// Navigation is all the seven below are. `callback` is left empty on every one:
+/// Navigation is all the eight below are. `callback` is left empty on every one:
 /// the kernel routes an entry only when `handler_type` is `"api"` and a callback
 /// is set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
-/// work because `002_netgrasp_gathers.sql` (and, for `/overview`,
-/// `008_netgrasp_overview.sql`) aliases each one onto a
+/// work because `002_netgrasp_gathers.sql` (and, for `/overview` and `/devices/todo`,
+/// 008 and 010) aliases each one onto a
 /// `/gather/<query_id>` route — the menu makes them findable, the URL aliases
 /// make them exist.
 ///
@@ -172,24 +173,27 @@ pub fn tap_menu() -> Vec<MenuRoute> {
         MenuRoute::page("/overview", "Overview")
             .permission(PERM_VIEW_DEVICES)
             .weight(0),
-        MenuRoute::page("/devices/online", "Online now")
+        MenuRoute::page("/devices/todo", "To do")
             .permission(PERM_VIEW_DEVICES)
             .weight(1),
-        MenuRoute::page("/devices", "All devices")
+        MenuRoute::page("/devices/online", "Online now")
             .permission(PERM_VIEW_DEVICES)
             .weight(2),
-        MenuRoute::page("/who-is-home", "Who is home")
+        MenuRoute::page("/devices", "All devices")
             .permission(PERM_VIEW_DEVICES)
             .weight(3),
-        MenuRoute::page("/people", "People")
+        MenuRoute::page("/who-is-home", "Who is home")
             .permission(PERM_VIEW_DEVICES)
             .weight(4),
-        MenuRoute::page("/events", "Events")
+        MenuRoute::page("/people", "People")
             .permission(PERM_VIEW_DEVICES)
             .weight(5),
-        MenuRoute::page("/events/security", "Security events")
+        MenuRoute::page("/events", "Events")
             .permission(PERM_VIEW_DEVICES)
             .weight(6),
+        MenuRoute::page("/events/security", "Security events")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(7),
     ];
     // The row menu's forms. Invisible, gated on `administer netgrasp`, and each
     // one naming a callback — which is the only combination the kernel routes
@@ -770,6 +774,7 @@ mod tests {
             ordered,
             [
                 "/overview",
+                "/devices/todo",
                 "/devices/online",
                 "/devices",
                 "/who-is-home",
@@ -782,7 +787,7 @@ mod tests {
         let mut weights: Vec<i32> = navigation().iter().map(|m| m.weight).collect();
         weights.sort_unstable();
         weights.dedup();
-        assert_eq!(weights.len(), 7, "two menu entries share a weight");
+        assert_eq!(weights.len(), 8, "two menu entries share a weight");
     }
 
     /// A navigation entry must be visible, or it is filtered out by
@@ -810,13 +815,14 @@ mod tests {
         let migrations = [
             include_str!("../migrations/002_netgrasp_gathers.sql"),
             include_str!("../migrations/008_netgrasp_overview.sql"),
+            include_str!("../migrations/010_netgrasp_new_devices.sql"),
         ];
         for m in navigation() {
             assert!(
                 migrations
                     .iter()
                     .any(|migration| migration.contains(&format!("'{}'", m.path))),
-                "menu path {} has no url_alias in 002 or 008",
+                "menu path {} has no url_alias in 002, 008 or 010",
                 m.path
             );
         }
@@ -1531,6 +1537,63 @@ mod tests {
             serde_json::json!([]),
         );
         assert!(empty.contains("UniFi enrichment"), "{empty}");
+    }
+
+    /// The to-do and the new-device event page render with the rows they will
+    /// really get, including a device with nothing but a MAC and an event
+    /// whose device has since been deleted, and each points at the other.
+    #[test]
+    fn the_todo_and_the_new_device_events_render_and_point_at_each_other() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+        let render = |template: &str, query_id: &str, rows: serde_json::Value| {
+            let mut context = tera::Context::new();
+            context.insert("total", &rows.as_array().map_or(0, Vec::len));
+            context.insert("rows", &rows);
+            context.insert("page", &1);
+            context.insert("total_pages", &1);
+            context.insert("base_path", "/devices/todo");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": query_id, "label": "To do"}),
+            );
+            context.insert("filter_values", &serde_json::json!({}));
+            tera.render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+        };
+
+        let todo = render(
+            "gather/query--ng_devices_todo.html",
+            "ng_devices_todo",
+            serde_json::json!([
+                {
+                    "id": 8, "mac": "02:00:5e:00:00:08", "display_name": null,
+                    "resolved_name": null, "hostname": null, "device_type": null,
+                    "state": null, "last_ip": null, "current_location": null,
+                    "current_ap": null, "owner_item_id": null, "owner_name": null,
+                    "hidden": false, "notify": true, "trovato_item_id": null,
+                    "last_seen_at_epoch": null
+                }
+            ]),
+        );
+        assert!(todo.contains("to name or assign"), "{todo}");
+        assert!(todo.contains("href=\"/events/new-devices\""), "{todo}");
+        assert!(todo.contains("/netgrasp/device/rename?"), "{todo}");
+
+        let events = render(
+            "gather/query--ng_event_new_devices.html",
+            "ng_event_new_devices",
+            serde_json::json!([
+                {"id": 1, "device_id": 8, "event_type": "new_device",
+                 "timestamp_epoch": 1_757_000_000, "details": {"interface": "eth0"}},
+                {"id": 2, "device_id": null, "event_type": "new_device",
+                 "timestamp_epoch": 1_757_000_100, "details": null}
+            ]),
+        );
+        assert!(events.contains("href=\"/devices/todo\""), "{events}");
+        assert!(events.contains("ng-menu__button"), "{events}");
     }
 
     /// Tera comments are not markup, and this file's comments discuss the very
