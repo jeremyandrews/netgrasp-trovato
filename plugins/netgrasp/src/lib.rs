@@ -151,13 +151,14 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// serialize to the same shape the registry reads, so this is a change of SDK
 /// type and not of contract.
 ///
-/// The order below is the order a person reads them in: what is here now, then
-/// everything, then who, then what happened.
+/// The order below is the order a person reads them in: the overview, then what
+/// is here now, then everything, then who, then what happened.
 ///
-/// Navigation is all the six below are. `callback` is left empty on every one:
+/// Navigation is all the seven below are. `callback` is left empty on every one:
 /// the kernel routes an entry only when `handler_type` is `"api"` and a callback
 /// is set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
-/// work because `002_netgrasp_gathers.sql` aliases each one onto a
+/// work because `002_netgrasp_gathers.sql` (and, for `/overview`,
+/// `008_netgrasp_overview.sql`) aliases each one onto a
 /// `/gather/<query_id>` route — the menu makes them findable, the URL aliases
 /// make them exist.
 ///
@@ -168,24 +169,27 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 #[plugin_tap]
 pub fn tap_menu() -> Vec<MenuRoute> {
     let mut menu = vec![
-        MenuRoute::page("/devices/online", "Online now")
+        MenuRoute::page("/overview", "Overview")
             .permission(PERM_VIEW_DEVICES)
             .weight(0),
-        MenuRoute::page("/devices", "All devices")
+        MenuRoute::page("/devices/online", "Online now")
             .permission(PERM_VIEW_DEVICES)
             .weight(1),
-        MenuRoute::page("/who-is-home", "Who is home")
+        MenuRoute::page("/devices", "All devices")
             .permission(PERM_VIEW_DEVICES)
             .weight(2),
-        MenuRoute::page("/people", "People")
+        MenuRoute::page("/who-is-home", "Who is home")
             .permission(PERM_VIEW_DEVICES)
             .weight(3),
-        MenuRoute::page("/events", "Events")
+        MenuRoute::page("/people", "People")
             .permission(PERM_VIEW_DEVICES)
             .weight(4),
-        MenuRoute::page("/events/security", "Security events")
+        MenuRoute::page("/events", "Events")
             .permission(PERM_VIEW_DEVICES)
             .weight(5),
+        MenuRoute::page("/events/security", "Security events")
+            .permission(PERM_VIEW_DEVICES)
+            .weight(6),
     ];
     // The row menu's forms. Invisible, gated on `administer netgrasp`, and each
     // one naming a callback — which is the only combination the kernel routes
@@ -765,6 +769,7 @@ mod tests {
         assert_eq!(
             ordered,
             [
+                "/overview",
                 "/devices/online",
                 "/devices",
                 "/who-is-home",
@@ -777,7 +782,7 @@ mod tests {
         let mut weights: Vec<i32> = navigation().iter().map(|m| m.weight).collect();
         weights.sort_unstable();
         weights.dedup();
-        assert_eq!(weights.len(), 6, "two menu entries share a weight");
+        assert_eq!(weights.len(), 7, "two menu entries share a weight");
     }
 
     /// A navigation entry must be visible, or it is filtered out by
@@ -798,18 +803,47 @@ mod tests {
         }
     }
 
-    /// Every menu path must be a route the gather migration actually aliases,
+    /// Every menu path must be a route a gather migration actually aliases,
     /// or the navigation links to a 404.
     #[test]
     fn every_menu_path_is_an_alias_the_migration_seeds() {
-        let migration = include_str!("../migrations/002_netgrasp_gathers.sql");
+        let migrations = [
+            include_str!("../migrations/002_netgrasp_gathers.sql"),
+            include_str!("../migrations/008_netgrasp_overview.sql"),
+        ];
         for m in navigation() {
             assert!(
-                migration.contains(&format!("'{}'", m.path)),
-                "menu path {} has no url_alias in 002_netgrasp_gathers.sql",
+                migrations
+                    .iter()
+                    .any(|migration| migration.contains(&format!("'{}'", m.path))),
+                "menu path {} has no url_alias in 002 or 008",
                 m.path
             );
         }
+    }
+
+    /// The front page is the overview, on a fresh install and on one that
+    /// still has the old default, and on nothing else.
+    ///
+    /// 005 claimed the setting only if nobody had, and 008 moves it only where
+    /// it is still what 005 wrote. A migration that set it unconditionally would
+    /// overwrite an operator's own front page on every install, which is the
+    /// promise 005 made and this is the test that keeps it.
+    #[test]
+    fn the_overview_becomes_the_front_page_only_where_the_old_default_stands() {
+        let migration = include_str!("../migrations/008_netgrasp_overview.sql");
+        assert!(
+            migration.contains("AND value = '\"/devices/online\"'::jsonb"),
+            "008 must move the front page only when it is still /devices/online"
+        );
+        assert!(
+            migration.contains("ON CONFLICT (key) DO NOTHING"),
+            "008 must claim an unset front page without overwriting a set one"
+        );
+        assert!(
+            !migration.contains("ON CONFLICT (key) DO UPDATE"),
+            "008 would overwrite an operator's front page"
+        );
     }
 
     /// The security-event list is written twice — once in Rust for the UI and
@@ -821,6 +855,25 @@ mod tests {
             assert!(
                 migration.contains(&format!("\"{t}\"")),
                 "security event type {t} is missing from the ng_event_security gather"
+            );
+        }
+    }
+
+    /// The overview counts security events itself, in SQL, so the list is
+    /// written there too and the count on the overview must be the pager total
+    /// of the page it links to.
+    #[test]
+    fn the_overview_counts_exactly_the_declared_security_event_types() {
+        let views = include_str!("../migrations/007_netgrasp_overview_views.sql");
+        let (_, overview) = views
+            .split_once("CREATE OR REPLACE VIEW ng_overview")
+            .unwrap_or_default();
+        for t in netgrasp_core::model::SECURITY_EVENT_TYPES {
+            // Twice: once for the total and once for the last 24 hours.
+            assert_eq!(
+                overview.matches(&format!("'{t}'")).count(),
+                2,
+                "security event type {t} is not in both of the overview's counts"
             );
         }
     }
@@ -1140,6 +1193,240 @@ mod tests {
                     "the fallback must carry the MAC: {html}"
                 );
             }
+        }
+    }
+
+    /// **The overview and its three listings are rendered, not grepped**, for
+    /// the reason the test above gives, and with the rows that break templates:
+    /// nulls in every column that can hold one, an include that came back empty,
+    /// and a departure with neither a place nor a way out.
+    ///
+    /// The overview's row is the shape the kernel builds: the view's columns,
+    /// with each include's child rows attached under the include's name.
+    #[test]
+    fn the_overview_and_its_listings_render_with_the_rows_they_will_really_get() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+
+        let home = serde_json::json!([
+            {
+                "item_id": "0193a5a0-0000-7000-8000-00000000000a",
+                "name": "Jamie",
+                "state": "home",
+                "current_location": "Studio",
+                "last_arrived_at_epoch": 1_757_000_000,
+                "last_departed_at_epoch": null,
+                "devices_online": 2
+            },
+            // Home, with no arrival time and no location: a mirror row the
+            // daemon has set a state on but never an arrival.
+            {
+                "item_id": "0193a5a0-0000-7000-8000-00000000000c",
+                "name": "Arlo",
+                "state": "home",
+                "current_location": null,
+                "last_arrived_at_epoch": null,
+                "last_departed_at_epoch": null,
+                "devices_online": 0
+            }
+        ]);
+        let movements = serde_json::json!([
+            {
+                "id": 21,
+                "event_type": "person_arrived",
+                "timestamp_epoch": 1_757_000_000,
+                "day": "2025-09-04",
+                "person_item_id": "0193a5a0-0000-7000-8000-00000000000a",
+                "person_name": "Jamie",
+                "location": "Studio",
+                "via": "Driveway",
+                "device_id": 1,
+                "device_mac": "02:00:5e:00:00:01",
+                "device_display_name": "Jamie's laptop",
+                "device_resolved_name": null,
+                "device_hostname": null,
+                "device_item_id": "0193a5a0-0000-7000-8000-00000000000b"
+            },
+            // A departure from a device that has since been deleted, recorded
+            // for a person with no details: every nullable column null.
+            {
+                "id": 22,
+                "event_type": "person_departed",
+                "timestamp_epoch": 1_757_000_100,
+                "day": "2025-09-04",
+                "person_item_id": null,
+                "person_name": null,
+                "location": null,
+                "via": null,
+                "device_id": null,
+                "device_mac": null,
+                "device_display_name": null,
+                "device_resolved_name": null,
+                "device_hostname": null,
+                "device_item_id": null
+            }
+        ]);
+        let new_devices = serde_json::json!([
+            {
+                "id": 12,
+                "mac": "02:00:5e:00:00:0c",
+                "display_name": null,
+                "resolved_name": null,
+                "hostname": "guest-phone",
+                "mdns_name": null,
+                "vendor": "Apple, Inc.",
+                "device_type": "phone",
+                "device_type_confidence": 0.92,
+                "os_family": "iOS",
+                "identity_source": "dhcp",
+                "identity_confidence": 0.8,
+                "state": "online",
+                "last_ip": "10.0.1.201",
+                "hidden": false,
+                "notify": true,
+                "owner_item_id": null,
+                "owner_name": null,
+                "trovato_item_id": null,
+                "first_seen_at_epoch": 1_757_000_000,
+                "last_seen_at_epoch": 1_757_000_500,
+                "period": "this_week"
+            },
+            // Nothing identified at all: no type, so no confidence either.
+            {
+                "id": 13,
+                "mac": "02:00:5e:00:00:08",
+                "display_name": null,
+                "resolved_name": null,
+                "hostname": null,
+                "mdns_name": null,
+                "vendor": null,
+                "device_type": null,
+                "device_type_confidence": null,
+                "os_family": null,
+                "identity_source": null,
+                "identity_confidence": null,
+                "state": null,
+                "last_ip": null,
+                "hidden": false,
+                "notify": true,
+                "owner_item_id": null,
+                "owner_name": null,
+                "trovato_item_id": null,
+                "first_seen_at_epoch": 1_757_000_000,
+                "last_seen_at_epoch": null,
+                "period": "this_week"
+            }
+        ]);
+
+        let overview_row = |home: &serde_json::Value,
+                            movements: &serde_json::Value,
+                            new_devices: &serde_json::Value| {
+            serde_json::json!([{
+                "id": 1,
+                "today": "2025-09-04",
+                "home_state": "home",
+                "new_period": "this_week",
+                "people_home": 2,
+                "people_total": 3,
+                "devices_online": 7,
+                "devices_new": 2,
+                "movements_today": 2,
+                "security_events": 5,
+                "security_events_24h": 1,
+                "generated_at_epoch": 1_757_000_600,
+                "home": home,
+                "movements": movements,
+                "new_devices": new_devices
+            }])
+        };
+        let empty = serde_json::json!([]);
+
+        let render = |template: &str, query_id: &str, rows: &serde_json::Value| {
+            let mut context = tera::Context::new();
+            context.insert("rows", rows);
+            context.insert("total", &1);
+            context.insert("page", &1);
+            context.insert("total_pages", &1);
+            context.insert("base_path", "/overview");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": query_id, "label": "Overview"}),
+            );
+            context.insert("filter_values", &serde_json::json!({}));
+            tera.render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+        };
+
+        let full = render(
+            "gather/query--ng_overview.html",
+            "ng_overview",
+            &overview_row(&home, &movements, &new_devices),
+        );
+        for expected in [
+            "Home since",
+            "Jamie",
+            "Arlo",
+            "Arrived",
+            "Left",
+            "via Driveway",
+            "Somebody",
+            "92%",
+            "Not yet identified",
+            "ng-menu__button",
+            "href=\"/events/security\"",
+            "ng-stat--alert",
+            "/people/movements?day=2025-09-04",
+        ] {
+            assert!(
+                full.contains(expected),
+                "the overview did not render {expected:?}: {full}"
+            );
+        }
+        // The row menu comes back to the overview, not to a gather path.
+        // Autoescaping writes the slash as an entity, which an href decodes.
+        assert!(full.contains("back=&#x2F;overview&amp;"), "{full}");
+
+        // Every include empty, and a quiet day: three empty states, no table.
+        let quiet = render(
+            "gather/query--ng_overview.html",
+            "ng_overview",
+            &overview_row(&empty, &empty, &empty),
+        );
+        assert!(quiet.contains("Nobody is home."), "{quiet}");
+        assert!(
+            quiet.contains("Nobody has arrived or left today."),
+            "{quiet}"
+        );
+        assert!(quiet.contains("Nothing new has appeared"), "{quiet}");
+        assert!(!quiet.contains("<table"), "{quiet}");
+
+        for (template, query_id, rows, expected) in [
+            (
+                "gather/query--ng_people_home.html",
+                "ng_people_home",
+                &home,
+                "Home since",
+            ),
+            (
+                "gather/query--ng_person_movements.html",
+                "ng_person_movements",
+                &movements,
+                "Arrived",
+            ),
+            (
+                "gather/query--ng_devices_new.html",
+                "ng_devices_new",
+                &new_devices,
+                "92%",
+            ),
+        ] {
+            let html = render(template, query_id, rows);
+            assert!(
+                html.contains(expected),
+                "{template} lost {expected:?}: {html}"
+            );
         }
     }
 
@@ -1743,9 +2030,11 @@ mod tests {
                 "scripts/first-run.sh does not post {step}"
             );
         }
+        // The overview specifically: it is the front page, and its gather is
+        // the last one the migrations add, so a 200 from it means all of them ran.
         assert!(
-            first_run.contains("/devices/online"),
-            "scripts/first-run.sh never checks that a netgrasp page serves"
+            first_run.contains("\"$BASE/overview\""),
+            "scripts/first-run.sh never checks that the front page serves"
         );
         assert!(
             demo_compose().contains("scripts/first-run.sh"),

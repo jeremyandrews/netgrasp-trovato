@@ -121,7 +121,7 @@ if [ "$SEED" = "1" ]; then
 fi
 
 echo "==> serving on http://localhost:$PORT"
-echo "    /  redirects to /devices/online"
+echo "    /  redirects to /overview"
 if [ "$BG" = "1" ]; then
     "$TROVATO_BIN" serve >/tmp/netgrasp-trovato.log 2>&1 &
     echo "    background pid $!, logs /tmp/netgrasp-trovato.log"

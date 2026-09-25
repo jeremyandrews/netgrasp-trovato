@@ -1,0 +1,83 @@
+{#
+    The overview. /overview, and the site's front page.
+
+    One gather over `ng_overview`, a view with exactly one row. That row's
+    columns are the counts; its three lists arrive on it as includes, each a
+    child gather the kernel ran after the parent: `home` (people home now),
+    `movements` (today's arrivals and departures, oldest first) and
+    `new_devices` (first seen this week). 008_netgrasp_overview.sql explains why
+    a page with four questions on it is built this way and not out of tiles.
+
+    `rows` therefore has one element, and the loop below runs once. It is a loop
+    and not `rows[0]` so that the template reads the same whether the kernel ever
+    hands it zero rows (it renders page.html's empty state, not an index error)
+    or one.
+
+    The row menus in the new-device table need `base_path`, which is this
+    page's canonical URL, so a rename started here comes back here.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block results %}
+{% for ov in rows %}
+<div class="ng-stats">
+    <a class="ng-stat ng-stat--home" href="/people/home">
+        <span class="ng-stat__count">{{ ov.people_home }}</span>
+        <span class="ng-stat__label">of {{ ov.people_total }} {{ ov.people_total | pluralize(singular="person", plural="people") }} home</span>
+    </a>
+    <a class="ng-stat" href="/devices/online">
+        <span class="ng-stat__count">{{ ov.devices_online }}</span>
+        <span class="ng-stat__label">device{{ ov.devices_online | pluralize }} online</span>
+    </a>
+    <a class="ng-stat" href="/devices/new">
+        <span class="ng-stat__count">{{ ov.devices_new }}</span>
+        <span class="ng-stat__label">new this week</span>
+    </a>
+    {# The count is exactly the pager total of the page it links to: the view
+       counts the same six event types /events/security filters on. #}
+    <a class="ng-stat ng-stat--security{% if ov.security_events_24h > 0 %} ng-stat--alert{% endif %}" href="/events/security">
+        <span class="ng-stat__count">{{ ov.security_events }}</span>
+        <span class="ng-stat__label">security event{{ ov.security_events | pluralize }},
+            {{ ov.security_events_24h }} in the last 24 hours</span>
+    </a>
+</div>
+
+<section class="ng-section" aria-labelledby="ng-section-home">
+    <h2 class="ng-section__title" id="ng-section-home">Home now</h2>
+    {% if ov.home | length > 0 %}
+    {% set ng_people = ov.home %}
+    {% include "gather/netgrasp/people-home.html" %}
+    {% else %}
+    <p class="ng-empty">Nobody is home.
+        <span class="ng-empty__hint">A person is home when any device they own is online. <a href="/people">People</a>.</span>
+    </p>
+    {% endif %}
+</section>
+
+<section class="ng-section" aria-labelledby="ng-section-today">
+    <h2 class="ng-section__title" id="ng-section-today">Today
+        <a class="ng-section__more" href="/people/movements?day={{ ov.today }}">All of today</a>
+    </h2>
+    {% if ov.movements | length > 0 %}
+    {% set ng_movements = ov.movements %}
+    {% include "gather/netgrasp/movement-table.html" %}
+    {% else %}
+    <p class="ng-empty">Nobody has arrived or left today.
+        <span class="ng-empty__hint"><a href="/people/movements">Earlier arrivals and departures</a>.</span>
+    </p>
+    {% endif %}
+</section>
+
+<section class="ng-section" aria-labelledby="ng-section-new">
+    <h2 class="ng-section__title" id="ng-section-new">New this week
+        <a class="ng-section__more" href="/devices/new">All new devices</a>
+    </h2>
+    {% if ov.new_devices | length > 0 %}
+    {% set ng_devices = ov.new_devices %}
+    {% include "gather/netgrasp/new-device-table.html" %}
+    {% else %}
+    <p class="ng-empty">Nothing new has appeared on the network this week.</p>
+    {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

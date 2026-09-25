@@ -1,0 +1,27 @@
+{#
+    Arrivals and departures. /people/movements, or one day of them with
+    ?day=YYYY-MM-DD.
+
+    Newest first, because this is the log. The overview shows today's in the
+    other order, oldest first, because a single day reads as a sequence.
+
+    The table is gather/netgrasp/movement-table.html, which the overview shares.
+
+    The page cannot say which day it is showing: `?day=` is a URL argument, and
+    a gather template's context carries exposed-filter values but not URL
+    arguments. Every row carries its own time, which is the same information.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block results %}
+{% set ng_movements = rows %}
+{% include "gather/netgrasp/movement-table.html" %}
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    The daemon records an arrival when the first device a person owns comes
+    online, and a departure when the last one goes offline. Devices with no
+    owner never make either. <a href="/overview">Overview</a>.
+</span>
+{% endblock %}

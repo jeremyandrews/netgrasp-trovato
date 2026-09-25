@@ -75,6 +75,8 @@ files = [
     "migrations/004_netgrasp_security_event_types.sql",
     "migrations/005_netgrasp_web_interface.sql",
     "migrations/006_netgrasp_owner_names.sql",
+    "migrations/007_netgrasp_overview_views.sql",
+    "migrations/008_netgrasp_overview.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -129,6 +131,15 @@ db_tables = [
     # names ng_devices directly, which is what keeps the write path addressing the
     # real table.
     "ng_devices_with_owner",
+    # The overview's four views, created by 007_netgrasp_overview_views.sql and
+    # declared as record types below for the same reason as the owner view. The
+    # assistant's read tools select from them too, which is why they are named
+    # here rather than only admitted: a structured `db` call against a relation
+    # outside this list is refused with `table-not-declared`.
+    "ng_people_presence",
+    "ng_person_movements",
+    "ng_devices_new",
+    "ng_overview",
 ]
 
 # Lightweight record types (P11g / D-53).
@@ -295,3 +306,103 @@ notify_arrive = "notify_arrive"
 notify_depart = "notify_depart"
 state = "state"
 current_location = "current_location"
+
+# ---------------------------------------------------------------------------
+# The overview's four views (007_netgrasp_overview_views.sql)
+# ---------------------------------------------------------------------------
+# Read-only like every record type here, and each over a VIEW, for the reasons
+# 007 gives: three of the questions are relative to the clock and the fourth is a
+# count, and a gather filter can express neither.
+#
+# Where a field is what an include joins on, its logical name IS its physical
+# column name: `state`, `day`, `period`. The kernel uses an include's
+# `child_field` twice, once as a filter field (rewritten through this map) and
+# once to read the child row (which is keyed by physical column), so a join field
+# whose two names differed would filter correctly and then attach nothing.
+
+# One person, with the arrival times as epoch twins ng_people itself lacks.
+[[record_types]]
+name = "ng_person_presence"
+table = "ng_people_presence"
+id_column = "item_id"
+title_column = "name"
+created_column = "last_arrived_at_epoch"
+changed_column = "last_arrived_at_epoch"
+
+[record_types.fields]
+item_id = "item_id"
+name = "name"
+state = "state"
+current_location = "current_location"
+last_arrived = "last_arrived_at_epoch"
+last_departed = "last_departed_at_epoch"
+devices_online = "devices_online"
+
+# One arrival or departure, with its `details` lifted into columns.
+[[record_types]]
+name = "ng_person_movement"
+table = "ng_person_movements"
+id_column = "id"
+title_column = "event_type"
+created_column = "timestamp_epoch"
+changed_column = "timestamp_epoch"
+
+[record_types.fields]
+event_type = "event_type"
+timestamp = "timestamp_epoch"
+day = "day"
+person_item_id = "person_item_id"
+person_name = "person_name"
+location = "location"
+via = "via"
+device_id = "device_id"
+
+# A device first seen in the last seven days.
+[[record_types]]
+name = "ng_device_new"
+table = "ng_devices_new"
+id_column = "id"
+title_column = "mac"
+created_column = "first_seen_at_epoch"
+changed_column = "last_seen_at_epoch"
+
+[record_types.fields]
+mac = "mac"
+display_name = "display_name"
+resolved_name = "resolved_name"
+hostname = "hostname"
+vendor = "vendor"
+device_type = "device_type"
+device_type_confidence = "device_type_confidence"
+os_family = "os_family"
+state = "state"
+hidden = "hidden"
+owner_id = "owner_item_id"
+owner_name = "owner_name"
+item_id = "trovato_item_id"
+first_seen = "first_seen_at_epoch"
+last_seen = "last_seen_at_epoch"
+period = "period"
+
+# The overview's single row. Its columns are counts, which is the only way a
+# gather page gets a number that is not a pager total.
+[[record_types]]
+name = "ng_overview"
+table = "ng_overview"
+id_column = "id"
+title_column = "today"
+created_column = "generated_at_epoch"
+changed_column = "generated_at_epoch"
+
+[record_types.fields]
+today = "today"
+home_state = "home_state"
+new_period = "new_period"
+people_home = "people_home"
+people_total = "people_total"
+devices_online = "devices_online"
+devices_new = "devices_new"
+movements_today = "movements_today"
+security_events = "security_events"
+security_events_24h = "security_events_24h"
+generated_at = "generated_at_epoch"

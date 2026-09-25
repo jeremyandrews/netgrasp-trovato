@@ -19,6 +19,56 @@ are built for the same `ng_` schema version. A change to the schema is always a
 paired release, and the daemon is upgraded and migrated first. The README's
 Compatibility section has the table.
 
+## [Unreleased]
+
+### Added
+
+**An overview, and it is the front page.** `/overview`, from
+`007_netgrasp_overview_views.sql` and `008_netgrasp_overview.sql`. Who is home
+and since when, today's arrivals and departures in order, the devices first seen
+this week with the daemon's fingerprint and how sure it is (each with the row
+menu, because a new device is the one you want to name and assign), and the
+security event count linking to `/events/security`. `/` redirected to
+`/devices/online` before; it redirects here now, but only where that was still
+the setting, so an operator's own front page is untouched.
+
+What was missing underneath was not a template but a way to put four questions
+on one server-rendered page. A gather renders one query, its template cannot run
+another, and a `gather_query` tile is an empty element for client script to fill.
+The kernel's gather `includes` does compose, so the overview is a gather over a
+one-row view whose columns are the counts, with the three lists attached as
+includes. Three of the questions are relative to the clock ("today", "this
+week", "the last 24 hours"), and a gather filter has no clock offset and resolves
+`current_date` in the kernel's time zone rather than the database's, so they are
+views that call `now()` in the same session that compares the rows. DESIGN.md
+Decision 11.
+
+Each list is a page of its own too: `/people/home` (people the daemon counts as
+home, with their arrival time, which `ng_people` stores as a `timestamptz` with
+no epoch twin, so the view computes one), `/people/movements` (the arrival and
+departure log, or one day with `?day=`), and `/devices/new`. Every page reloads
+itself on the same interval as the others.
+
+**`scripts/verify-demo.sh`, and a `verify-demo` CI job that runs it.** It brings
+up `docker-compose.demo.yml` as the README describes, then checks that `/`
+redirects to `/overview` and that the page is the overview's own template: a
+gather template that raises answers 200 with the kernel's column dump, so a
+status code alone would pass a broken page.
+
+### Tests
+
+Host-in-the-loop, against the real `GatherService` and a real Postgres:
+`the_overview_counts_and_lists_what_the_house_is_doing_today`,
+`the_overviews_listings_are_pages_that_filter_and_render_on_their_own`,
+`an_empty_house_still_has_an_overview`,
+`every_overview_view_carries_every_column_its_record_type_maps`,
+`no_overview_include_is_named_after_a_column_it_would_overwrite`,
+`each_overview_list_agrees_with_the_page_it_links_to`,
+`the_front_page_moves_to_the_overview_only_from_the_old_default`. Unit:
+`the_overview_and_its_listings_render_with_the_rows_they_will_really_get`,
+`the_overview_counts_exactly_the_declared_security_event_types`,
+`the_overview_becomes_the_front_page_only_where_the_old_default_stands`.
+
 ## [1.0.0] - 2026-09-23
 
 The first release. Everything from the extraction out of the Trovato monorepo

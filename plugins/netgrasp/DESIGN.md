@@ -262,6 +262,10 @@ own route with a `{"url_arg": …}` filter whose value is always supplied:
 | `/events/security` | `ng_event_security` | none (fixed set) |
 | `/events/device?device=…` | `ng_event_by_device` | device |
 | `/people` | `ng_person_list` | none |
+| `/overview` | `ng_overview` | none (one row; Decision 11) |
+| `/people/home` | `ng_people_home` | none (`state = 'home'` fixed) |
+| `/people/movements?day=…` | `ng_person_movements` | day, optional: an absent `url_arg` resolves to null and constrains nothing |
+| `/devices/new` | `ng_devices_new` | none (the view is the week) |
 
 ### Decision 7 — the tiles are gather tiles, because a tile cannot count
 
@@ -429,6 +433,55 @@ reads one record type — so the page the link opens is also the first place tha
 select could be built. And an event row's menu acts on the **device** the event
 is about, reached by the `device_id` the row does carry, because an event is a
 read-only record with nothing of its own to configure (Decision 2).
+
+---
+
+### Decision 11: the overview is a one-row view with its lists as includes
+
+The front page answers four questions at once: who is home and since when, who
+came and went today, what is new on the network this week, and whether anything
+suspicious is happening. A gather page renders one query and its template cannot
+run another (Decision 10 lists its context), and a `gather_query` tile renders as
+an empty `<div data-query-id>` for client script to fill, so neither composes a
+page on the server.
+
+`includes` does. The kernel runs each include as a child gather after the parent,
+batched, and writes the child rows onto each parent row under the include's name.
+So `/overview` is a gather over `ng_overview`, a view with exactly one row whose
+columns are the counts, and its three lists (`home`, `movements`, `new_devices`)
+arrive on that row. The counts are columns because a gather cannot count
+(Decision 7); the lists are includes because a view with one row cannot hold a
+page of rows without flattening them into JSON the templates would then have to
+unpack.
+
+Three of the four questions are relative to the clock, which is what put them in
+views (`007_netgrasp_overview_views.sql`) rather than in gather filters. A filter
+has `current_time` and `current_date` and no offset, so "seven days ago" is not a
+value it can hold; and `current_date` is the kernel process's local date while
+the rows are compared in the database's session time zone. A view evaluates
+`now()` in the session that compares the rows, so "today" means one thing on the
+whole page: the database's calendar day.
+
+Three things follow, each held by a host-in-the-loop test:
+
+- **An include joins on equal text.** `child_field IN (parent values)`, bound as
+  text, and `child_field` is used both as a filter field (through the record
+  field map) and as a row key (physical). So each join column is text with the
+  same logical and physical name: a person's `state`, a movement's `day`, a new
+  device's `period`. `period` is a constant the week-bounded view carries for
+  exactly this, because "the last seven days" is a range and an include cannot
+  join on one.
+- **An include's name must not be a column of its parent.** The kernel writes the
+  child list over whatever key was there, so an include named `people_home`
+  would replace the count with a list.
+- **Every list is also a page, and the two definitions agree.** An include
+  carries its definition inline, so each is written twice; the test compares
+  record type and filters (less the join) and allows the sort to differ only on
+  movements, oldest first for one day and newest first for the log.
+
+The front page moves to `/overview` only where `site_front_page` is still the
+`/devices/online` 005 wrote, or unset. An operator's own choice is left alone,
+the same promise 005 made from the other side.
 
 ---
 

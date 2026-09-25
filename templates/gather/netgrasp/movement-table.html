@@ -1,0 +1,82 @@
+{#
+    Arrivals and departures, one row each. Shared by /people/movements and the
+    overview, which differ only in which rows and in which order.
+
+    The caller sets `ng_movements` to a list of `ng_person_movement` rows, keyed
+    by the columns of the `ng_person_movements` view: the daemon's
+    `person_arrived` and `person_departed` events with their `details` lifted
+    into columns.
+
+    Every column but `id`, `event_type` and the time can be null, and each null
+    is a real case rather than a broken row:
+      - `person_name`: an event recorded without a person in its details. The
+        daemon always writes one; an older or hand-written row may not.
+      - `person_item_id`: the same, and then there is no owner page to link.
+      - `location`: always, on a departure. A departure has a way out ("via"),
+        not a place.
+      - `via`: an arrival or departure with no edge access point behind it,
+        which is every one on a network without UniFi enrichment.
+      - the device columns: the device row was deleted, and `ng_events` keeps
+        the event with `device_id` set to null.
+#}
+<div class="ng-table-scroll">
+    <table class="ng-table ng-movement-table">
+        <thead>
+            <tr>
+                <th>When</th>
+                <th>Who</th>
+                <th>What</th>
+                <th>Where</th>
+                <th>Device</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in ng_movements %}
+            <tr data-id="{{ m.id }}" class="ng-row--{{ m.event_type }}">
+                <td class="ng-mono ng-nowrap" {% if m.timestamp_epoch %}data-ng-epoch="{{ m.timestamp_epoch }}"{% endif %}>
+                    {%- if m.timestamp_epoch -%}
+                    {{ m.timestamp_epoch | date(format="%Y-%m-%d %H:%M") }}
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                <td class="ng-name">
+                    {%- if m.person_item_id %}<a href="/devices/owner?owner={{ m.person_item_id | urlencode }}">{% endif -%}
+                    {%- if m.person_name %}{{ m.person_name }}{% else %}Somebody{% endif -%}
+                    {%- if m.person_item_id %}</a>{% endif -%}
+                </td>
+
+                <td>
+                    {%- if m.event_type == "person_arrived" -%}
+                    <span class="ng-movement ng-movement--arrived">Arrived</span>
+                    {%- elif m.event_type == "person_departed" -%}
+                    <span class="ng-movement ng-movement--departed">Left</span>
+                    {%- else -%}
+                    <span class="ng-event-type">{{ m.event_type }}</span>
+                    {%- endif -%}
+                </td>
+
+                {# "Where" reads as a sentence fragment: a place, the edge they
+                   crossed, both, or a dash when the daemon had neither. #}
+                <td>
+                    {%- if m.location %}{{ m.location }}{% endif -%}
+                    {%- if m.location and m.via %}, {% endif -%}
+                    {%- if m.via %}via {{ m.via }}{% endif -%}
+                    {%- if not m.location and not m.via %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                </td>
+
+                {# The device naming ladder device-table.html explains, over the
+                   view's `device_` columns. #}
+                <td>
+                    {%- if m.device_item_id %}<a href="/item/{{ m.device_item_id }}">{% endif -%}
+                    {%- if m.device_display_name %}{{ m.device_display_name }}
+                    {%- elif m.device_resolved_name %}{{ m.device_resolved_name }}
+                    {%- elif m.device_hostname %}{{ m.device_hostname }}
+                    {%- elif m.device_mac %}<span class="ng-mono">{{ m.device_mac }}</span>
+                    {%- else %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                    {%- if m.device_item_id %}</a>{% endif -%}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>

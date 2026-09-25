@@ -60,14 +60,15 @@ curl -fsS -o /dev/null \
     "$BASE/install/site"
 echo "    site name: $SITE_NAME"
 
-# The check the health check cannot make. /devices/online is a netgrasp gather
-# behind a netgrasp permission, so a 200 here means the wizard is done, the
-# plugin is enabled, its migrations ran, its gather is registered and the
-# anonymous role can see it. Any one of those missing is a redirect or a 403.
-code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/devices/online")"
+# The check the health check cannot make. /overview is a netgrasp gather behind
+# a netgrasp permission, and the last one the migrations add, so a 200 here
+# means the wizard is done, the plugin is enabled, every migration ran, its
+# gather is registered and the anonymous role can see it. Any one of those
+# missing is a redirect or a 403.
+code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/overview")"
 if [ "$code" != "200" ]; then
-    echo "error: $BASE/devices/online answered $code, not 200" >&2
+    echo "error: $BASE/overview answered $code, not 200" >&2
     exit 1
 fi
 
-echo "==> ready: $BASE/ redirects to $BASE/devices/online"
+echo "==> ready: $BASE/ redirects to $BASE/overview"
