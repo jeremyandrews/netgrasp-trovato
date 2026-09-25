@@ -1430,6 +1430,109 @@ mod tests {
         }
     }
 
+    /// **Location reads cleanly with UniFi enrichment on and off.** Off, every
+    /// row has a null place and access point, and the device table must not
+    /// grow a column of dashes; on, the column appears, links each place to its
+    /// section of /devices/location, and shows the access point under it.
+    #[test]
+    fn the_where_column_appears_only_when_something_on_the_page_is_somewhere() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+        let device = |id: i64, location: Option<&str>, ap: Option<&str>| {
+            serde_json::json!({
+                "id": id,
+                "mac": format!("02:00:5e:00:00:{id:02x}"),
+                "display_name": null,
+                "resolved_name": null,
+                "hostname": format!("host-{id}"),
+                "device_type": null,
+                "state": "online",
+                "last_ip": null,
+                "current_location": location,
+                "current_ap": ap,
+                "owner_item_id": null,
+                "owner_name": null,
+                "hidden": false,
+                "notify": true,
+                "trovato_item_id": null,
+                "last_seen_at_epoch": 1_757_000_000
+            })
+        };
+        let render = |template: &str, query_id: &str, rows: serde_json::Value| {
+            let mut context = tera::Context::new();
+            context.insert("rows", &rows);
+            context.insert("total", &rows.as_array().map_or(0, Vec::len));
+            context.insert("page", &1);
+            context.insert("total_pages", &1);
+            context.insert("base_path", "/devices");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": query_id, "label": "Devices"}),
+            );
+            context.insert("filter_values", &serde_json::json!({}));
+            tera.render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+        };
+
+        // Enrichment off: nothing anywhere.
+        let off = render(
+            "gather/netgrasp/device-table.html",
+            "ng_device_list",
+            serde_json::json!([device(1, None, None), device(2, None, None)]),
+        );
+        assert!(!off.contains("<th>Where</th>"), "{off}");
+        assert!(!off.contains("/devices/location"), "{off}");
+        assert!(!off.contains("ng-ap"), "{off}");
+
+        // Enrichment on: a placed device, one with only an access point, and a
+        // wired one with neither.
+        let on = render(
+            "gather/netgrasp/device-table.html",
+            "ng_device_list",
+            serde_json::json!([
+                device(1, Some("Living room"), Some("Living room AP")),
+                device(2, None, Some("Garage AP")),
+                device(3, None, None)
+            ]),
+        );
+        assert!(on.contains("<th>Where</th>"), "{on}");
+        assert!(
+            on.contains("href=\"/devices/location#loc-living-room\">Living room</a>"),
+            "{on}"
+        );
+        assert!(on.contains("Living room AP"), "{on}");
+        assert!(on.contains("ng-ap--alone\">Garage AP"), "{on}");
+
+        // The location page: one section per place, in the gather's order, each
+        // with the id the Where cells link to.
+        let page = render(
+            "gather/query--ng_devices_by_location.html",
+            "ng_devices_by_location",
+            serde_json::json!([
+                device(1, Some("Living room"), Some("Living room AP")),
+                device(4, Some("Living room"), Some("Living room AP")),
+                device(5, Some("Studio"), Some("Studio AP"))
+            ]),
+        );
+        let living = page.find("id=\"loc-living-room\"").unwrap_or(usize::MAX);
+        let studio = page.find("id=\"loc-studio\"").unwrap_or(usize::MAX);
+        assert!(living < studio && studio < usize::MAX, "{page}");
+        assert_eq!(page.matches("class=\"ng-section\"").count(), 2, "{page}");
+        // Each section holds exactly its own devices.
+        let studio_section = &page[studio..];
+        assert!(studio_section.contains("host-5") && !studio_section.contains("host-4"));
+
+        // And with enrichment off the page is its empty state, which says why.
+        let empty = render(
+            "gather/query--ng_devices_by_location.html",
+            "ng_devices_by_location",
+            serde_json::json!([]),
+        );
+        assert!(empty.contains("UniFi enrichment"), "{empty}");
+    }
+
     /// Tera comments are not markup, and this file's comments discuss the very
     /// markup the test above forbids.
     fn strip_tera_comments(template: &str) -> String {

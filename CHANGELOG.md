@@ -69,6 +69,34 @@ Host-in-the-loop, against the real `GatherService` and a real Postgres:
 `the_overview_counts_exactly_the_declared_security_event_types`,
 `the_overview_becomes_the_front_page_only_where_the_old_default_stands`.
 
+### Added (location)
+
+**Where a device is, on its row and on its page, and a page by place.** The
+device tables grow a Where column: the place the daemon's UniFi enrichment
+resolved, linked to its section of the new `/devices/location`, with the access
+point under it. The device page adds an Access point row beside Location.
+`/devices/location` (`009_netgrasp_locations.sql`) groups every placed device
+under its place.
+
+What had to be decided underneath was what these read like with enrichment off,
+which is the default and most installs: `current_location` and `current_ap` are
+null on every row. So the Where column is rendered only when some row on the
+page has either value (counted with Tera's `map`, which drops nulls), the device
+page omits both rows instead of printing empty ones, its location timeline says
+the location would come from the daemon's enrichment instead of "No location
+history", which read as a gap in monitoring, and `/devices/location` is its
+empty state saying the same. The device page read `current_location` before and
+never `current_ap`; `SELECT_DEVICE_STATE` now reads both.
+
+Tests: `the_location_page_groups_every_placed_device_under_its_place`,
+`with_enrichment_off_the_device_pages_read_cleanly_and_say_why_location_is_empty`,
+`the_device_page_shows_the_access_point_and_explains_a_missing_location`
+(host-in-the-loop; all three fail with the templates, manifest and query as they
+were), `the_where_column_appears_only_when_something_on_the_page_is_somewhere`,
+`the_identity_block_names_the_place_and_the_access_point`,
+`with_no_enrichment_the_page_omits_location_and_says_where_it_would_come_from`,
+and the daemon-schema test now decodes `current_ap` null and set.
+
 ## [1.0.0] - 2026-09-23
 
 The first release. Everything from the extraction out of the Trovato monorepo

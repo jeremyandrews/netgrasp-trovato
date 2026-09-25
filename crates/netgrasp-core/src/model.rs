@@ -380,9 +380,15 @@ pub struct DeviceState {
     /// Most recent address.
     #[serde(default)]
     pub last_ip: Option<String>,
-    /// Access point or segment.
+    /// The place the daemon resolved the device's access point to ("Studio").
+    /// Null whenever the daemon's UniFi enrichment is off or has not placed
+    /// this device, which on most installs is always.
     #[serde(default)]
     pub current_location: Option<String>,
+    /// The access point the device is associated with, as the controller names
+    /// it ("Studio AP"). Null for the same reasons, and also for a wired device.
+    #[serde(default)]
+    pub current_ap: Option<String>,
     /// First observation, unix seconds — `first_seen_at_epoch`, aliased.
     #[serde(default)]
     pub first_seen: Option<i64>,

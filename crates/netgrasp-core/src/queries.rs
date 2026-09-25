@@ -99,7 +99,7 @@ pub const DELETE_EXPIRED_EVENTS: &str = "DELETE FROM ng_events WHERE id IN (\
 
 /// The daemon's row for a device Item. `$1` is the Item id.
 pub const SELECT_DEVICE_STATE: &str = "SELECT id, mac, hostname, vendor, device_type, os_family, \
-     state, last_ip, current_location, first_seen_at_epoch AS first_seen, \
+     state, last_ip, current_location, current_ap, first_seen_at_epoch AS first_seen, \
      last_seen_at_epoch AS last_seen \
      FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1";
 

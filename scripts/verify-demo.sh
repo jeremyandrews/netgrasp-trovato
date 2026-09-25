@@ -62,7 +62,7 @@ expect 'class="ng-menu"' "a row menu on a new device"
 echo "    /overview renders the overview, with the seeded people and devices"
 
 # The three pages the overview links to.
-for path in /people/home /people/movements /devices/new; do
+for path in /people/home /people/movements /devices/new /devices/location; do
     code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE$path")"
     [ "$code" = "200" ] || fail "$path answered $code"
     grep -q 'class="ng-page ' "$PAGE" || fail "$path did not render netgrasp's page chrome"

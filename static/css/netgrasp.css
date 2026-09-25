@@ -809,3 +809,26 @@
         color: #cbd5e1;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * Location
+ * ------------------------------------------------------------------------ */
+
+/* The access point under the place it was mapped to: the evidence, quieter
+   than the claim. Alone, when the daemon has an access point and no place. */
+.ng-ap {
+    display: block;
+    color: var(--gray-500);
+    font-size: 0.75rem;
+}
+
+.ng-ap--alone {
+    display: inline;
+    font-size: inherit;
+}
+
+@media (prefers-color-scheme: dark) {
+    .ng-ap {
+        color: #94a3b8;
+    }
+}

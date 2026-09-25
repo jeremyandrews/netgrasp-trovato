@@ -1755,6 +1755,158 @@ fn the_front_page_moves_to_the_overview_only_from_the_old_default() {
     });
 }
 
+// ===========================================================================
+// Location
+// ===========================================================================
+
+/// Place a device the way the daemon's UniFi enrichment does: an access point
+/// and the place it maps to, either of which may be absent.
+async fn place(pool: &PgPool, device: i64, location: Option<&str>, ap: Option<&str>) {
+    sqlx::query("UPDATE ng_devices SET current_location = $1, current_ap = $2 WHERE id = $3")
+        .bind(location)
+        .bind(ap)
+        .bind(device)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// /devices/location through the real `GatherService`: only placed, unhidden
+/// devices, sorted so a place's devices are adjacent, and the page rendering one
+/// section per place with the device table inside it.
+#[test]
+fn the_location_page_groups_every_placed_device_under_its_place() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let a = seed_device(&pool, "aa:bb:cc:00:02:01", Some("tv"), "online").await;
+        let b = seed_device(&pool, "aa:bb:cc:00:02:02", Some("laptop"), "online").await;
+        let c = seed_device(&pool, "aa:bb:cc:00:02:03", Some("phone"), "online").await;
+        let ap_only = seed_device(&pool, "aa:bb:cc:00:02:04", Some("ap-only"), "online").await;
+        let wired = seed_device(&pool, "aa:bb:cc:00:02:05", Some("wired"), "online").await;
+        let hidden = seed_device(&pool, "aa:bb:cc:00:02:06", Some("hidden"), "online").await;
+        place(&pool, a, Some("Living room"), Some("Living room AP")).await;
+        place(&pool, b, Some("Studio"), Some("Studio AP")).await;
+        place(&pool, c, Some("Living room"), Some("Living room AP")).await;
+        place(&pool, ap_only, None, Some("Garage AP")).await;
+        place(&pool, wired, None, None).await;
+        place(&pool, hidden, Some("Studio"), Some("Studio AP")).await;
+        sqlx::query("UPDATE ng_devices SET hidden = true WHERE id = $1")
+            .bind(hidden)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_devices_by_location", HashMap::new()).await;
+        let places: Vec<&str> = rows
+            .iter()
+            .map(|r| r["current_location"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            places,
+            ["Living room", "Living room", "Studio"],
+            "placed and unhidden only, sorted by place"
+        );
+        assert!(rows[0]["current_ap"].is_string(), "{}", rows[0]);
+
+        let html = render_page(
+            "ng_devices_by_location",
+            "Devices by location",
+            "/devices/location",
+            &rows,
+        );
+        assert_eq!(html.matches("class=\"ng-section\"").count(), 2, "{html}");
+        assert!(html.contains("id=\"loc-living-room\""), "{html}");
+        assert!(html.contains("id=\"loc-studio\""), "{html}");
+        assert!(html.contains("Studio AP"), "{html}");
+        assert!(
+            !html.contains("aa:bb:cc:00:02:06"),
+            "a hidden device was listed: {html}"
+        );
+    });
+}
+
+/// **UniFi enrichment off**: every device's place and access point are null.
+/// The device list renders no Where column, the location page is its empty
+/// state saying why, and nothing errors.
+#[test]
+fn with_enrichment_off_the_device_pages_read_cleanly_and_say_why_location_is_empty() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        for mac in ["aa:bb:cc:00:03:01", "aa:bb:cc:00:03:02"] {
+            let id = seed_device(&pool, mac, Some("dev"), "online").await;
+            place(&pool, id, None, None).await;
+        }
+        let gather = wire_gather(&pool).await;
+
+        let devices = gather_items(&gather, "ng_device_list", HashMap::new()).await;
+        assert_eq!(devices.len(), 2);
+        assert!(devices[0]["current_location"].is_null() && devices[0]["current_ap"].is_null());
+        let html = render_page("ng_device_list", "Devices", "/devices", &devices);
+        assert!(!html.contains("<th>Where</th>"), "{html}");
+
+        let placed = gather_items(&gather, "ng_devices_by_location", HashMap::new()).await;
+        assert!(placed.is_empty());
+        let html = render_page(
+            "ng_devices_by_location",
+            "Devices by location",
+            "/devices/location",
+            &placed,
+        );
+        assert!(html.contains("UniFi enrichment"), "{html}");
+
+        // The same device list, once one device is placed, grows the column.
+        let id = seed_device(&pool, "aa:bb:cc:00:03:03", Some("placed"), "online").await;
+        place(&pool, id, Some("Studio"), Some("Studio AP")).await;
+        let devices = gather_items(&gather, "ng_device_list", HashMap::new()).await;
+        let html = render_page("ng_device_list", "Devices", "/devices", &devices);
+        assert!(html.contains("<th>Where</th>"), "{html}");
+        assert!(html.contains("/devices/location#loc-studio"), "{html}");
+    });
+}
+
+/// The device Item page, through the real `tap_item_view`: the place and the
+/// access point when the daemon has them, and an explanation rather than an
+/// apparent gap when it has neither.
+#[test]
+fn the_device_page_shows_the_access_point_and_explains_a_missing_location() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let placed = seed_device(&pool, "aa:bb:cc:00:04:01", Some("placed"), "online").await;
+        let bare = seed_device(&pool, "aa:bb:cc:00:04:02", Some("bare"), "online").await;
+        place(&pool, placed, Some("Studio"), Some("Studio AP")).await;
+        place(&pool, bare, None, None).await;
+        run_cron(&pool).await;
+
+        let view = |device: i64| {
+            let pool = pool.clone();
+            async move {
+                let (item_id, _) = link_of(&pool, device).await;
+                let item = item_json(&pool, item_id.unwrap()).await;
+                let results = dispatcher()
+                    .dispatch("tap_item_view", &item.to_string(), background(&pool))
+                    .await;
+                serde_json::from_str::<String>(&results[0].output).unwrap()
+            }
+        };
+
+        let html = view(placed).await;
+        assert!(html.contains("<dt>Location</dt><dd>Studio</dd>"), "{html}");
+        assert!(
+            html.contains("<dt>Access point</dt><dd>Studio AP</dd>"),
+            "{html}"
+        );
+
+        let html = view(bare).await;
+        assert!(!html.contains("<dt>Location</dt>"), "{html}");
+        assert!(!html.contains("<dt>Access point</dt>"), "{html}");
+        assert!(html.contains("UniFi enrichment"), "{html}");
+    });
+}
+
 /// Wire a standalone `GatherService` with the plugin's record types admitted and
 /// the migration-seeded queries loaded, the way the running kernel wires it.
 async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {

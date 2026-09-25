@@ -394,12 +394,27 @@ async fn the_device_page_finds_its_row_by_the_item_link() {
     assert_eq!(state.mac, "aa:bb:cc:00:00:03");
     assert_eq!(state.state.as_deref(), Some("online"));
     assert_eq!(state.current_location.as_deref(), Some("living-room-ap"));
+    // No access point: the seed leaves `current_ap` null, which is what every
+    // row looks like on a daemon without UniFi enrichment.
+    assert_eq!(state.current_ap, None);
     assert_eq!(
         state.last_seen,
         Some(seen),
         "the identity block would render 'never'"
     );
     assert_eq!(state.first_seen, Some(seen - 900_000));
+
+    // And with one, the page reads it: the access point is a plain TEXT
+    // column in the daemon's DDL, so it decodes through the db host as-is.
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET current_ap = 'Studio AP' WHERE id = $1::bigint",
+        &[json!(id)],
+    )
+    .await;
+    let rows: Vec<DeviceState> =
+        query_rows(&mut conn, queries::SELECT_DEVICE_STATE, &[json!(ITEM_A)]).await;
+    assert_eq!(rows[0].current_ap.as_deref(), Some("Studio AP"));
 
     // An Item with no row behind it matches nothing rather than raising.
     let none: Vec<DeviceState> =
