@@ -267,6 +267,8 @@ own route with a `{"url_arg": …}` filter whose value is always supplied:
 | `/people/movements?day=…` | `ng_person_movements` | day, optional: an absent `url_arg` resolves to null and constrains nothing |
 | `/devices/new` | `ng_devices_new` | none (the view is the week) |
 | `/devices/location` | `ng_devices_by_location` | none (`current_location is_not_null` fixed) |
+| `/devices/todo` | `ng_devices_todo` | none (no `display_name`, no owner, not hidden) |
+| `/events/new-devices` | `ng_event_new_devices` | none (`event_type = 'new_device'` fixed) |
 
 ### Decision 7 — the tiles are gather tiles, because a tile cannot count
 

@@ -1907,6 +1907,140 @@ fn the_device_page_shows_the_access_point_and_explains_a_missing_location() {
     });
 }
 
+// ===========================================================================
+// New devices: the event record and the to-do
+// ===========================================================================
+
+/// /events/new-devices is the daemon's `new_device` events and nothing else,
+/// rendered in the ordinary event table with a menu on each row.
+#[test]
+fn the_new_device_event_page_lists_only_new_device_events() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let device = seed_device(&pool, "aa:bb:cc:00:05:01", None, "online").await;
+        for event_type in [
+            "new_device",
+            "returned",
+            "arp_scan",
+            "new_device",
+            "went_offline",
+        ] {
+            sqlx::query(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+                 VALUES ($1, $2, now())",
+            )
+            .bind(device)
+            .bind(event_type)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_event_new_devices", HashMap::new()).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r["event_type"] == "new_device"));
+
+        let html = render_page(
+            "ng_event_new_devices",
+            "New device events",
+            "/events/new-devices",
+            &rows,
+        );
+        assert!(html.contains("ng-menu__button"), "{html}");
+        assert!(html.contains("href=\"/devices/todo\""), "{html}");
+    });
+}
+
+/// **The to-do is the operator's task after a new device appears**: it lists
+/// every unhidden device with neither a typed name nor an owner, and a device
+/// leaves it the moment either is given. The rename goes through the row menu's
+/// real form, the way a person on the page would do it.
+#[test]
+fn the_todo_lists_unnamed_unowned_devices_until_somebody_names_or_assigns_them() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let owner = seed_person_item(&pool, "Jamie").await;
+
+        // Two to do: one the daemon knows nothing about, one it has guessed a
+        // name for (a guess is not a name a person gave it).
+        let bare = seed_clean_device(&pool, "02:00:5e:00:05:01", None, "online").await;
+        let guessed = seed_clean_device(&pool, "02:00:5e:00:05:02", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET resolved_name = 'jamie-phone', first_seen_at = now() - interval '1 day' WHERE id = $1")
+            .bind(guessed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Three done: named, owned, and hidden.
+        let named = seed_clean_device(&pool, "02:00:5e:00:05:03", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET display_name = 'Router' WHERE id = $1")
+            .bind(named)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_clean_device(&pool, "02:00:5e:00:05:04", Some(owner), "online").await;
+        let hidden = seed_clean_device(&pool, "02:00:5e:00:05:05", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET hidden = true WHERE id = $1")
+            .bind(hidden)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let gather = wire_gather(&pool).await;
+        let todo = |gather: Arc<GatherService>| async move {
+            gather_items(&gather, "ng_devices_todo", HashMap::new())
+                .await
+                .iter()
+                .map(|r| r["mac"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            todo(gather.clone()).await,
+            ["02:00:5e:00:05:01", "02:00:5e:00:05:02"],
+            "unnamed, unowned and unhidden, newest first"
+        );
+
+        let rows = gather_items(&gather, "ng_devices_todo", HashMap::new()).await;
+        let html = render_page("ng_devices_todo", "To do", "/devices/todo", &rows);
+        assert!(
+            html.contains("jamie-phone"),
+            "the daemon's guess is shown: {html}"
+        );
+        assert!(html.contains("/netgrasp/device/rename?"), "{html}");
+        assert!(html.contains("/netgrasp/device/owner?"), "{html}");
+
+        // Named through the row menu's form: off the list.
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_rename_save",
+            "POST",
+            FORM_RENAME,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A05%3A02&back=%2Fdevices%2Ftodo&value=Jamie%27s+phone",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(todo(gather.clone()).await, ["02:00:5e:00:05:01"]);
+
+        // Assigned: off the list, and the list is empty.
+        sqlx::query("UPDATE ng_devices SET owner_item_id = $1 WHERE id = $2")
+            .bind(owner)
+            .bind(bare)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(todo(gather.clone()).await.is_empty());
+        let html = render_page("ng_devices_todo", "To do", "/devices/todo", &[]);
+        assert!(
+            html.contains("leaves this list once it has a name or an owner"),
+            "the empty to-do does not say what empties it: {html}"
+        );
+    });
+}
+
 /// Wire a standalone `GatherService` with the plugin's record types admitted and
 /// the migration-seeded queries loaded, the way the running kernel wires it.
 async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {
