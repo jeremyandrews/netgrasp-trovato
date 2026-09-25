@@ -1,0 +1,24 @@
+{#
+    Who is home, as people. /people/home
+
+    One card per person the daemon counts as home, with the time they arrived.
+    /who-is-home is the device-shaped version of the same question and says
+    which devices make somebody home; this is the daemon's own answer, from
+    ng_people, which is the one that knows since when.
+
+    The cards are gather/netgrasp/people-home.html, which the overview shares.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block results %}
+{% set ng_people = rows %}
+{% include "gather/netgrasp/people-home.html" %}
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    A person is home when any device they own is online, so nobody here can also
+    mean nobody's devices have an owner yet. <a href="/people">People</a>,
+    <a href="/overview">overview</a>.
+</span>
+{% endblock %}

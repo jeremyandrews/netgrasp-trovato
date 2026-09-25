@@ -2,7 +2,7 @@
 #
 #   docker compose -f docker-compose.demo.yml up
 #
-# then open http://localhost:3101/, which redirects to /devices/online.
+# then open http://localhost:3101/, which redirects to /overview.
 #
 # WHAT THIS IS
 # Every other way of running netgrasp needs something: a Trovato checkout built
@@ -187,7 +187,7 @@ services:
   # scripts/serve-demo.sh runs against a source checkout, so the two ways of
   # serving this repository cannot drift into one of them being broken.
   #
-  # It finishes by asking for /devices/online and failing on anything but a 200,
+  # It finishes by asking for /overview and failing on anything but a 200,
   # which is the one check the health check cannot make: a 303 to /install is a
   # healthy response. When this container exits 0 the demo is genuinely up.
   installer:

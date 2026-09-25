@@ -1,0 +1,105 @@
+{#
+    Devices first seen in the last seven days. Shared by /devices/new and the
+    overview.
+
+    The caller sets `ng_devices` to a list of `ng_device_new` rows, keyed by the
+    columns of the `ng_devices_new` view.
+
+    Not device-table.html, because the question is different. The device table
+    answers "what is on the network and is it up"; this one answers "what is
+    this thing that just appeared", so it leads with what the daemon's
+    fingerprinting decided (the type, and how sure it is), what OS and vendor it
+    saw, and when it first showed up. The row menu is the same menu, because
+    what somebody does next with a new device is exactly what it offers: name
+    it, give it an owner, hide it.
+
+    `device_type_confidence` is a REAL between 0 and 1. It is printed as a whole
+    percentage, and only beside a type: a confidence with no verdict attached
+    is a number about nothing.
+#}
+<div class="ng-table-scroll">
+    <table class="ng-table ng-device-table ng-new-device-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Looks like</th>
+                <th>OS</th>
+                <th>Vendor</th>
+                <th>IP</th>
+                <th>MAC</th>
+                <th>Owner</th>
+                <th>First seen</th>
+                <th><span class="ng-visually-hidden">Actions</span></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in ng_devices %}
+            <tr data-id="{{ row.id }}">
+                <td class="ng-name">
+                    {%- if row.trovato_item_id %}<a href="/item/{{ row.trovato_item_id }}">{% endif -%}
+                    {%- if row.display_name %}{{ row.display_name }}
+                    {%- elif row.resolved_name %}{{ row.resolved_name }}
+                    {%- elif row.hostname %}{{ row.hostname }}
+                    {%- else %}<span class="ng-muted">Unnamed</span>{% endif -%}
+                    {%- if row.trovato_item_id %}</a>{% endif -%}
+                </td>
+
+                <td>
+                    {%- if row.device_type -%}
+                    <a href="/devices/type?device_type={{ row.device_type | urlencode }}">{{ row.device_type }}</a>
+                    {%- if row.device_type_confidence %}
+                    <span class="ng-confidence" title="How sure the daemon's fingerprinting is">
+                        {%- set ng_pct = row.device_type_confidence * 100 -%}
+                        {{ ng_pct | round | int }}%
+                    </span>
+                    {%- endif -%}
+                    {%- else -%}<span class="ng-muted">Not yet identified</span>{%- endif -%}
+                </td>
+
+                <td>
+                    {%- if row.os_family %}{{ row.os_family }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                </td>
+
+                <td>
+                    {%- if row.vendor %}{{ row.vendor }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                </td>
+
+                <td class="ng-mono">
+                    {%- if row.last_ip %}{{ row.last_ip }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
+                </td>
+
+                <td class="ng-mono">{{ row.mac }}</td>
+
+                <td>
+                    {%- if row.owner_name -%}
+                    <a href="/devices/owner?owner={{ row.owner_item_id }}">{{ row.owner_name }}</a>
+                    {%- elif row.owner_item_id -%}
+                    <a class="ng-id-chip" href="/devices/owner?owner={{ row.owner_item_id }}"
+                       title="Person {{ row.owner_item_id }} has no mirror row">{{ row.owner_item_id | split(pat="-") | last }}</a>
+                    {%- else -%}<span class="ng-muted">Nobody yet</span>{%- endif -%}
+                </td>
+
+                <td class="ng-mono ng-nowrap" {% if row.first_seen_at_epoch %}data-ng-epoch="{{ row.first_seen_at_epoch }}"{% endif %}>
+                    {%- if row.first_seen_at_epoch -%}
+                    {{ row.first_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+
+                {# The row menu, told what the row is exactly as device-table.html
+                   tells it; that file explains each line. #}
+                <td class="ng-actions">
+                    {% set ng_row_kind = "device" %}
+                    {% set ng_row_ref = row.mac %}
+                    {% set ng_row_item = row.trovato_item_id %}
+                    {% set ng_row_label = row.mac %}
+                    {% set ng_row_flags = true %}
+                    {% set ng_row_hidden = row.hidden %}
+                    {% set ng_row_notify = row.notify %}
+                    {% set ng_row_id = "new-" ~ row.id %}
+                    {% include "gather/netgrasp/row-actions.html" %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>

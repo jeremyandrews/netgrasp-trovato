@@ -18,8 +18,10 @@ daemon.
 docker compose -f docker-compose.demo.yml up
 ```
 
-Then open **http://localhost:3101/**, which redirects to `/devices/online`. The
-[six-entry navigation](#the-pages) reaches every page from there.
+Then open **http://localhost:3101/**, which redirects to `/overview`. The
+[seven-entry navigation](#the-pages) reaches every page from there.
+`scripts/verify-demo.sh` checks the same thing from a terminal, and CI runs it
+against this demo.
 
 The first run compiles the plugin inside a container and pulls the published
 kernel image, so it takes a few minutes. After that it is seconds. What comes up:
@@ -255,7 +257,11 @@ without being copied into the image.
 
 | URL | What it is |
 |---|---|
-| `/` | redirects to `/devices/online` |
+| `/` | redirects to `/overview` |
+| `/overview` | who is home and since when, today's arrivals and departures, devices new this week, the security event count |
+| `/people/home` | the people the daemon counts as home, with the time each arrived |
+| `/people/movements` | every arrival and departure; `?day=YYYY-MM-DD` for one day |
+| `/devices/new` | devices first seen in the last seven days, with the daemon's fingerprint and how sure it is |
 | `/devices/online` | what is on the network right now |
 | `/devices` | every device the daemon has seen |
 | `/devices/type?device_type=…` | one device type; reached by clicking a Type cell |
@@ -266,7 +272,7 @@ without being copied into the image.
 | `/events/security` | scans, spoofs, rogue DHCP, conflicts, identity changes |
 | `/events/device?device=…` | one device's events; reached by clicking a Device chip |
 
-The navigation is six `tap_menu` entries the kernel renders as the site menu.
+The navigation is seven `tap_menu` entries the kernel renders as the site menu.
 They appear because `005_netgrasp_web_interface.sql` grants
 `view netgrasp devices` to the anonymous role — the assumption being a localhost
 dashboard with no login. To put the whole thing behind a login, delete that one
@@ -386,8 +392,10 @@ scripting off.
 - `docker compose -f docker-compose.demo.yml up --build` then load the pages.
   Row counts are checkable: `scripts/seed-demo.sql` prints its own counts per
   listing when it finishes, and every listing above is a `count(*)` you can hold
-  a page against. The `installer` container fails the run if `/devices/online`
-  answers anything but 200.
+  a page against. The `installer` container fails the run if `/overview`
+  answers anything but 200, and `scripts/verify-demo.sh` then checks that `/`
+  redirects there and that the page is the overview's own template rather than
+  the kernel's column dump.
 - `scripts/serve-demo.sh <trovato> --seed --bg` for the same thing against a
   Trovato source checkout, which is the path to use when the kernel is what you
   are changing.

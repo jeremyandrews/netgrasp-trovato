@@ -1,0 +1,16 @@
+{#
+    Devices first seen in the last seven days. /devices/new
+
+    The table is gather/netgrasp/new-device-table.html, which the overview
+    shares; its comment says why this is not the ordinary device table.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block results %}
+{% set ng_devices = rows %}
+{% include "gather/netgrasp/new-device-table.html" %}
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint"><a href="/devices">All devices</a>, <a href="/overview">overview</a>.</span>
+{% endblock %}

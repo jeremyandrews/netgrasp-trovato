@@ -232,6 +232,55 @@ jobs:
           psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
             -c "select count(*) from ng_devices"
 
+      # 007 is the other migration that stands alone: views over the ng_ tables
+      # 001 creates, and nothing in a kernel table. `CREATE OR REPLACE VIEW` is
+      # its guard, so the second run must also be a no-op, and the overview view
+      # must answer with its one row on an empty database.
+      - name: The overview views apply, twice, and the overview has one row
+        env:
+          PGPASSWORD: trovato
+        run: |
+          for _ in 1 2; do
+            psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+              -f plugins/netgrasp/migrations/007_netgrasp_overview_views.sql
+          done
+          rows=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -tAc "select count(*) from ng_overview")
+          test "$rows" = "1"
+
+  # The demo, brought up exactly as the README tells a reader to, and its front
+  # page loaded. This is the only job that meets the PUBLISHED kernel image
+  # rather than the pinned kernel crate the test suite links, and the only one
+  # that goes through the kernel's own gather route and theme: a template that
+  # raises there is not an error but a 200 carrying the kernel's column dump, so
+  # scripts/verify-demo.sh checks for the overview's own markup, not a status.
+  verify-demo:
+    name: verify-demo (the front page loads)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring the demo up
+        run: docker compose -f docker-compose.demo.yml up -d --build
+
+      # The installer is the last one-shot: it runs after the seed and exits 0
+      # only once /overview answers 200. `wait` blocks until it stops; what it
+      # prints is a sentence, not a code, so the code is read off the container.
+      - name: Wait for the first run to finish
+        run: |
+          docker compose -f docker-compose.demo.yml wait installer || true
+          code=$(docker inspect -f '{{.State.ExitCode}}' \
+            "$(docker compose -f docker-compose.demo.yml ps -aq installer)")
+          echo "installer exited $code"
+          test "$code" = "0"
+
+      - name: verify-demo
+        run: scripts/verify-demo.sh http://127.0.0.1:3101
+
+      - name: The demo's logs
+        if: failure()
+        run: docker compose -f docker-compose.demo.yml logs --no-color --tail 200
+
   shell:
     name: shellcheck
     runs-on: ubuntu-latest

@@ -372,6 +372,10 @@ fn the_record_types_are_admitted_and_do_not_collide_with_the_item_types() {
             "ng_location",
             "ng_ip_history",
             "ng_person_mirror",
+            "ng_person_presence",
+            "ng_person_movement",
+            "ng_device_new",
+            "ng_overview",
         ] {
             assert!(registry.contains(name), "{name} was not admitted");
         }
@@ -398,6 +402,10 @@ fn every_ng_table_is_inside_the_plugins_effective_db_allowlist() {
             "ng_location_history",
             "ng_ip_history",
             "ng_state",
+            "ng_people_presence",
+            "ng_person_movements",
+            "ng_devices_new",
+            "ng_overview",
         ] {
             assert!(
                 policy.check_table(table).is_ok(),
@@ -1237,6 +1245,513 @@ fn the_by_owner_facet_route_filters_on_its_url_argument() {
             run_gather(&gather, &pool, "ng_device_by_owner", args).await,
             1
         );
+    });
+}
+
+// ===========================================================================
+// The overview
+// ===========================================================================
+
+/// Seed the house the overview tests read: three people, two of them home; a
+/// day of arrivals and departures with yesterday's behind it; devices old, new
+/// and hidden; and security events inside and outside the last day.
+///
+/// "Today" is the database's calendar day, so today's rows are placed just after
+/// its midnight rather than a few minutes before now: a test that ran at 00:02
+/// would otherwise seed half of "today" into yesterday.
+async fn seed_house(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+    let jamie = Uuid::now_v7();
+    let aurora = Uuid::now_v7();
+    let arlo = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO ng_people (item_id, name, state, current_location, last_arrived_at, last_departed_at) VALUES \
+            ($1, 'Jamie',  'home', 'Studio', date_trunc('day', now()) + interval '10 seconds', NULL), \
+            ($2, 'Aurora', 'home', NULL,     date_trunc('day', now()) + interval '5 seconds',  NULL), \
+            ($3, 'Arlo',   'away', NULL,     now() - interval '3 days', date_trunc('day', now()) + interval '20 seconds')",
+    )
+    .bind(jamie)
+    .bind(aurora)
+    .bind(arlo)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Jamie's phone: old, online, owned. The device the movements name.
+    let phone = seed_device(pool, "aa:bb:cc:00:01:01", Some("jamie-phone"), "online").await;
+    // A device first seen a year ago, and one first seen yesterday that is
+    // hidden: neither is "new" on the page.
+    let old = seed_device(pool, "aa:bb:cc:00:01:02", Some("old-nas"), "online").await;
+    let hidden = seed_device(pool, "aa:bb:cc:00:01:03", Some("hidden-new"), "online").await;
+    // Two genuinely new ones, one of which the daemon has identified.
+    let fresh = seed_device(pool, "aa:bb:cc:00:01:04", None, "online").await;
+    let unknown = seed_device(pool, "aa:bb:cc:00:01:05", None, "offline").await;
+    sqlx::query(
+        "UPDATE ng_devices SET owner_item_id = $1, first_seen_at = now() - interval '300 days' WHERE id = $2",
+    )
+    .bind(jamie)
+    .bind(phone)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ng_devices SET first_seen_at = now() - interval '400 days' WHERE id = $1")
+        .bind(old)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ng_devices SET hidden = true, first_seen_at = now() - interval '1 day' WHERE id = $1",
+    )
+    .bind(hidden)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ng_devices SET device_type = 'phone', device_type_confidence = 0.92, \
+             first_seen_at = now() - interval '2 hours' WHERE id = $1",
+    )
+    .bind(fresh)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ng_devices SET device_type = NULL, device_type_confidence = NULL, os_family = NULL, \
+             vendor = NULL, first_seen_at = now() - interval '6 days' WHERE id = $1",
+    )
+    .bind(unknown)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Movements, written the way the daemon writes them (src/people/mod.rs):
+    // the person's name and item id and the device in `details`.
+    for (event_type, person, name, at, details) in [
+        // Yesterday's departure: not on today's list.
+        (
+            "person_departed",
+            jamie,
+            "Jamie",
+            "date_trunc('day', now()) - interval '2 hours'",
+            r#"{"via": "Driveway"}"#,
+        ),
+        // Today, deliberately inserted out of order.
+        (
+            "person_arrived",
+            jamie,
+            "Jamie",
+            "date_trunc('day', now()) + interval '10 seconds'",
+            r#"{"location": "Studio", "via": "Driveway"}"#,
+        ),
+        (
+            "person_arrived",
+            aurora,
+            "Aurora",
+            "date_trunc('day', now()) + interval '5 seconds'",
+            r#"{"location": null, "via": null}"#,
+        ),
+        (
+            "person_departed",
+            arlo,
+            "Arlo",
+            "date_trunc('day', now()) + interval '20 seconds'",
+            r#"{"via": "Gate"}"#,
+        ),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+             VALUES ($1, $2, {at}, $3::jsonb || jsonb_build_object('person', $4::text, 'person_item_id', $5::text, 'device', 'aa:bb:cc:00:01:01'))"
+        ))
+        .bind(phone)
+        .bind(event_type)
+        .bind(details)
+        .bind(name)
+        .bind(person.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // Security: two in the last day, one a week ago, and an ordinary event that
+    // is not security at all.
+    for (event_type, ago) in [
+        ("arp_spoof", "1 hour"),
+        ("ip_conflict", "2 hours"),
+        ("arp_scan", "7 days"),
+        ("name_updated", "1 hour"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+             VALUES ($1, $2, now() - interval '{ago}')"
+        ))
+        .bind(fresh)
+        .bind(event_type)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    (jamie, aurora, arlo)
+}
+
+/// Render a gather's page template the way the kernel's gather route does:
+/// the template the query id suggests, in the context
+/// `render_gather_with_theme` builds (`crates/kernel/src/routes/gather.rs`),
+/// from a result the real `GatherService` returned.
+///
+/// The kernel's own render falls back to a dump of every column when the
+/// template raises, and the page still returns 200; so a template error is only
+/// ever visible to something that renders the template itself.
+fn render_page(query_id: &str, label: &str, base_path: &str, rows: &[serde_json::Value]) -> String {
+    let dir = plugin_source_dir().join("../../templates/**/*.html");
+    let tera = tera::Tera::new(&dir.to_string_lossy()).expect("the templates parse");
+    let mut context = tera::Context::new();
+    context.insert(
+        "query",
+        &serde_json::json!({"query_id": query_id, "label": label}),
+    );
+    context.insert("rows", rows);
+    context.insert("total", &rows.len());
+    context.insert("page", &1);
+    context.insert("per_page", &50);
+    context.insert("total_pages", &1);
+    context.insert("has_next", &false);
+    context.insert("has_prev", &false);
+    context.insert("base_path", base_path);
+    context.insert("exposed_filters", &serde_json::json!([]));
+    context.insert("filter_values", &serde_json::json!({}));
+    tera.render(&format!("gather/query--{query_id}.html"), &context)
+        .unwrap_or_else(|e| panic!("{query_id} failed to render: {e:#?}"))
+}
+
+/// Every view the overview's record types are declared over carries every
+/// column the record type maps.
+///
+/// Asked of Postgres rather than of the migration's text: a field map naming a
+/// column the view does not have is admitted by the kernel and then fails the
+/// first gather that filters or sorts on it, with a SQL error on a page that
+/// looked fine in review.
+#[test]
+fn every_overview_view_carries_every_column_its_record_type_maps() {
+    serial(async {
+        let pool = fresh_pool().await;
+        let compiled = dispatcher().runtime().get_plugin(PLUGIN).unwrap();
+        let mut checked = 0;
+        for record_type in &compiled.info.record_types {
+            if ![
+                "ng_person_presence",
+                "ng_person_movement",
+                "ng_device_new",
+                "ng_overview",
+            ]
+            .contains(&record_type.name.as_str())
+            {
+                continue;
+            }
+            let columns: HashSet<String> = sqlx::query_scalar(
+                "SELECT column_name::text FROM information_schema.columns WHERE table_name = $1",
+            )
+            .bind(&record_type.table)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+            assert!(!columns.is_empty(), "{} does not exist", record_type.table);
+            for column in record_type.fields.values().chain([
+                &record_type.id_column,
+                &record_type.title_column,
+                &record_type.created_column,
+                &record_type.changed_column,
+            ]) {
+                assert!(
+                    columns.contains(column.as_str()),
+                    "{} maps {column}, which {} does not have",
+                    record_type.name,
+                    record_type.table
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "not every overview record type was checked");
+    });
+}
+
+/// An include's name is the key its rows land under on the parent row, and the
+/// kernel inserts it over whatever was there. An include named after one of the
+/// overview's columns would replace a count with a list.
+#[test]
+fn no_overview_include_is_named_after_a_column_it_would_overwrite() {
+    serial(async {
+        let pool = fresh_pool().await;
+        let includes: serde_json::Value = sqlx::query_scalar(
+            "SELECT definition -> 'includes' FROM gather_query WHERE query_id = 'ng_overview'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let columns: HashSet<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns WHERE table_name = 'ng_overview'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        let names: Vec<&String> = includes.as_object().unwrap().keys().collect();
+        assert_eq!(names.len(), 3, "{includes}");
+        for name in names {
+            assert!(
+                !columns.contains(name),
+                "the include {name} would overwrite the overview's {name} column"
+            );
+        }
+    });
+}
+
+/// Each list on the overview is also a page of its own, and the two copies of
+/// its definition must agree: same record type, and the same filters apart from
+/// the one the include's join supplies. The sorts are allowed to differ, and
+/// only where 008 says they do.
+#[test]
+fn each_overview_list_agrees_with_the_page_it_links_to() {
+    serial(async {
+        let pool = fresh_pool().await;
+        let definition = |query_id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT definition FROM gather_query WHERE query_id = $1",
+                )
+                .bind(query_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let overview = definition("ng_overview").await;
+        for (include, standalone, same_sort) in [
+            ("home", "ng_people_home", true),
+            ("movements", "ng_person_movements", false),
+            ("new_devices", "ng_devices_new", true),
+        ] {
+            let inc = &overview["includes"][include];
+            let child = &inc["definition"];
+            let page = definition(standalone).await;
+            assert_eq!(child["record_type"], page["record_type"], "{include}");
+
+            let join = inc["child_field"].as_str().unwrap();
+            let without_join = |filters: &serde_json::Value| -> Vec<serde_json::Value> {
+                filters
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| f["field"] != join)
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                without_join(&child["filters"]),
+                without_join(&page["filters"]),
+                "the overview's {include} and {standalone} filter differently"
+            );
+            if same_sort {
+                assert_eq!(child["sorts"], page["sorts"], "{include}");
+            } else {
+                assert_ne!(child["sorts"], page["sorts"], "{include}");
+            }
+        }
+    });
+}
+
+/// **The overview gather, end to end**: one row, the right counts, each list
+/// holding exactly its rows in its order, and the page rendering all of it.
+#[test]
+fn the_overview_counts_and_lists_what_the_house_is_doing_today() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        assert_eq!(rows.len(), 1, "the overview is one row: {rows:?}");
+        let ov = &rows[0];
+
+        assert_eq!(ov["people_home"], 2, "{ov}");
+        assert_eq!(ov["people_total"], 3, "{ov}");
+        assert_eq!(
+            ov["devices_new"], 2,
+            "hidden and year-old devices are not new: {ov}"
+        );
+        assert_eq!(ov["movements_today"], 3, "{ov}");
+        assert_eq!(
+            ov["security_events"], 3,
+            "a non-security event was counted: {ov}"
+        );
+        assert_eq!(ov["security_events_24h"], 2, "{ov}");
+
+        // The includes: attached, filled, and in the order the page promises.
+        let names = |list: &serde_json::Value, key: &str| -> Vec<String> {
+            list.as_array()
+                .unwrap_or_else(|| panic!("the include is not a list: {list}"))
+                .iter()
+                .map(|r| r[key].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&ov["home"], "name"),
+            ["Aurora", "Jamie"],
+            "home is everyone home, earliest arrival first"
+        );
+        assert_eq!(
+            names(&ov["movements"], "person_name"),
+            ["Aurora", "Jamie", "Arlo"],
+            "today's movements, oldest first, and not yesterday's"
+        );
+        assert_eq!(
+            names(&ov["new_devices"], "mac"),
+            ["aa:bb:cc:00:01:04", "aa:bb:cc:00:01:05"],
+            "new devices, newest first, without the hidden one"
+        );
+        // The arrival time reached the row as an integer, which is the one
+        // thing ng_people could not give it.
+        assert!(ov["home"][0]["last_arrived_at_epoch"].is_i64(), "{ov}");
+
+        let html = render_page("ng_overview", "Overview", "/overview", &rows);
+        for expected in [
+            "Aurora",
+            "Home since",
+            "via Driveway",
+            "via Gate",
+            "Left",
+            "92%",
+            "Not yet identified",
+            "aa:bb:cc:00:01:05",
+            "ng-menu__button",
+            "href=\"/events/security\"",
+            "ng-stat--alert",
+        ] {
+            assert!(
+                html.contains(expected),
+                "the overview lost {expected:?}: {html}"
+            );
+        }
+    });
+}
+
+/// The overview's three listings as pages of their own, and each page rendered.
+#[test]
+fn the_overviews_listings_are_pages_that_filter_and_render_on_their_own() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let gather = wire_gather(&pool).await;
+
+        let home = gather_items(&gather, "ng_people_home", HashMap::new()).await;
+        assert_eq!(home.len(), 2, "only the people who are home: {home:?}");
+        assert!(render_page("ng_people_home", "Home now", "/people/home", &home).contains("Jamie"));
+
+        // The whole log, newest first, and one day of it by URL argument.
+        let all = gather_items(&gather, "ng_person_movements", HashMap::new()).await;
+        assert_eq!(
+            all.len(),
+            4,
+            "every movement, yesterday's included: {all:?}"
+        );
+        assert_eq!(all[0]["person_name"], "Arlo", "newest first");
+        let today: String = sqlx::query_scalar("SELECT to_char(now(), 'YYYY-MM-DD')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let one_day = gather_items(
+            &gather,
+            "ng_person_movements",
+            HashMap::from([("day".to_string(), today)]),
+        )
+        .await;
+        assert_eq!(one_day.len(), 3, "?day= keeps only that day: {one_day:?}");
+        let html = render_page(
+            "ng_person_movements",
+            "Arrivals and departures",
+            "/people/movements",
+            &all,
+        );
+        assert!(html.contains("Arrived") && html.contains("Left"), "{html}");
+
+        let new = gather_items(&gather, "ng_devices_new", HashMap::new()).await;
+        assert_eq!(new.len(), 2, "{new:?}");
+        assert!(
+            render_page("ng_devices_new", "New this week", "/devices/new", &new).contains("92%")
+        );
+    });
+}
+
+/// A quiet house: nobody, nothing, no events. The overview is still one row,
+/// with zeroes and three empty lists rather than missing keys, and the page
+/// renders its empty states.
+#[test]
+fn an_empty_house_still_has_an_overview() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        assert_eq!(rows.len(), 1);
+        for list in ["home", "movements", "new_devices"] {
+            assert_eq!(rows[0][list], serde_json::json!([]), "{list}: {}", rows[0]);
+        }
+        let html = render_page("ng_overview", "Overview", "/overview", &rows);
+        assert!(html.contains("Nobody is home."), "{html}");
+        assert!(!html.contains("ng-stat--alert"), "{html}");
+    });
+}
+
+/// The front page moves to the overview from the old default, and from nothing,
+/// and from nowhere else.
+#[test]
+fn the_front_page_moves_to_the_overview_only_from_the_old_default() {
+    serial(async {
+        let pool = fresh_pool().await;
+        let migration = std::fs::read_to_string(
+            plugin_source_dir().join("migrations/008_netgrasp_overview.sql"),
+        )
+        .unwrap();
+        let front = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT value FROM site_config WHERE key = 'site_front_page'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        };
+
+        for (before, after) in [
+            (Some("/devices/online"), "/overview"),
+            (None, "/overview"),
+            (
+                Some("/somewhere-the-operator-chose"),
+                "/somewhere-the-operator-chose",
+            ),
+        ] {
+            sqlx::query("DELETE FROM site_config WHERE key = 'site_front_page'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if let Some(path) = before {
+                sqlx::query(
+                    "INSERT INTO site_config (key, value, updated) VALUES ('site_front_page', $1, NOW())",
+                )
+                .bind(serde_json::json!(path))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+            assert_eq!(
+                front(pool.clone()).await,
+                Some(serde_json::json!(after)),
+                "front page {before:?} became the wrong thing"
+            );
+        }
     });
 }
 

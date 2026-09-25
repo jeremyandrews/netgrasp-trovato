@@ -691,3 +691,121 @@
         border-color: #475569;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * The overview
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Four figures across the top, each a link to the page whose total it is. A
+ * grid that wraps rather than a row that scrolls: on a phone the four stack two
+ * by two, and nothing about them needs to be side by side to be read.
+ */
+.ng-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: 0.75rem;
+    margin: 0 0 1.5rem 0;
+}
+
+.ng-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.85rem 1rem;
+    background: var(--ng-surface);
+    border: 1px solid var(--ng-border);
+    border-radius: 0.5rem;
+    color: inherit;
+    text-decoration: none;
+}
+
+.ng-stat:hover {
+    background: var(--ng-hover);
+}
+
+.ng-stat__count {
+    font-size: 1.6rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+}
+
+.ng-stat__label {
+    color: var(--gray-500);
+    font-size: 0.85rem;
+}
+
+.ng-stat--home .ng-stat__count {
+    color: var(--success);
+}
+
+/* Something happened in the last day: the one figure on the page that is a
+   call to look, so the one with a colour that says so. */
+.ng-stat--alert {
+    box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.ng-stat--alert .ng-stat__count {
+    color: var(--danger);
+}
+
+.ng-section {
+    margin: 0 0 1.75rem 0;
+}
+
+.ng-section__title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin: 0 0 0.6rem 0;
+    font-size: 1.15rem;
+}
+
+.ng-section__more {
+    margin-inline-start: auto;
+    font-size: 0.8rem;
+    font-weight: normal;
+}
+
+/* The fingerprint's certainty, beside the type it qualifies. */
+.ng-confidence {
+    margin-inline-start: 0.35rem;
+    color: var(--gray-500);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.ng-movement {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+}
+
+.ng-movement--arrived {
+    background: #dcfce7;
+    color: #15803d;
+}
+
+.ng-movement--departed {
+    background: var(--gray-100);
+    color: var(--gray-700);
+}
+
+@media (prefers-color-scheme: dark) {
+    .ng-stat__label,
+    .ng-confidence {
+        color: #94a3b8;
+    }
+
+    .ng-movement--arrived {
+        background: #14532d;
+        color: #bbf7d0;
+    }
+
+    .ng-movement--departed {
+        background: #334155;
+        color: #cbd5e1;
+    }
+}

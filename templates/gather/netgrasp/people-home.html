@@ -1,0 +1,40 @@
+{#
+    People who are home, one card each. Shared by /people/home and the overview.
+
+    The caller sets `ng_people` to a list of `ng_person_presence` rows: flat,
+    keyed by the columns of the `ng_people_presence` view. The two times are
+    epoch twins the view computes, because ng_people carries none of its own.
+
+    A person with no `last_arrived_at_epoch` is still home: the daemon sets the
+    state and the time together, but a mirror row written before the daemon ever
+    saw that person has a state and no time. The card says "home" and no "since"
+    rather than inventing one.
+#}
+<ul class="ng-people">
+    {% for person in ng_people %}
+    <li class="ng-person">
+        <h3 class="ng-person__name">
+            <a href="/devices/owner?owner={{ person.item_id }}">
+                {%- if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif -%}
+            </a>
+        </h3>
+        <p class="ng-person__meta">
+            {%- if person.last_arrived_at_epoch -%}
+            Home since <span class="ng-mono ng-nowrap" data-ng-epoch="{{ person.last_arrived_at_epoch }}">
+                {{- person.last_arrived_at_epoch | date(format="%Y-%m-%d %H:%M") -}}
+            </span>
+            {%- else -%}
+            Home
+            {%- endif -%}
+            {%- if person.current_location %}, in {{ person.current_location }}{% endif -%}
+        </p>
+        <p class="ng-person__meta">
+            {%- if person.devices_online -%}
+            {{ person.devices_online }} device{{ person.devices_online | pluralize }} online
+            {%- else -%}
+            No device of theirs is online right now
+            {%- endif -%}
+        </p>
+    </li>
+    {% endfor %}
+</ul>

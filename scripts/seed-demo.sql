@@ -256,6 +256,37 @@ FROM (VALUES
 JOIN ng_devices d ON d.mac = v.mac;
 
 -- ---------------------------------------------------------------------------
+-- Arrivals and departures, for the overview
+-- ---------------------------------------------------------------------------
+-- The daemon's two person events, with `details` shaped the way it writes them
+-- (netgraspd, src/people/mod.rs): the person's name and item id, the device that
+-- caused it, and for an arrival where they arrived and the edge they came
+-- through. The times agree with the people rows above: Jamie home three hours,
+-- Aurora forty minutes, Arlo left this morning after a night home.
+--
+-- Arlo's departure also sets `last_departed_at`, which the people insert above
+-- leaves null, so the one person who is away has a time to be away since.
+UPDATE ng_people SET last_departed_at = NOW() - INTERVAL '5 hours'
+WHERE item_id = '5eed0000-0000-4000-8000-000000000003';
+
+INSERT INTO ng_events (device_id, event_type, "timestamp", details, notified, sync_state)
+SELECT d.id, v.event_type, NOW() - (v.ago || ' minutes')::interval,
+       jsonb_build_object(
+           'person', v.person,
+           'person_item_id', v.person_item_id,
+           'device', v.mac,
+           'location', v.location,
+           'via', v.via
+       ),
+       TRUE, 'clean'
+FROM (VALUES
+    ('02:00:5e:00:00:04', 'person_departed', 300, 'Arlo',   '5eed0000-0000-4000-8000-000000000003', NULL,          'Driveway AP'),
+    ('02:00:5e:00:00:02', 'person_arrived',  180, 'Jamie',  '5eed0000-0000-4000-8000-000000000001', 'Studio',      'Driveway AP'),
+    ('02:00:5e:00:00:0a', 'person_arrived',   40, 'Aurora', '5eed0000-0000-4000-8000-000000000002', 'Living room', NULL)
+) AS v(mac, event_type, ago, person, person_item_id, location, via)
+JOIN ng_devices d ON d.mac = v.mac;
+
+-- ---------------------------------------------------------------------------
 -- One device's history, for the device page's timelines
 -- ---------------------------------------------------------------------------
 -- Jamie's laptop, because it is the row with an Item and therefore the one whose
@@ -313,4 +344,7 @@ UNION ALL SELECT 'events',           count(*) FROM ng_events
 UNION ALL SELECT 'security events',  count(*) FROM ng_events
     WHERE event_type IN ('arp_scan', 'arp_spoof', 'gratuitous_arp', 'identity_change', 'ip_conflict', 'rogue_dhcp')
 UNION ALL SELECT 'people',           count(*) FROM item WHERE type = 'ng_person' AND status = 1
+UNION ALL SELECT 'people home',      count(*) FROM ng_people WHERE state = 'home'
+UNION ALL SELECT 'devices new this week', count(*) FROM ng_devices
+    WHERE first_seen_at > NOW() - INTERVAL '7 days' AND NOT hidden
 ORDER BY 1;
