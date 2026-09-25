@@ -1630,62 +1630,99 @@ mod tests {
         );
     }
 
+    /// The pinned release is authored in `kernel-release.toml`, and every file
+    /// that repeats it must agree.
+    ///
     /// The manifest's `api_version` must match the kernel this repo is pinned
     /// to, or the module is refused at load with a version mismatch and no page
-    /// exists to debug.
+    /// exists to debug. It is checked against the version in
+    /// `kernel-release.toml` rather than against a constant imported from the
+    /// kernel, because the SDK does not export one: Trovato's version and its
+    /// `KERNEL_API_VERSION` move in lock-step by its own versioning protocol.
     ///
-    /// Checked against the Trovato version the workspace records in
-    /// `[workspace.metadata.trovato]` rather than against a constant imported
-    /// from the kernel, because the SDK does not export one: Trovato's version
-    /// and its `KERNEL_API_VERSION` move in lock-step by its own versioning
-    /// protocol. The recorded `rev` must also be the one the dependencies pin.
-    /// So bumping the pinned `rev` without the recorded version, or the
-    /// recorded version without the manifest, fails here.
+    /// The same file's `rev` must be the one both dependency lines pin, and the
+    /// demo compose file must run the image of the same version. So bumping the
+    /// pin in one place and not another fails here, by name.
     ///
-    /// Before 1.0.0 this read `CARGO_PKG_VERSION`, because the workspace
-    /// version was the kernel's. The plugin now has a version of its own, and
-    /// the manifest's `version` must equal it.
+    /// Before 1.0.0 this read `CARGO_PKG_VERSION`, because the workspace version
+    /// was the kernel's. Then it read `[workspace.metadata.trovato]`. The plugin
+    /// now has a version of its own, the kernel's lives in `kernel-release.toml`
+    /// alone, and the manifest's `version` must equal the plugin's.
     #[test]
     fn the_manifest_declares_the_pinned_kernels_api_version() {
         let manifest = include_str!("../netgrasp.info.toml");
         let workspace = include_str!("../../../Cargo.toml");
+        let release = include_str!("../../../kernel-release.toml");
+        let compose = demo_compose();
 
-        // The table header on a line of its own: the comments above the
-        // dependencies name the table in prose too.
+        // A bare `key = "value"` from the contract file.
         let field = |key: &str| {
-            workspace
+            release
                 .lines()
                 .map(str::trim)
-                .skip_while(|line| *line != "[workspace.metadata.trovato]")
-                .skip(1)
-                .take_while(|line| !line.starts_with('['))
-                .find_map(|line| line.strip_prefix(key)?.trim().strip_prefix('='))
-                .map(|value| value.trim().trim_matches('"').to_string())
+                .find_map(|line| {
+                    line.strip_prefix(key)?
+                        .trim()
+                        .strip_prefix('=')
+                        .map(|value| value.trim().trim_matches('"').to_string())
+                })
                 .unwrap_or_default()
         };
         let kernel = field("version");
         let rev = field("rev");
         assert!(
             !kernel.is_empty() && !rev.is_empty(),
-            "Cargo.toml has no [workspace.metadata.trovato] version and rev"
+            "kernel-release.toml has no version and rev"
         );
 
+        // Both dependency lines, and nothing else, carry the rev.
         let pin = format!("rev = \"{rev}\"");
         assert_eq!(
             workspace.matches(&pin).count(),
-            3,
-            "trovato-sdk, trovato-kernel and [workspace.metadata.trovato] must all name {rev}"
+            2,
+            "trovato-sdk and trovato-kernel must both name {rev} from kernel-release.toml"
         );
 
         let mut parts = kernel.split('.');
         let major = parts.next().unwrap_or_default();
         let minor = parts.next().unwrap_or_default();
+
         let expected = format!("api_version = \"{major}.{minor}\"");
         assert!(
             manifest.contains(&expected),
-            "manifest does not declare {expected} for Trovato {kernel}"
+            "manifest does not declare {expected} for Trovato {kernel}; \
+             run scripts/sync-kernel-release.sh"
         );
 
+        let image = format!("image: ghcr.io/jeremyandrews/trovato:{kernel}");
+        assert!(
+            compose.contains(&image),
+            "docker-compose.demo.yml does not run `{image}`; \
+             run scripts/sync-kernel-release.sh"
+        );
+
+        // The generated block in the README states the same pin.
+        let readme = include_str!("../../../README.md");
+        let block = readme
+            .split_once("<!-- kernel-release:begin -->")
+            .and_then(|(_, rest)| rest.split_once("<!-- kernel-release:end -->"))
+            .map(|(block, _)| block)
+            .unwrap_or_default();
+        for needed in [
+            rev.clone(),
+            kernel.clone(),
+            format!("({major}, {minor})"),
+            format!("ghcr.io/jeremyandrews/trovato:{kernel}"),
+        ] {
+            assert!(
+                block.contains(&needed),
+                "the generated README block does not name `{needed}`; \
+                 run scripts/sync-kernel-release.sh"
+            );
+        }
+
+        // The plugin's own version is a separate fact, and the script must not
+        // have touched it.
         let own = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
         assert!(
             manifest.lines().any(|line| line.trim() == own),
@@ -2039,12 +2076,12 @@ mod tests {
     /// The kernel the demo runs is a PINNED published release, and the manifest
     /// must be loadable by it.
     ///
-    /// The kernel's rule (`PluginInfo::check_api_compatibility`) is plugin major
-    /// == kernel major and plugin minor <= kernel minor, so this repository's
-    /// `0.99` manifest runs unchanged on a `0.101` kernel. That is a fact worth
-    /// pinning rather than rediscovering: the sibling test above ties
-    /// `api_version` to the Trovato version the workspace pins, and without this
-    /// one nothing says the released kernel in the demo can still load it.
+    /// The kernel.s rule (`PluginInfo::check_api_compatibility`) is plugin major
+    /// == kernel major and plugin minor <= kernel minor, so a manifest runs
+    /// unchanged on any later `0.x` kernel. That is a fact worth pinning rather
+    /// than rediscovering: the sibling test above ties `api_version` and the
+    /// demo image to the release authored in `kernel-release.toml`, and without
+    /// this one nothing says the released kernel in the demo can still load it.
     ///
     /// `latest` is rejected on purpose. A demo whose kernel changes underneath
     /// it is a demo that breaks with no commit to blame.
