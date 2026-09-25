@@ -18,7 +18,11 @@
 # which docker-compose.demo.yml copies into a named volume and mounts read-only
 # into the released kernel.
 
-FROM rust:1-bookworm AS build
+# The module is wasm, which is the same bytes on every architecture, so the
+# compiler always runs natively on the builder and only the tiny final stages
+# are per-platform. A multi-arch build that emulated cargo under QEMU would take
+# an hour to produce identical output.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
 
 WORKDIR /src
 
@@ -29,7 +33,26 @@ COPY . .
 
 RUN scripts/build-overlay.sh
 
+# ---- The published image: all three search-path directories ----
+# ghcr.io/jeremyandrews/netgrasp-trovato, built by .github/workflows/image.yml
+# with `--target published`. It carries the whole overlay laid out as the
+# three directories Trovato's search paths take, so a deployment with no
+# checkout (a Kubernetes init container, say) copies /netgrasp and appends:
+#
+#   PLUGINS_DIR    ...:/netgrasp/plugins
+#   TEMPLATES_DIR  ...:/netgrasp/templates
+#   STATIC_DIR     ...:/netgrasp/static
+#
+# busybox rather than scratch so that copy needs nothing but this image.
+FROM busybox:1.37 AS published
+
+COPY --from=build /src/overlay/plugins /netgrasp/plugins
+COPY templates /netgrasp/templates
+COPY static /netgrasp/static
+
 # ---- The artifact, and nothing else ----
+# The demo's stage, and the default target because it is last. The demo mounts
+# templates/ and static/ from the checkout so an edit shows without a rebuild.
 FROM busybox:1.37
 
 # One directory: netgrasp.wasm, netgrasp.info.toml, migrations/. The layout the
