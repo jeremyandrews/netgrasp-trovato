@@ -1,0 +1,19 @@
+# The Trovato release this repository pins, and the only place it is authored.
+# Everything else that names the release is written from here by
+# scripts/sync-kernel-release.sh and checked by the test suite.
+#
+# Derived: the tag is "v" plus version, api_version in the plugin manifest is the
+# major and minor of version, KERNEL_API_VERSION is those two as a pair, and the
+# demo image is ghcr.io/jeremyandrews/trovato: plus version. The rev is written
+# onto both dependency lines, trovato-sdk and the trovato-kernel dev dependency,
+# which cargo requires as literals and which must stay equal: a plugin compiled
+# against one kernel revision and tested against another is testing nothing.
+#
+# This is NOT the plugin's own version. That is [workspace.package] version in
+# Cargo.toml, it is semantic from 1.0.0 on, and it moves independently.
+#
+# To move the pin: scripts/sync-kernel-release.sh --set-version X.Y.Z, which
+# resolves the tag to its commit and rewrites every location. Then rebuild for
+# wasm32-wasip1 and reinstall against a kernel built from the same revision.
+version = "0.102.0"
+rev = "ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74"

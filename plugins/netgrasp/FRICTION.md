@@ -13,9 +13,10 @@ decidable post-1.0 ledger item. **NEW** findings were surfaced by this build;
 **RESIDUAL** ones are re-confirmed from this consumer's side. No-friction findings
 are last, as required.
 
-Verified at `KERNEL_API_VERSION (1,0)` (`crates/kernel/src/plugin/mod.rs:51`)
-with **no kernel, WIT, SDK or kernel-migration change** in the build session. The
-design decisions these findings forced are argued in `DESIGN.md`.
+Verified against the kernel API this repository pins, `(0, 102)`
+(`crates/kernel/src/plugin/mod.rs`), with **no kernel, WIT, SDK or
+kernel-migration change** in the build session. The design decisions these
+findings forced are argued in `DESIGN.md`.
 
 Seven findings are grouped under their own heading below: they were met during
 the first joint run of the daemon and the plugin against a live LAN

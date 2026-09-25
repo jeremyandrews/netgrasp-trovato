@@ -3,7 +3,8 @@
 The scope for this build (TROVATO-CLOSE A7 / NETGRASP 03) carries three
 assumptions about the frozen kernel that turn out not to hold. Each of them was
 load-bearing for a data-model choice, so this document records what the kernel
-actually does, checked at `KERNEL_API_VERSION (1,0)`, and what follows.
+actually does, checked against the kernel API this repository pins, `(0, 102)`,
+and what follows.
 
 The pattern being followed is the one CLOSE 09/A1/A5 landed for Argus: an
 in-repo pure WASM plugin (`plugins/netgrasp`) over a host-agnostic core crate

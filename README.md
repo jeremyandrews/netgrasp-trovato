@@ -28,7 +28,7 @@ kernel image, so it takes a few minutes. After that it is seconds. What comes up
 
 | | |
 |---|---|
-| kernel | `ghcr.io/jeremyandrews/trovato:0.101.0`, the published image, unmodified |
+| kernel | the published image, unmodified, at the version in `kernel-release.toml` |
 | netgrasp | the plugin, the templates and the assets, mounted read-only on the three search paths |
 | rows | `scripts/seed-demo.sql`: 13 devices, 3 people, 19 events, 6 of them security |
 | clock | a container POSTing `/cron/<CRON_KEY>` every 60 seconds, because the kernel runs no scheduler |
@@ -124,28 +124,35 @@ nothing.
 
 ### Which Trovato revision this builds against
 
-The pin is a commit, not a branch. The triple that moves together, recorded in
-the workspace `Cargo.toml` next to the dependency and again, as data, in
-`[workspace.metadata.trovato]`:
+The pin is a commit, not a branch, and it is authored in one place:
+`kernel-release.toml` at the repository root. Everything below is generated from
+it by `scripts/sync-kernel-release.sh`, and `cargo test` fails by name if any
+copy drifts.
 
+<!-- kernel-release:begin -->
 | | |
 |---|---|
 | pinned `rev` | `ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74` |
 | Trovato version | 0.102.0 |
 | `KERNEL_API_VERSION` | (0, 102) |
+| manifest `api_version` | `0.102` |
+| demo kernel image | `ghcr.io/jeremyandrews/trovato:0.102.0` |
+<!-- kernel-release:end -->
 
-`api_version` in `plugins/netgrasp/netgrasp.info.toml` tracks that kernel API
-version, and a test asserts the pair has not drifted. The bump protocol is in the
-`Cargo.toml` comment. The plugin's own `version` is separate and is not the
-kernel's.
+`api_version` is not chosen: it is the pinned version's major and minor, so it
+cannot disagree with the kernel it is built against. The plugin's own `version`
+is separate and is not the kernel's. To move the pin, run
+`scripts/sync-kernel-release.sh --set-version X.Y.Z`, which resolves the tag to
+its commit and rewrites every location.
 
 ### And which Trovato release it runs on
 
 A different question, with a different answer. The kernel's compatibility rule
 (`PluginInfo::check_api_compatibility`) is **plugin major equal, plugin minor at
-or below the kernel's**, so a module declaring `0.102` loads on any `0.x` kernel
-from 0.102 up. The demo runs the published `0.102.0` image, and a test pins that
-pair so bumping the image cannot quietly outrun what the manifest claims.
+or below the kernel's**, so the module loads on its own kernel minor and on any
+later `0.x`. The demo runs the published image named in the table above, and a
+test pins that pair so bumping the image cannot quietly outrun what the manifest
+claims.
 
 What a newer kernel does *not* buy the plugin is host functions that did not
 exist when it was built. Nothing here needs one, which is why the demo needs no
@@ -258,9 +265,9 @@ the search path made that harmless: the kernel logged `plugin name found in more
 than one plugins directory; the later directory on the search path wins`, naming
 both. That is over. Trovato removed its copy when netgrasp was extracted, so
 neither the source tree nor the published image carries one, and the overlay is
-the only netgrasp the kernel discovers. Verified against
-`ghcr.io/jeremyandrews/trovato:0.101.0`, whose `/app/plugins` holds 38 plugin
-directories and no `netgrasp`.
+the only netgrasp the kernel discovers. Verified against the
+published kernel image this repository pins, whose `/app/plugins` holds 38
+plugin directories and no `netgrasp`.
 
 The precedence still matters for the other two paths, and it is still the reason
 they are search paths: `TEMPLATES_DIR` is how a netgrasp template could override
