@@ -1357,6 +1357,380 @@ impl PresenceWindowFacts {
     }
 }
 
+// =============================================================================
+// The overview's questions: who came and went, and what is new
+// =============================================================================
+
+/// How many movements one `arrivals_and_departures` answer reads at most. A
+/// household's day is a handful; the cap is a fence, not an expectation.
+pub const MAX_MOVEMENT_ROWS: i64 = 200;
+
+/// How many devices one `new_devices` answer reads at most.
+pub const MAX_NEW_DEVICE_ROWS: i64 = 100;
+
+/// Parse an optional `YYYY-MM-DD` day argument.
+///
+/// `Ok(None)` when it is absent or blank, which means "today" and is resolved
+/// against the database's clock rather than here: "today" on the overview is the
+/// database's calendar day, and a tool that took the plugin's clock instead
+/// could answer about a different day than the page beside it shows.
+///
+/// A date that does not exist ("2026-02-30") is refused rather than passed on,
+/// because the view would simply match no rows and the model would report an
+/// empty day as fact.
+pub fn parse_day(arguments: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    let Some(raw) = optional_str(arguments, key)? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let refuse = || {
+        format!(
+            "'{raw}' is not a day. Pass one as YYYY-MM-DD, e.g. 2026-09-25, or leave `{key}` out for today."
+        )
+    };
+    let parts: Vec<&str> = raw.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return Err(refuse());
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return Err(refuse());
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        year.parse::<i64>(),
+        month.parse::<i64>(),
+        day.parse::<i64>(),
+    ) else {
+        return Err(refuse());
+    };
+    // A real calendar day survives the round trip; 2026-02-30 comes back as
+    // 2026-03-02 and is refused.
+    if !(1..=12).contains(&m) || civil_from_days(days_from_civil(y, m, d)) != (y, m, d) {
+        return Err(refuse());
+    }
+    Ok(Some(raw.to_string()))
+}
+
+/// One arrival or departure, as `SELECT_MOVEMENTS_ON_DAY` decodes it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MovementFacts {
+    /// `person_arrived` or `person_departed`.
+    pub event_type: String,
+    /// When, unix seconds.
+    #[serde(default)]
+    pub ts: Option<i64>,
+    /// The database's calendar day it fell on.
+    #[serde(default)]
+    pub day: Option<String>,
+    /// The person's Item id, as text, when the event carried one.
+    #[serde(default)]
+    pub person_item_id: Option<String>,
+    /// Their current name, or the one the event was recorded under.
+    #[serde(default)]
+    pub person_name: Option<String>,
+    /// Where they arrived. Never set on a departure.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// The edge access point that is the evidence for it.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// The device that caused it, when that device still exists.
+    #[serde(default)]
+    pub device_mac: Option<String>,
+    /// That device's typed name.
+    #[serde(default)]
+    pub device_display_name: Option<String>,
+    /// That device's resolved name.
+    #[serde(default)]
+    pub device_resolved_name: Option<String>,
+    /// That device's hostname.
+    #[serde(default)]
+    pub device_hostname: Option<String>,
+}
+
+impl MovementFacts {
+    /// One line: when, who, what, where, and on which device.
+    #[must_use]
+    pub fn render_line(&self, now: i64) -> String {
+        let who = self
+            .person_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or("Somebody (no person recorded)");
+        let what = match self.event_type.as_str() {
+            "person_arrived" => "arrived",
+            "person_departed" => "left",
+            other => other,
+        };
+        let mut line = format!("  {}: {who} {what}", stamp(self.ts, now));
+        if let Some(place) = present(self.location.as_deref()) {
+            line.push_str(&format!(", at {place}"));
+        }
+        if let Some(via) = present(self.via.as_deref()) {
+            line.push_str(&format!(", via {via}"));
+        }
+        if let Some(mac) = present(self.device_mac.as_deref()) {
+            let label = device_label(
+                self.device_display_name.as_deref(),
+                self.device_resolved_name.as_deref(),
+                self.device_hostname.as_deref(),
+                None,
+                mac,
+            );
+            line.push_str(&format!(", on {}", device_phrase(&label, mac)));
+        }
+        line.push('\n');
+        line
+    }
+}
+
+/// One person who is home, as `SELECT_PEOPLE_HOME` decodes them.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HomeFacts {
+    /// Their Item id, as text.
+    pub item_id: String,
+    /// Their name.
+    pub name: String,
+    /// Where the daemon last placed them.
+    #[serde(default)]
+    pub current_location: Option<String>,
+    /// When they arrived, unix seconds. `None` for a person the daemon set home
+    /// without recording an arrival.
+    #[serde(default)]
+    pub arrived: Option<i64>,
+    /// How many of their unhidden devices are online.
+    #[serde(default)]
+    pub devices_online: i64,
+}
+
+impl HomeFacts {
+    /// One line: who, since when, where, how many devices.
+    #[must_use]
+    pub fn render_line(&self, now: i64) -> String {
+        let mut line = format!("  {}", person_phrase(&self.name, &self.item_id));
+        match self.arrived {
+            Some(_) => line.push_str(&format!(", home since {}", stamp(self.arrived, now))),
+            None => line.push_str(", home (no arrival time recorded)"),
+        }
+        if let Some(place) = present(self.current_location.as_deref()) {
+            line.push_str(&format!(", at {place}"));
+        }
+        line.push_str(&format!(
+            ", {} device{} online\n",
+            self.devices_online,
+            if self.devices_online == 1 { "" } else { "s" }
+        ));
+        line
+    }
+}
+
+/// Render an `arrivals_and_departures` answer.
+///
+/// The day's movements oldest first, then who is home now. Both, because "who
+/// came home today" is usually asked to find out who is here, and a person who
+/// arrived yesterday and never left is home with no movement today at all.
+///
+/// It says which day it read and that the day is the database's, for the same
+/// reason the network context says when monitoring began: an empty answer about
+/// the wrong day, stated confidently, is worse than no answer.
+#[must_use]
+pub fn render_movements(
+    day: &str,
+    today: &str,
+    movements: &[MovementFacts],
+    home: &[HomeFacts],
+    now: i64,
+) -> String {
+    let which = if day == today { " (today)" } else { "" };
+    let mut out =
+        format!("Arrivals and departures on {day}{which}. Days are the database's calendar day.\n");
+    if movements.is_empty() {
+        out.push_str(&format!(
+            "Nobody arrived or left on {day}. Only a person with at least one device \
+             assigned to them can arrive or leave; unowned devices never make either.\n"
+        ));
+    } else {
+        let arrivals = movements
+            .iter()
+            .filter(|m| m.event_type == "person_arrived")
+            .count();
+        let departures = movements
+            .iter()
+            .filter(|m| m.event_type == "person_departed")
+            .count();
+        out.push_str(&format!(
+            "{arrivals} arrival{}, {departures} departure{}, oldest first:\n",
+            if arrivals == 1 { "" } else { "s" },
+            if departures == 1 { "" } else { "s" }
+        ));
+        for movement in movements {
+            out.push_str(&movement.render_line(now));
+        }
+    }
+
+    if home.is_empty() {
+        out.push_str("Nobody is home now.\n");
+    } else {
+        out.push_str(&format!("Home now ({}):\n", home.len()));
+        for person in home {
+            out.push_str(&person.render_line(now));
+        }
+    }
+    cap(&out, RESULT_MAX_BYTES)
+}
+
+/// One device first seen this week, as `SELECT_NEW_DEVICES` decodes it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NewDeviceFacts {
+    /// `ng_devices.id`.
+    pub id: i64,
+    /// Hardware address.
+    pub mac: String,
+    /// A name a person typed.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The daemon's resolved name.
+    #[serde(default)]
+    pub resolved_name: Option<String>,
+    /// Hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// mDNS name.
+    #[serde(default)]
+    pub mdns_name: Option<String>,
+    /// OUI vendor.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    /// The fingerprint's verdict.
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// How sure the fingerprint is, 0 to 1.
+    #[serde(default)]
+    pub device_type_confidence: Option<f64>,
+    /// OS guess.
+    #[serde(default)]
+    pub os_family: Option<String>,
+    /// Which signal the resolved name came from.
+    #[serde(default)]
+    pub identity_source: Option<String>,
+    /// `online`, `idle`, `offline`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Most recent IPv4.
+    #[serde(default)]
+    pub last_ip: Option<String>,
+    /// Owner's Item id, as text.
+    #[serde(default)]
+    pub owner_item_id: Option<String>,
+    /// Owner's name, when the mirror has them.
+    #[serde(default)]
+    pub owner_name: Option<String>,
+    /// First observation, unix seconds.
+    #[serde(default)]
+    pub first_seen: Option<i64>,
+    /// Latest observation, unix seconds.
+    #[serde(default)]
+    pub last_seen: Option<i64>,
+}
+
+impl NewDeviceFacts {
+    /// Whether a person still has to name or assign it: the /devices/todo test.
+    #[must_use]
+    pub fn is_todo(&self) -> bool {
+        present(self.display_name.as_deref()).is_none()
+            && present(self.owner_item_id.as_deref()).is_none()
+    }
+
+    /// One listing line.
+    #[must_use]
+    pub fn render_line(&self, now: i64) -> String {
+        let label = descriptive_label(
+            self.display_name.as_deref(),
+            self.resolved_name.as_deref(),
+            self.hostname.as_deref(),
+            self.mdns_name.as_deref(),
+            self.vendor.as_deref(),
+            self.device_type.as_deref(),
+            &self.mac,
+        );
+        let mut line = format!(
+            "  {} [id {}]: first seen {}",
+            device_phrase(&label, &self.mac),
+            self.id,
+            stamp(self.first_seen, now)
+        );
+        match (
+            present(self.device_type.as_deref()),
+            self.device_type_confidence,
+        ) {
+            (Some(kind), Some(c)) => {
+                line.push_str(&format!("; looks like a {kind} ({:.0}% sure)", c * 100.0));
+            }
+            (Some(kind), None) => line.push_str(&format!("; looks like a {kind}")),
+            (None, _) => line.push_str("; not yet identified"),
+        }
+        if let Some(os) = present(self.os_family.as_deref()) {
+            line.push_str(&format!(", {os}"));
+        }
+        if let Some(vendor) = present(self.vendor.as_deref()) {
+            line.push_str(&format!(", made by {vendor}"));
+        }
+        line.push_str(&format!(
+            "; {}",
+            present(self.state.as_deref()).unwrap_or("state unknown")
+        ));
+        match (
+            present(self.owner_name.as_deref()),
+            present(self.owner_item_id.as_deref()),
+        ) {
+            (Some(name), _) => line.push_str(&format!("; owner {name}")),
+            (None, Some(id)) => line.push_str(&format!("; owner {id} (no such person)")),
+            (None, None) => line.push_str("; no owner"),
+        }
+        if present(self.display_name.as_deref()).is_none() {
+            match present(self.resolved_name.as_deref()) {
+                Some(guess) => line.push_str(&format!(
+                    "; not named by anyone (the daemon guesses '{guess}', from {})",
+                    present(self.identity_source.as_deref()).unwrap_or("an unrecorded signal")
+                )),
+                None => line.push_str("; not named by anyone"),
+            }
+        }
+        line.push('\n');
+        line
+    }
+}
+
+/// Render a `new_devices` answer: what appeared in the last seven days, and
+/// which of it still needs a person to name or assign it.
+#[must_use]
+pub fn render_new_devices(devices: &[NewDeviceFacts], now: i64) -> String {
+    if devices.is_empty() {
+        return "No device was first seen in the last seven days.\n".to_string();
+    }
+    let todo = devices.iter().filter(|d| d.is_todo()).count();
+    let mut out = format!(
+        "{} device{} first seen in the last seven days, newest first. \
+         {todo} of them {} neither a name a person gave it nor an owner, \
+         which is what /devices/todo lists.\n",
+        devices.len(),
+        if devices.len() == 1 { "" } else { "s" },
+        if todo == 1 { "has" } else { "have" }
+    );
+    for device in devices {
+        out.push_str(&device.render_line(now));
+    }
+    cap(&out, RESULT_MAX_BYTES)
+}
+
+/// A trimmed, non-empty value, or nothing.
+fn present(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 /// Render a `who_was_online` answer.
 ///
 /// Grouped by person, because the question is "who", and a device list is only
@@ -2579,5 +2953,189 @@ mod tests {
             assert!(capped.is_char_boundary(capped.len()));
         }
         assert_eq!(cap(text, 10_000), text);
+    }
+
+    // --- the overview's questions ----------------------------------------
+
+    #[test]
+    fn a_day_is_optional_and_must_be_a_real_calendar_day() {
+        let arg = |v: serde_json::Value| serde_json::json!({ "day": v });
+        assert_eq!(parse_day(&serde_json::json!({}), "day"), Ok(None));
+        assert_eq!(parse_day(&arg(serde_json::json!("  ")), "day"), Ok(None));
+        assert_eq!(
+            parse_day(&arg(serde_json::json!("2026-09-25")), "day"),
+            Ok(Some("2026-09-25".to_string()))
+        );
+        assert_eq!(
+            parse_day(&arg(serde_json::json!("2028-02-29")), "day"),
+            Ok(Some("2028-02-29".to_string())),
+            "a leap day is a day"
+        );
+        for bad in [
+            "2026-02-30",
+            "2026-13-01",
+            "25/09/2026",
+            "2026-9-25",
+            "today",
+            "2026-09-25T00:00",
+        ] {
+            let refused = parse_day(&arg(serde_json::json!(bad)), "day");
+            assert!(refused.is_err(), "{bad} was accepted");
+            assert!(refused.unwrap_err().contains("YYYY-MM-DD"));
+        }
+    }
+
+    fn movement(event_type: &str, name: Option<&str>, at: i64) -> MovementFacts {
+        MovementFacts {
+            event_type: event_type.to_string(),
+            ts: Some(at),
+            day: Some("2026-09-25".into()),
+            person_item_id: name.map(|_| "0193a5a0-0000-7000-8000-00000000000a".to_string()),
+            person_name: name.map(str::to_string),
+            ..MovementFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_day_of_movements_reads_in_order_and_ends_with_who_is_home() {
+        let now = 1_790_000_000;
+        let mut arrived = movement("person_arrived", Some("Jamie"), now - 3_600);
+        arrived.location = Some("Studio".into());
+        arrived.via = Some("Driveway AP".into());
+        arrived.device_mac = Some("02:00:5e:00:00:02".into());
+        arrived.device_resolved_name = Some("jamie-phone".into());
+        let left = movement("person_departed", None, now - 600);
+        let home = [HomeFacts {
+            item_id: "0193a5a0-0000-7000-8000-00000000000a".into(),
+            name: "Jamie".into(),
+            current_location: Some("Studio".into()),
+            arrived: Some(now - 3_600),
+            devices_online: 2,
+        }];
+
+        let out = render_movements("2026-09-25", "2026-09-25", &[arrived, left], &home, now);
+        assert!(
+            out.starts_with("Arrivals and departures on 2026-09-25 (today)."),
+            "{out}"
+        );
+        assert!(
+            out.contains("1 arrival, 1 departure, oldest first"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "Jamie arrived, at Studio, via Driveway AP, on jamie-phone (02:00:5e:00:00:02)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("Somebody (no person recorded) left"), "{out}");
+        assert!(out.find("arrived").unwrap_or(0) < out.find(" left").unwrap_or(0));
+        assert!(out.contains("Home now (1):"), "{out}");
+        assert!(out.contains("home since"), "{out}");
+        assert!(out.contains("2 devices online"), "{out}");
+        assert!(out.contains("UTC"), "every time says its zone: {out}");
+    }
+
+    #[test]
+    fn a_quiet_day_says_so_and_says_why_a_day_can_be_quiet() {
+        let out = render_movements("2026-09-20", "2026-09-25", &[], &[], 1_790_000_000);
+        assert!(
+            out.starts_with("Arrivals and departures on 2026-09-20."),
+            "not today: {out}"
+        );
+        assert!(
+            out.contains("Nobody arrived or left on 2026-09-20"),
+            "{out}"
+        );
+        assert!(out.contains("assigned to them"), "{out}");
+        assert!(out.contains("Nobody is home now."), "{out}");
+    }
+
+    #[test]
+    fn a_person_home_with_no_arrival_time_is_home_without_an_invented_time() {
+        let person = HomeFacts {
+            item_id: "0193a5a0-0000-7000-8000-00000000000c".into(),
+            name: "Arlo".into(),
+            current_location: None,
+            arrived: None,
+            devices_online: 1,
+        };
+        let line = person.render_line(1_790_000_000);
+        assert!(line.contains("home (no arrival time recorded)"), "{line}");
+        assert!(line.contains("1 device online"), "{line}");
+        assert!(!line.contains("never"), "{line}");
+    }
+
+    fn new_device() -> NewDeviceFacts {
+        NewDeviceFacts {
+            id: 12,
+            mac: "02:00:5e:00:00:0c".into(),
+            resolved_name: Some("guest-phone".into()),
+            identity_source: Some("dhcp".into()),
+            vendor: Some("Apple, Inc.".into()),
+            device_type: Some("phone".into()),
+            device_type_confidence: Some(0.92),
+            os_family: Some("iOS".into()),
+            state: Some("online".into()),
+            first_seen: Some(1_790_000_000 - 7_200),
+            ..NewDeviceFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_new_device_line_says_what_it_looks_like_and_what_is_left_to_do() {
+        let now = 1_790_000_000;
+        let line = new_device().render_line(now);
+        for expected in [
+            "guest-phone (02:00:5e:00:00:0c) [id 12]",
+            "first seen",
+            "looks like a phone (92% sure)",
+            "iOS",
+            "made by Apple, Inc.",
+            "online",
+            "no owner",
+            "the daemon guesses 'guest-phone', from dhcp",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?}: {line}");
+        }
+
+        let mut unknown = new_device();
+        unknown.resolved_name = None;
+        unknown.device_type = None;
+        unknown.device_type_confidence = None;
+        unknown.vendor = None;
+        let line = unknown.render_line(now);
+        assert!(line.contains("not yet identified"), "{line}");
+        assert!(line.contains("not named by anyone"), "{line}");
+        assert!(
+            !line.contains("% sure"),
+            "a confidence with no verdict: {line}"
+        );
+    }
+
+    #[test]
+    fn the_new_device_answer_counts_what_still_needs_a_person() {
+        let now = 1_790_000_000;
+        let mut named = new_device();
+        named.id = 13;
+        named.display_name = Some("Guest phone".into());
+        let mut owned = new_device();
+        owned.id = 14;
+        owned.owner_item_id = Some("0193a5a0-0000-7000-8000-00000000000a".into());
+        owned.owner_name = Some("Jamie".into());
+
+        let out = render_new_devices(&[new_device(), named, owned], now);
+        assert!(
+            out.starts_with("3 devices first seen in the last seven days"),
+            "{out}"
+        );
+        assert!(out.contains("1 of them has neither a name"), "{out}");
+        assert!(out.contains("/devices/todo"), "{out}");
+        assert!(out.contains("owner Jamie"), "{out}");
+
+        assert_eq!(
+            render_new_devices(&[], now),
+            "No device was first seen in the last seven days.\n"
+        );
     }
 }

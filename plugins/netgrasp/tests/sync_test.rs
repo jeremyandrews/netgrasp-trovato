@@ -2041,6 +2041,145 @@ fn the_todo_lists_unnamed_unowned_devices_until_somebody_names_or_assigns_them()
     });
 }
 
+// ===========================================================================
+// The overview's questions, in conversation
+// ===========================================================================
+
+/// **"Who came home today" and "what is new this week", answered by the
+/// assistant** from the same seeded house the overview tests read, through the
+/// real `tap_assistant_tool`. The answers must agree with the page: the same
+/// people, the same order, the same devices.
+#[test]
+fn the_network_assistant_answers_who_came_home_today_and_what_is_new() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let today = call_tool(
+            &pool,
+            &admin,
+            "netgrasp_network",
+            None,
+            "arrivals_and_departures",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(today["ok"], true, "{today}");
+        let text = today["content"].as_str().unwrap_or_default();
+        assert!(text.contains("(today)"), "{text}");
+        assert!(text.contains("2 arrivals, 1 departure"), "{text}");
+        let (aurora, jamie, arlo) = (
+            text.find("Aurora arrived").unwrap_or(usize::MAX),
+            text.find("Jamie arrived, at Studio, via Driveway")
+                .unwrap_or(usize::MAX),
+            text.find("Arlo left, via Gate").unwrap_or(usize::MAX),
+        );
+        assert!(
+            aurora < jamie && jamie < arlo && arlo < usize::MAX,
+            "the day in the order the overview shows it: {text}"
+        );
+        assert!(
+            !text.contains("Jamie left"),
+            "yesterday's departure leaked into today: {text}"
+        );
+        assert!(text.contains("Home now (2):"), "{text}");
+
+        // Another day, by argument, and a day that does not exist, refused.
+        let yesterday: String =
+            sqlx::query_scalar("SELECT to_char(now() - interval '1 day', 'YYYY-MM-DD')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let other = call_tool(
+            &pool,
+            &admin,
+            "netgrasp_network",
+            None,
+            "arrivals_and_departures",
+            serde_json::json!({ "day": yesterday }),
+            "execute",
+        )
+        .await;
+        let text = other["content"].as_str().unwrap_or_default();
+        assert!(text.contains("0 arrivals, 1 departure"), "{text}");
+        assert!(!text.contains("(today)"), "{text}");
+        let refused = call_tool(
+            &pool,
+            &admin,
+            "netgrasp_network",
+            None,
+            "arrivals_and_departures",
+            serde_json::json!({ "day": "2026-02-30" }),
+            "execute",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+
+        let new = call_tool(
+            &pool,
+            &admin,
+            "netgrasp_network",
+            None,
+            "new_devices",
+            serde_json::json!({}),
+            "execute",
+        )
+        .await;
+        assert_eq!(new["ok"], true, "{new}");
+        let text = new["content"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with("2 devices first seen in the last seven days"),
+            "{text}"
+        );
+        assert!(text.contains("aa:bb:cc:00:01:04"), "{text}");
+        assert!(text.contains("looks like a phone (92% sure)"), "{text}");
+        assert!(text.contains("aa:bb:cc:00:01:05"), "{text}");
+        assert!(
+            !text.contains("aa:bb:cc:00:01:03"),
+            "the hidden device: {text}"
+        );
+        assert!(
+            !text.contains("aa:bb:cc:00:01:02"),
+            "the year-old device: {text}"
+        );
+
+        // A read changes nothing: the overview's counts are what they were.
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        assert_eq!(rows[0]["devices_new"], 2);
+        assert_eq!(rows[0]["movements_today"], 3);
+    });
+}
+
+/// Somebody without the permission gets neither answer.
+#[test]
+fn the_overview_reads_refuse_a_caller_without_the_permission() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let nobody = ng_nobody(&pool).await;
+        for tool in ["arrivals_and_departures", "new_devices"] {
+            let result = call_tool(
+                &pool,
+                &nobody,
+                "netgrasp_network",
+                None,
+                tool,
+                serde_json::json!({}),
+                "execute",
+            )
+            .await;
+            assert_eq!(result["ok"], false, "{tool}: {result}");
+            let text = result.to_string();
+            assert!(!text.contains("Jamie"), "{tool} leaked a name: {text}");
+        }
+    });
+}
+
 /// Wire a standalone `GatherService` with the plugin's record types admitted and
 /// the migration-seeded queries loaded, the way the running kernel wires it.
 async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {
@@ -2647,6 +2786,18 @@ fn the_three_scopes_are_declared_and_the_kernel_registry_accepts_them() {
             trovato_sdk::types::AssistantIdKind::None
         );
         assert!(network.tool("who_was_online").is_some());
+        // The overview's two questions are reads, and adding them added no
+        // write: the count below is the one it was before they existed.
+        for read in ["arrivals_and_departures", "new_devices"] {
+            let tool = network
+                .tool(read)
+                .unwrap_or_else(|| panic!("the network scope has no {read}"));
+            assert_eq!(
+                tool.kind,
+                trovato_sdk::types::AssistantToolKind::Read,
+                "{read} must be a read"
+            );
+        }
         assert_eq!(network.write_tool_count(), 5);
 
         // Every scope's prompt says what the daemon cannot know, which is the
