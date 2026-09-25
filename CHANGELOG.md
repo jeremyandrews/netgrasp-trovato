@@ -23,6 +23,18 @@ Compatibility section has the table.
 
 ### Added
 
+**The plugin as a container image.** `ghcr.io/jeremyandrews/netgrasp-trovato`,
+multi-arch (arm64 and amd64), published on every push to `main` as
+`sha-<12 character commit>` and on every `v*` tag as the version and `latest`.
+Until now the only artifact was the release tarball, which a cluster cannot pull:
+a Kubernetes deployment had no way to get the plugin without a checkout or a
+download step of its own. The image is the tarball's three directories under
+`/netgrasp`, built by a new `published` stage in `docker/overlay.Dockerfile` that
+runs `scripts/build-overlay.sh` like every other consumer, so the capability check
+still runs. That Dockerfile's build stage now runs on the builder's native
+platform, since the wasm is identical on every architecture and compiling it
+under emulation would buy nothing but time.
+
 **An overview, and it is the front page.** `/overview`, from
 `007_netgrasp_overview_views.sql` and `008_netgrasp_overview.sql`. Who is home
 and since when, today's arrivals and departures in order, the devices first seen

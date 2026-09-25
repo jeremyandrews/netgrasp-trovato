@@ -205,6 +205,20 @@ Then install and serve as in steps 3 to 5 below. With the published kernel
 image, mount the three directories and set the same variables on the container;
 `docker-compose.demo.yml` shows how.
 
+### From the image
+
+Every push to `main` publishes `ghcr.io/jeremyandrews/netgrasp-trovato:sha-<12
+character commit>`, and a release tag publishes `:<version>` and `:latest`, for
+`linux/arm64` and `linux/amd64`. The image holds the same three directories as
+the tarball at `/netgrasp/plugins`, `/netgrasp/templates` and `/netgrasp/static`,
+on busybox so it can copy itself: run it as an init container with
+`cp -a /netgrasp/. /shared/`, mount the shared volume read-only at `/netgrasp` in
+the published kernel image, and set `PLUGINS_DIR=/app/plugins:/netgrasp/plugins`,
+`TEMPLATES_DIR=/app/templates:/netgrasp/templates` and
+`STATIC_DIR=/app/static:/netgrasp/static`. Pin a `sha-` tag or a version, never
+`latest`, so the plugin cannot move underneath a deployment. It is built from
+`docker/overlay.Dockerfile`'s `published` stage by `.github/workflows/image.yml`.
+
 ### From source
 
 Trovato reads `PLUGINS_DIR`, `TEMPLATES_DIR` and `STATIC_DIR` as
