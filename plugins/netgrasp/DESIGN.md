@@ -465,7 +465,7 @@ the rows are compared in the database's session time zone. A view evaluates
 `now()` in the session that compares the rows, so "today" means one thing on the
 whole page: the database's calendar day.
 
-Three things follow, each held by a host-in-the-loop test:
+Four things follow, each held by a test:
 
 - **An include joins on equal text.** `child_field IN (parent values)`, bound as
   text, and `child_field` is used both as a filter field (through the record
@@ -481,6 +481,14 @@ Three things follow, each held by a host-in-the-loop test:
   carries its definition inline, so each is written twice; the test compares
   record type and filters (less the join) and allows the sort to differ only on
   movements, oldest first for one day and newest first for the log.
+- **The views are the assistant's queries too.** The network scope's
+  `arrivals_and_departures` and `new_devices` reads select from the same views
+  (`netgrasp_core::queries::SELECT_MOVEMENTS_ON_DAY`, `SELECT_PEOPLE_HOME`,
+  `SELECT_NEW_DEVICES`), and ask the database what day it is rather than
+  computing one, so a page and a conversation cannot disagree about what
+  "today" or "new" means. Both are reads; the scope's write tools are unchanged.
+  The schema test runs the three statements over the daemon's DDL with 007 on
+  top.
 
 The front page moves to `/overview` only where `site_front_page` is still the
 `/devices/online` 005 wrote, or unset. An operator's own choice is left alone,

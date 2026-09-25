@@ -49,6 +49,12 @@ const DAEMON_SCHEMA: &str = include_str!("fixtures/daemon_schema.sql");
 const PLUGIN_MIGRATION: &str =
     include_str!("../../../plugins/netgrasp/migrations/001_netgrasp_schema.sql");
 
+/// The plugin's overview views, applied on top of the daemon's DDL: the
+/// assistant's overview reads select from them, and they are defined over the
+/// daemon's tables, so the daemon's schema is the one they have to hold on.
+const OVERVIEW_VIEWS: &str =
+    include_str!("../../../plugins/netgrasp/migrations/007_netgrasp_overview_views.sql");
+
 const ITEM_A: &str = "11111111-1111-4111-8111-111111111111";
 const ITEM_B: &str = "22222222-2222-4222-8222-222222222222";
 const PERSON: &str = "33333333-3333-4333-8333-333333333333";
@@ -1489,4 +1495,115 @@ async fn who_was_online_returns_only_and_all_of_the_overlapping_spans() {
     for span in &spans {
         assert!(span.start.unwrap_or_default() > 0, "{span:?}");
     }
+}
+
+/// **The overview's questions, asked through the `db` host.** The assistant's
+/// `arrivals_and_departures` and `new_devices` read the same views /overview
+/// does, over the daemon's own DDL, and every column has to arrive decoded: the
+/// two person times are computed twins (ng_people has none of its own), the
+/// fingerprint confidence is a REAL, and "today" is the database's day.
+#[tokio::test]
+async fn the_overview_reads_decode_through_the_db_host_over_the_daemons_schema() {
+    use netgrasp_core::assist::{HomeFacts, MovementFacts, NewDeviceFacts};
+
+    let mut conn = scratch(
+        "overview_reads",
+        &format!("{DAEMON_SCHEMA}\n{OVERVIEW_VIEWS}"),
+    )
+    .await;
+
+    // Two people home, one away; one arrival today, one departure yesterday.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_people (item_id, name, state, current_location, last_arrived_at) VALUES \
+            ($1::uuid, 'Jamie', 'home', 'Studio', date_trunc('day', now()) + interval '30 seconds'), \
+            ($2::uuid, 'Arlo',  'home', NULL,     NULL), \
+            ($3::uuid, 'Aurora','away', NULL,     now() - interval '3 days')",
+        &[json!(ITEM_A), json!(ITEM_B), json!(PERSON)],
+    )
+    .await;
+    let phone = seed_device(&mut conn, "aa:bb:cc:00:07:01", Some("jamie-phone"), now()).await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET owner_item_id = $1::uuid, first_seen_at = now() - interval '300 days' \
+         WHERE id = $2::bigint",
+        &[json!(ITEM_A), json!(phone)],
+    )
+    .await;
+    let fresh = seed_device(&mut conn, "aa:bb:cc:00:07:02", None, now()).await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET device_type_confidence = 0.75, first_seen_at = now() - interval '2 days' \
+         WHERE id = $1::bigint",
+        &[json!(fresh)],
+    )
+    .await;
+    for (event_type, at, details) in [
+        (
+            "person_arrived",
+            "date_trunc('day', now()) + interval '30 seconds'",
+            format!(
+                r#"{{"person": "Jamie", "person_item_id": "{ITEM_A}", "location": "Studio", "via": "Driveway AP"}}"#
+            ),
+        ),
+        (
+            "person_departed",
+            "date_trunc('day', now()) - interval '1 hour'",
+            format!(r#"{{"person": "Aurora", "person_item_id": "{PERSON}", "via": "Gate"}}"#),
+        ),
+    ] {
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+                 VALUES ($1::bigint, $2, {at}, $3::jsonb)"
+            ),
+            &[json!(phone), json!(event_type), json!(details)],
+        )
+        .await;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Today {
+        today: String,
+    }
+    let today: Vec<Today> = query_rows(&mut conn, queries::SELECT_TODAY, &[]).await;
+    let today = today[0].today.clone();
+    assert_eq!(today.len(), 10, "{today}");
+
+    let moves: Vec<MovementFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_MOVEMENTS_ON_DAY,
+        &[json!(today), json!(50)],
+    )
+    .await;
+    assert_eq!(moves.len(), 1, "only today's movement");
+    assert_eq!(moves[0].event_type, "person_arrived");
+    assert_eq!(moves[0].person_name.as_deref(), Some("Jamie"));
+    assert_eq!(moves[0].via.as_deref(), Some("Driveway AP"));
+    assert_eq!(moves[0].device_mac.as_deref(), Some("aa:bb:cc:00:07:01"));
+    assert!(moves[0].ts.is_some(), "the event time decoded as null");
+
+    let home: Vec<HomeFacts> = query_rows(&mut conn, queries::SELECT_PEOPLE_HOME, &[]).await;
+    let names: Vec<&str> = home.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["Jamie", "Arlo"],
+        "home only, arrival time first, a missing one last"
+    );
+    assert!(
+        home[0].arrived.is_some(),
+        "the computed arrival twin decoded as null"
+    );
+    assert_eq!(home[0].item_id, ITEM_A);
+    assert_eq!(home[0].devices_online, 1);
+    assert_eq!(home[1].arrived, None);
+
+    let new: Vec<NewDeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_NEW_DEVICES, &[json!(50)]).await;
+    assert_eq!(new.len(), 1, "the 300-day-old phone is not new");
+    assert_eq!(new[0].mac, "aa:bb:cc:00:07:02");
+    let confidence = new[0].device_type_confidence.expect("a REAL decodes");
+    assert!((confidence - 0.75).abs() < 1e-6, "{confidence}");
+    assert!(new[0].first_seen.is_some());
 }

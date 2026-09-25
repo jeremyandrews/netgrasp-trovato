@@ -45,8 +45,8 @@
 //! change happens and a conversation outlives the request that opened it.
 
 use netgrasp_core::assist::{
-    self, DeviceFacts, DeviceFilter, DeviceRef, EventFacts, PersonCandidate, PersonFacts,
-    PresenceWindowFacts, TimelineRow,
+    self, DeviceFacts, DeviceFilter, DeviceRef, EventFacts, HomeFacts, MovementFacts,
+    NewDeviceFacts, PersonCandidate, PersonFacts, PresenceWindowFacts, TimelineRow,
 };
 use netgrasp_core::model::{DeviceEdit, Span, SpanRow};
 use netgrasp_core::{DEVICE_TYPE, PERSON_TYPE, queries};
@@ -635,14 +635,41 @@ pub fn scopes() -> Vec<trovato_sdk::types::AssistantScope> {
     .prompt(prompt(
         "You are looking at the WHOLE network. The context lists every person and \
          every device, grouped by owner. Use it to answer questions about ownership \
-         and presence, and propose changes when asked to tidy something up.",
+         and presence, and propose changes when asked to tidy something up. \
+         For who came or went on a day, and who is home now, call \
+         arrivals_and_departures; for what appeared on the network recently, call \
+         new_devices. Both read exactly what the overview page shows.",
     ))
     .suggestions([
+        "Who came home today?",
+        "What is new on the network this week?",
         "Which devices have no owner?",
-        "Which device is this person using, and who should own it?",
         "Who is home right now?",
     ])
     .tool(list_people_tool())
+    .tool(
+        AssistantTool::read(
+            "arrivals_and_departures",
+            "Who arrived and who left on one day, in order, with where and through \
+             which access point, then who is home now and since when. Defaults to \
+             today, which is the database's calendar day.",
+        )
+        .parameters(json!({
+            "type": "object",
+            "properties": {
+                "day": {
+                    "type": "string",
+                    "description": "YYYY-MM-DD. Leave it out for today."
+                }
+            }
+        })),
+    )
+    .tool(AssistantTool::read(
+        "new_devices",
+        "Devices first seen on the network in the last seven days, newest first: \
+         what each looks like, how sure the daemon is, who owns it, and which still \
+         need a name or an owner.",
+    ))
     .tool(
         AssistantTool::read(
             "list_devices",
@@ -888,6 +915,8 @@ pub fn tool(call: &trovato_sdk::types::AssistantToolCall) -> AssistantToolResult
         (SCOPE_PERSON, "person_devices") => person_devices(&scope_id),
         (SCOPE_NETWORK, "list_devices") => list_devices(&call.arguments),
         (SCOPE_NETWORK, "who_was_online") => who_was_online(&call.arguments),
+        (SCOPE_NETWORK, "arrivals_and_departures") => arrivals_and_departures(&call.arguments),
+        (SCOPE_NETWORK, "new_devices") => new_devices(),
 
         // Writes.
         (SCOPE_DEVICE, "set_owner") => set_owner(&scope_id, &call.arguments, describing),
@@ -1058,6 +1087,57 @@ fn who_was_online(arguments: &Value) -> Result<AssistantToolResult, String> {
             assist::format_utc(start),
             assist::format_utc(end)
         ),
+    ))
+}
+
+/// One day's arrivals and departures, and who is home now.
+///
+/// The same views /overview reads, through `netgrasp_core::queries`, so the
+/// conversation and the page agree about what "today" is. "Today" is asked of
+/// the database rather than computed from the plugin's clock for that reason.
+fn arrivals_and_departures(arguments: &Value) -> Result<AssistantToolResult, String> {
+    #[derive(serde::Deserialize)]
+    struct TodayRow {
+        today: String,
+    }
+    let today = query_rows::<TodayRow>(queries::SELECT_TODAY, &[])
+        .map_err(|e| format!("could not read the database's date: {e}"))?
+        .into_iter()
+        .next()
+        .map(|r| r.today)
+        .ok_or("the database did not say what day it is")?;
+    let day = assist::parse_day(arguments, "day")?.unwrap_or_else(|| today.clone());
+
+    let movements: Vec<MovementFacts> = query_rows(
+        queries::SELECT_MOVEMENTS_ON_DAY,
+        &[json!(day), json!(assist::MAX_MOVEMENT_ROWS)],
+    )
+    .map_err(|e| format!("could not read the arrivals and departures: {e}"))?;
+    let home: Vec<HomeFacts> = query_rows(queries::SELECT_PEOPLE_HOME, &[])
+        .map_err(|e| format!("could not read who is home: {e}"))?;
+
+    let rendered = assist::render_movements(&day, &today, &movements, &home, now().unwrap_or(0));
+    Ok(AssistantToolResult::ok(
+        rendered,
+        format!(
+            "{} arrivals and departures on {day}; {} home now",
+            movements.len(),
+            home.len()
+        ),
+    ))
+}
+
+/// Devices first seen in the last seven days.
+fn new_devices() -> Result<AssistantToolResult, String> {
+    let devices: Vec<NewDeviceFacts> = query_rows(
+        queries::SELECT_NEW_DEVICES,
+        &[json!(assist::MAX_NEW_DEVICE_ROWS)],
+    )
+    .map_err(|e| format!("could not read the new devices: {e}"))?;
+    let rendered = assist::render_new_devices(&devices, now().unwrap_or(0));
+    Ok(AssistantToolResult::ok(
+        rendered,
+        format!("{} devices new this week", devices.len()),
     ))
 }
 

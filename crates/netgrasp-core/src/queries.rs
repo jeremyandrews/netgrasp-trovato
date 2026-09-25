@@ -336,6 +336,50 @@ pub const SELECT_PRESENCE_WINDOW: &str = "SELECT d.mac, d.display_name, d.resolv
        AND (s.ended_at_epoch IS NULL OR s.ended_at_epoch > $1::bigint) \
      ORDER BY s.started_at_epoch DESC LIMIT $3::bigint";
 
+// ---------------------------------------------------------------------------
+// The overview's questions, asked in conversation
+// ---------------------------------------------------------------------------
+//
+// These three read the plugin's own views (007_netgrasp_overview_views.sql),
+// not the daemon's tables, and that is the point of them: /overview and the
+// network scope answer "who came home today" and "what is new this week" from
+// the same definitions, so a page and a conversation cannot disagree about what
+// "today" or "new" means. The views compute every time as a BIGINT, including
+// the two ng_people arrival times the daemon stores with no epoch twin, so the
+// rule above about reading twins holds here with nothing to alias.
+
+/// The database's calendar day, which is what "today" means on the overview.
+/// No parameter.
+pub const SELECT_TODAY: &str = "SELECT to_char(now(), 'YYYY-MM-DD') AS today";
+
+/// One day's arrivals and departures, oldest first. `$1` is the day as
+/// `YYYY-MM-DD` text, `$2` the row limit.
+///
+/// `day` is text in the view, so the day binds as text: comparing it as a date
+/// would need the view's column to be one, and the overview's include joins on
+/// it as text.
+pub const SELECT_MOVEMENTS_ON_DAY: &str = "SELECT event_type, timestamp_epoch AS ts, day, \
+     person_item_id, person_name, location, via, device_mac, \
+     device_display_name, device_resolved_name, device_hostname \
+     FROM ng_person_movements WHERE day = $1::text \
+     ORDER BY timestamp_epoch ASC LIMIT $2::bigint";
+
+/// Everyone the daemon counts as home, earliest arrival first. No parameter:
+/// a household has tens of people, and the overview lists all of them too.
+pub const SELECT_PEOPLE_HOME: &str = "SELECT item_id::text AS item_id, name, current_location, \
+     last_arrived_at_epoch AS arrived, devices_online \
+     FROM ng_people_presence WHERE state = 'home' \
+     ORDER BY last_arrived_at_epoch ASC NULLS LAST, name ASC";
+
+/// Devices first seen in the last seven days, newest first, hidden ones left
+/// out as the overview leaves them out. `$1` is the row limit.
+pub const SELECT_NEW_DEVICES: &str = "SELECT id, mac, display_name, resolved_name, hostname, \
+     mdns_name, vendor, device_type, device_type_confidence, os_family, \
+     identity_source, state, last_ip, owner_item_id::text AS owner_item_id, owner_name, \
+     first_seen_at_epoch AS first_seen, last_seen_at_epoch AS last_seen \
+     FROM ng_devices_new WHERE NOT hidden \
+     ORDER BY first_seen_at_epoch DESC LIMIT $1::bigint";
+
 /// Every statement above, for the tests that check them as a set.
 pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DIRTY_DEVICES", SELECT_DIRTY_DEVICES),
@@ -370,6 +414,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_SECURITY_EVENTS", SELECT_SECURITY_EVENTS),
     ("SELECT_SECURITY_EVENT_COUNT", SELECT_SECURITY_EVENT_COUNT),
     ("SELECT_PRESENCE_WINDOW", SELECT_PRESENCE_WINDOW),
+    ("SELECT_TODAY", SELECT_TODAY),
+    ("SELECT_MOVEMENTS_ON_DAY", SELECT_MOVEMENTS_ON_DAY),
+    ("SELECT_PEOPLE_HOME", SELECT_PEOPLE_HOME),
+    ("SELECT_NEW_DEVICES", SELECT_NEW_DEVICES),
 ];
 
 #[cfg(test)]

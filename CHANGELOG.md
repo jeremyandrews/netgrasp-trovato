@@ -118,6 +118,29 @@ Tests: `the_todo_lists_unnamed_unowned_devices_until_somebody_names_or_assigns_t
 `the_new_device_event_page_lists_only_new_device_events` (host-in-the-loop; both
 fail without 010), `the_todo_and_the_new_device_events_render_and_point_at_each_other`.
 
+### Added (assistant)
+
+**"Who came home today?" and "What is new this week?" in conversation.** The
+network scope gains two read tools. `arrivals_and_departures` gives one day's
+arrivals and departures in order (today by default, or `day: YYYY-MM-DD`), with
+where and through which access point, then who is home now and since when.
+`new_devices` gives the devices first seen in the last seven days, with the
+fingerprint and its confidence, the owner, the daemon's name guess, and how
+many still need a person to name or assign them. No write tools were added.
+
+They read the overview's own views through three new statements in
+`netgrasp_core::queries`, and "today" is asked of the database rather than
+worked out from the plugin's clock, so the conversation and `/overview` cannot
+disagree about which day it is or what counts as new. A day that is not a
+calendar day ("2026-02-30") is refused rather than answered with an empty day.
+
+Tests: `the_network_assistant_answers_who_came_home_today_and_what_is_new` and
+the extended `the_three_scopes_are_declared_and_the_kernel_registry_accepts_them`
+(host-in-the-loop; both fail against the module built from the previous
+`assist_host.rs`), `the_overview_reads_refuse_a_caller_without_the_permission`,
+`the_overview_reads_decode_through_the_db_host_over_the_daemons_schema`, and six
+unit tests over the day parser and the two renderers.
+
 ## [1.0.0] - 2026-09-23
 
 The first release. Everything from the extraction out of the Trovato monorepo
