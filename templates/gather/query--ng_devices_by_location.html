@@ -1,0 +1,55 @@
+{#
+    Devices by where they are. /devices/location
+
+    One section per place, each holding the ordinary device table for that
+    place's devices. The gather sorts by `current_location`, so a place's
+    devices arrive adjacent; `unique` then `filter` split them into sections,
+    for the reason query--ng_who_is_home.html gives for not using `group_by`
+    (it reorders the groups).
+
+    Each section has an id the device tables' Where cells link to, so clicking
+    "Studio" anywhere lands on the Studio section here. `slugify` on both sides,
+    so the two cannot disagree about how "Living room" is spelled in a URL.
+
+    The device table is included with `rows` rebound to one place's devices.
+    Its own Where column still appears, because every row here has a place; it
+    is where each device's access point shows.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block summary %}
+{% set ng_places = rows | unique(attribute="current_location") %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ ng_places | length }}</span>
+        <span class="ng-summary__label">place{{ ng_places | length | pluralize }}</span>
+    </span>
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">device{{ total | pluralize }} placed</span>
+    </span>
+    <span class="ng-summary__scope">
+        {%- if total_pages > 1 -%}page {{ page }} of {{ total_pages }}{%- endif -%}
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}
+{% set ng_all = rows %}
+{% for ng_place in ng_all | unique(attribute="current_location") %}
+<section class="ng-section" id="loc-{{ ng_place.current_location | slugify }}">
+    <h2 class="ng-section__title">{{ ng_place.current_location }}</h2>
+    {% set rows = ng_all | filter(attribute="current_location", value=ng_place.current_location) %}
+    {% include "gather/netgrasp/device-table.html" %}
+</section>
+{% endfor %}
+{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    A device's place comes from the netgrasp daemon's UniFi enrichment, which
+    maps the access point a device is connected to onto a named location. With
+    enrichment switched off, which is the default, no device has one, and every
+    other page is complete without it. <a href="/devices">All devices</a>.
+</span>
+{% endblock %}

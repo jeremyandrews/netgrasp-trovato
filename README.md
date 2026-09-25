@@ -263,6 +263,7 @@ without being copied into the image.
 | `/people/movements` | every arrival and departure; `?day=YYYY-MM-DD` for one day |
 | `/devices/new` | devices first seen in the last seven days, with the daemon's fingerprint and how sure it is |
 | `/devices/online` | what is on the network right now |
+| `/devices/location` | devices grouped by where the daemon's UniFi enrichment placed them; empty, and saying why, when enrichment is off |
 | `/devices` | every device the daemon has seen |
 | `/devices/type?device_type=…` | one device type; reached by clicking a Type cell |
 | `/devices/owner?owner=…` | one person's devices; reached by clicking an Owner chip |

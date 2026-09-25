@@ -9,7 +9,25 @@
     Rows are `ng_device_state` records: flat objects keyed by the physical
     column names of ng_devices. See gather/netgrasp/page.html for what happens
     when a template forgets that.
+
+    ===========================================================================
+    The Where column exists only when something on the page is somewhere
+    ===========================================================================
+    `current_location` and `current_ap` come from the daemon's UniFi
+    enrichment, and with enrichment off (the default, and most installs) both
+    are null on every row. A column of dashes on every device page would say
+    "missing" about a feature that is simply not switched on, so the column,
+    header and cells alike, is rendered only when at least one row on this page
+    has either value.
+
+    Counted with `map`, which drops nulls, so the length is the number of rows
+    that actually have one. Not `filter`: it matches a value and cannot express
+    "not null". Bound here, at the top level of the template, because a `set`
+    inside the row loop would not be visible to the header above it.
 #}
+{%- set ng_with_location = rows | map(attribute="current_location") | length -%}
+{%- set ng_with_ap = rows | map(attribute="current_ap") | length -%}
+{%- set ng_located = ng_with_location + ng_with_ap > 0 -%}
 <div class="ng-table-scroll">
     <table class="ng-table ng-device-table">
         <thead>
@@ -18,6 +36,7 @@
                 <th>State</th>
                 <th>Type</th>
                 <th>IP</th>
+                {% if ng_located %}<th>Where</th>{% endif %}
                 <th>MAC</th>
                 <th>Owner</th>
                 <th>Last seen</th>
@@ -81,6 +100,24 @@
                 <td class="ng-mono">
                     {%- if row.last_ip %}{{ row.last_ip }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
                 </td>
+
+                {#
+                    The place, linked to its group on /devices/location, with
+                    the access point under it as the evidence. A device with an
+                    access point the daemon could not map to a place shows the
+                    access point alone; a wired device on a page where others
+                    are placed shows a dash, which here does mean "not known".
+                #}
+                {% if ng_located %}
+                <td>
+                    {%- if row.current_location -%}
+                    <a href="/devices/location#loc-{{ row.current_location | slugify }}">{{ row.current_location }}</a>
+                    {%- if row.current_ap %}<span class="ng-ap">{{ row.current_ap }}</span>{% endif -%}
+                    {%- elif row.current_ap -%}
+                    <span class="ng-ap ng-ap--alone">{{ row.current_ap }}</span>
+                    {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
+                </td>
+                {% endif %}
 
                 <td class="ng-mono">{{ row.mac }}</td>
 

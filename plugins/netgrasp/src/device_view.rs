@@ -112,7 +112,7 @@ pub fn render(
         "Location history",
         &history.locations,
         now,
-        "No location history.",
+        location_empty_text(state),
         true,
     );
     render_timeline(
@@ -167,6 +167,9 @@ fn render_identity(out: &mut String, state: &DeviceState, owner_name: Option<&st
     if let Some(v) = present(state.current_location.as_deref()) {
         row(out, "Location", &escape(v));
     }
+    if let Some(v) = present(state.current_ap.as_deref()) {
+        row(out, "Access point", &escape(v));
+    }
     if let Some(v) = present(owner_name) {
         row(out, "Owner", &escape(v));
     }
@@ -181,6 +184,25 @@ fn render_identity(out: &mut String, state: &DeviceState, owner_name: Option<&st
         &escape(&timeline::humanize_ago(state.last_seen, now)),
     );
     out.push_str("</dl>");
+}
+
+/// What the location timeline says when it has no rows.
+///
+/// Two different silences. A device the daemon has placed before and has no
+/// history for is simply one with no history yet. A device with no location and
+/// no access point at all is, on almost every install, one whose daemon runs
+/// without UniFi enrichment, which is the only source of either; "No location
+/// history" there reads as a gap in monitoring when it is a feature switched off.
+/// The page says which, since the reader cannot tell them apart.
+fn location_empty_text(state: &DeviceState) -> &'static str {
+    if present(state.current_location.as_deref()).is_some()
+        || present(state.current_ap.as_deref()).is_some()
+    {
+        "No location history."
+    } else {
+        "No location reported. Locations come from the daemon's UniFi enrichment, \
+         which has placed nothing for this device."
+    }
 }
 
 /// One definition-list row. Both halves are escaped by the caller.
@@ -313,7 +335,8 @@ mod tests {
             os_family: Some("iOS".to_string()),
             state: Some("online".to_string()),
             last_ip: Some("192.168.1.42".to_string()),
-            current_location: Some("living-room-ap".to_string()),
+            current_location: Some("Living room".to_string()),
+            current_ap: Some("living-room-ap".to_string()),
             first_seen: Some(NOW - 900_000),
             last_seen: Some(NOW - 30),
         }
@@ -445,11 +468,48 @@ mod tests {
             "jeremys-phone",
             "Apple",
             "192.168.1.42",
+            "Living room",
             "living-room-ap",
             "Jeremy",
         ] {
             assert!(html.contains(expected), "missing {expected}");
         }
+    }
+
+    /// The place and the access point are two rows: the place is what a person
+    /// asks about, and the access point is the evidence for it.
+    #[test]
+    fn the_identity_block_names_the_place_and_the_access_point() {
+        let html = render(Some(&state()), &history(), None, NOW);
+        assert!(
+            html.contains("<dt>Location</dt><dd>Living room</dd>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<dt>Access point</dt><dd>living-room-ap</dd>"),
+            "{html}"
+        );
+    }
+
+    /// **With UniFi enrichment off**, both columns are null on every device.
+    /// The page must read as complete rather than broken: no empty Location or
+    /// Access point rows, and a location timeline that says why it is empty
+    /// instead of implying the monitoring missed something.
+    #[test]
+    fn with_no_enrichment_the_page_omits_location_and_says_where_it_would_come_from() {
+        let mut s = state();
+        s.current_location = None;
+        s.current_ap = Some(String::new());
+        let html = render(Some(&s), &empty_history(), None, NOW);
+        assert!(!html.contains("<dt>Location</dt>"), "{html}");
+        assert!(!html.contains("<dt>Access point</dt>"), "{html}");
+        assert!(html.contains("UniFi enrichment"), "{html}");
+        assert!(!html.contains("No location history."), "{html}");
+
+        // Placed once, but no spans yet: the ordinary empty state.
+        let placed = render(Some(&state()), &empty_history(), None, NOW);
+        assert!(placed.contains("No location history."), "{placed}");
+        assert!(!placed.contains("UniFi enrichment"), "{placed}");
     }
 
     #[test]

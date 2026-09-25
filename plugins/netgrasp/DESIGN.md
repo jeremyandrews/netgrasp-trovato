@@ -266,6 +266,7 @@ own route with a `{"url_arg": …}` filter whose value is always supplied:
 | `/people/home` | `ng_people_home` | none (`state = 'home'` fixed) |
 | `/people/movements?day=…` | `ng_person_movements` | day, optional: an absent `url_arg` resolves to null and constrains nothing |
 | `/devices/new` | `ng_devices_new` | none (the view is the week) |
+| `/devices/location` | `ng_devices_by_location` | none (`current_location is_not_null` fixed) |
 
 ### Decision 7 — the tiles are gather tiles, because a tile cannot count
 
@@ -502,7 +503,13 @@ the same promise 005 made from the other side.
   flushes untouched. What that run also showed is that the daemon reads those
   columns only when it starts, so a change made through the assistant does not
   reach a running daemon until it restarts. See `docs/JOINT-RUN.md`.
-- **No enrichment / UniFi, no arrival-departure notification** (CLOSE 16), **no iOS.**
+- **No enrichment of its own, no arrival-departure notification** (CLOSE 16),
+  **no iOS.** The plugin talks to no UniFi controller. It shows what the
+  daemon's enrichment wrote (`current_location`, `current_ap`, the location
+  history) wherever the daemon wrote it, and with enrichment off every one of
+  those is null: the device tables then have no Where column at all, the device
+  page leaves out its Location and Access point rows and says where a location
+  would come from, and `/devices/location` is its empty state saying the same.
 - **No assistant scope over the event log.** Events are read-only and high volume:
   there is nothing to configure, and the network scope's `device_history` already
   puts a device's events in front of the model.
