@@ -67,15 +67,15 @@ use netgrasp_core::assist::{self, DeviceFacts, PersonFacts};
 use netgrasp_core::model::DeviceEdit;
 use trovato_sdk::types::{ApiRequest, ApiResponse, MenuRoute};
 
-use crate::{PERM_ADMINISTER, assist_host, people_forms};
+use crate::{PERM_ADMINISTER, alerts, assist_host, people_forms};
 
 /// Where each form lives. One path per action, two methods each.
 const DEVICE_RENAME: &str = "/netgrasp/device/rename";
 const DEVICE_OWNER: &str = "/netgrasp/device/owner";
 const DEVICE_HIDDEN: &str = "/netgrasp/device/hidden";
-const DEVICE_NOTIFY: &str = "/netgrasp/device/notify";
+pub(crate) const DEVICE_NOTIFY: &str = "/netgrasp/device/notify";
 const PERSON_RENAME: &str = "/netgrasp/person/rename";
-const PERSON_NOTIFY: &str = "/netgrasp/person/notify";
+pub(crate) const PERSON_NOTIFY: &str = "/netgrasp/person/notify";
 
 /// The script that makes the owner select searchable. Progressive: every form
 /// it touches posts the same fields with scripting off, and the filter box it
@@ -117,6 +117,9 @@ pub fn routes() -> Vec<MenuRoute> {
         (people_forms::DEVICES_ASSIGN, "devices_assign"),
         (people_forms::PERSON_MERGE, "person_merge"),
         (people_forms::PERSON_DELETE, "person_delete"),
+        (alerts::ALERTS, "alerts"),
+        (alerts::ALERTS_ADD, "alerts_add"),
+        (alerts::ALERTS_DEVICES, "alerts_devices"),
     ] {
         routes
             .push(MenuRoute::api("GET", path, format!("{stem}_form")).permission(PERM_ADMINISTER));
@@ -159,6 +162,12 @@ pub fn serve(request: &ApiRequest) -> ApiResponse {
         "person_merge_save" => people_forms::person_merge_save(request),
         "person_delete_form" => people_forms::person_delete_form(request),
         "person_delete_save" => people_forms::person_delete_save(request),
+        "alerts_form" => alerts::alerts_page(request),
+        "alerts_save" => alerts::alerts_test_save(request),
+        "alerts_add_form" => alerts::alerts_add_form(request),
+        "alerts_add_save" => alerts::alerts_add_save(request),
+        "alerts_devices_form" => alerts::alerts_devices_form(request),
+        "alerts_devices_save" => alerts::alerts_devices_save(request),
         other => refuse(404, &format!("no such form: {other}")),
     }
 }
@@ -921,7 +930,7 @@ mod tests {
     #[test]
     fn every_route_is_gated_on_the_administer_permission() {
         let routes = routes();
-        assert_eq!(routes.len(), 20, "ten forms, two methods each");
+        assert_eq!(routes.len(), 26, "thirteen forms, two methods each");
         for route in &routes {
             assert_eq!(
                 route.permission, PERM_ADMINISTER,
@@ -959,6 +968,9 @@ mod tests {
             people_forms::DEVICES_ASSIGN,
             people_forms::PERSON_MERGE,
             people_forms::PERSON_DELETE,
+            alerts::ALERTS,
+            alerts::ALERTS_ADD,
+            alerts::ALERTS_DEVICES,
         ] {
             let mine: Vec<_> = routes.iter().filter(|r| r.path == path).collect();
             assert_eq!(mine.len(), 2, "{path} is not served twice");

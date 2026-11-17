@@ -23,6 +23,38 @@ Compatibility section has the table.
 
 ### Added
 
+**One Alerts page, `/alerts`, in the site menu between People and Activity.**
+Before, there was no answer anywhere to "will I be told when Jamie gets home,
+and will it reach me": the two notify flags sat on each person's and device's
+forms, and the plugin could only guess delivery from `ng_events.notified`
+because the destination lives in the daemon's config. The page now says every
+rule as a sentence ("Tell me when Jamie gets home."), grouped by person and
+then by device, each with a switch; where alerts go and whether the last one
+was delivered; and the last 20 alerts sent, in the daemon's own words.
+`/alerts/add` sets a rule for a person or a device and `/alerts/devices` sets
+exactly which devices alert; both write through the existing notify saves and
+nothing else. **Send test** inserts one row into `ng_notify_requests`, which
+netgraspd answers on its next reconcile tick, and the confirmation page shows
+the outcome. The plugin still sends nothing and reads no secret: the daemon's
+status row names the transport (`ntfy`), never the topic, server or token.
+
+The two tables are netgraspd's schema V4 ([netgraspd#23](https://github.com/jeremyandrews/netgraspd/pull/23)). `015_netgrasp_notify_schema.sql` is a
+guarded copy, as `001` is for V1 to V3, and `016_netgrasp_alerts.sql` adds the
+menu row. Upgrade and migrate the daemon first.
+
+Tests: `the_alerts_page_says_every_rule_where_alerts_go_and_what_was_sent`,
+`an_alert_added_for_a_person_turns_on_that_alert_alone_on_both_tiers`,
+`an_alert_added_for_a_device_turns_its_notify_on_and_nothing_else`,
+`the_bulk_alerts_form_sets_exactly_the_listed_devices`,
+`send_test_inserts_one_request_for_the_daemon_and_nothing_else`,
+`the_alerts_page_switch_turns_one_person_rule_off_and_keeps_the_other`,
+`the_alerts_pages_refuse_a_caller_without_the_permission_and_anonymous`
+(host-in-the-loop); `the_alerts_page_reads_the_daemons_notify_status`,
+`a_test_request_is_inserted_and_its_outcome_read_back`,
+`recently_sent_lists_only_delivered_events_in_the_daemons_words`,
+`the_alerting_devices_are_counted_and_listed_by_owner` (against the daemon's
+DDL); and the faithful-copy check now covers the notify tables.
+
 **Give a device an owner who does not exist yet.** The owner form lists
 everybody by name, with a search box when scripting is on, and under it "or a
 new person named". A name nobody has creates that person and assigns the

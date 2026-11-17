@@ -473,6 +473,99 @@ pub const UNDO_PERSON_MERGE: &str = "WITH restored AS (\
        RETURNING from_item_id) \
      DELETE FROM ng_person_merge WHERE from_item_id = $1::uuid AND into_item_id = $2::uuid";
 
+// ===========================================================================
+// Alerts (U3)
+// ===========================================================================
+//
+// What the Alerts page reads, and the one row it writes. `ng_notify_status` and
+// `ng_notify_requests` are the daemon's (netgraspd schema V4): the daemon is
+// the only thing that sends anything, and these two tables are how the web side
+// learns whether it can, and asks it to prove it. Neither holds the ntfy topic,
+// the server or the token.
+//
+// Times of day are formatted by Postgres, in the session's time zone, because
+// the plugin has no clock of its own beyond an epoch and no time zone database.
+// `to_char` returns text, which the `db` host decodes; the timestamptz itself
+// would arrive as null.
+
+/// The daemon's one status row about delivery. No parameter.
+///
+/// No row at all means netgraspd has never reported: it is older than V4, or
+/// it has not started since it was upgraded.
+pub const SELECT_NOTIFY_STATUS: &str = "SELECT notify_configured, notify_backend, \
+     last_delivery_ok, last_delivery_at_epoch AS last_delivery_at, \
+     to_char(last_delivery_at, 'YYYY-MM-DD') AS last_delivery_day, \
+     to_char(last_delivery_at, 'HH24:MI') AS last_delivery_clock, \
+     updated_at_epoch AS updated_at \
+     FROM ng_notify_status WHERE id = 1";
+
+/// The most recent test request and what became of it. No parameter.
+pub const SELECT_LATEST_TEST_REQUEST: &str = "SELECT id, requested_at_epoch AS requested_at, \
+     handled_at_epoch AS handled_at, outcome, \
+     to_char(requested_at, 'HH24:MI') AS requested_clock, \
+     to_char(handled_at, 'YYYY-MM-DD') AS handled_day, \
+     to_char(handled_at, 'HH24:MI') AS handled_clock \
+     FROM ng_notify_requests ORDER BY id DESC LIMIT 1";
+
+/// Ask the daemon for a test alert. `$1` is who asked (a user id, as text).
+///
+/// The plugin's only write to a daemon table here, and it is an insert into the
+/// one table whose rows the plugin owns: `handled_at` and `outcome` are left for
+/// the daemon, which answers on its reconcile tick.
+///
+/// No `RETURNING`: it runs through the `db` host's execute call, which counts
+/// rows, and the host's query call refuses a write.
+pub const INSERT_TEST_REQUEST: &str = "INSERT INTO ng_notify_requests (requested_by) \
+     VALUES ($1::text)";
+
+/// The alerts the daemon delivered, newest first: `ng_events.notified`, which
+/// the daemon sets only once a notifier accepted the message. `$1` is the row
+/// limit.
+///
+/// `person_name` prefers the person's current name, the way the movements view
+/// does, and falls back to the one recorded on the event. `last_seen_clock` is
+/// the departure's "last seen" time, from the daemon's `details.last_seen_at`,
+/// read only when it looks like a timestamp so one malformed row cannot fail
+/// the page.
+pub const SELECT_RECENTLY_SENT: &str = "SELECT e.id, e.event_type, e.timestamp_epoch AS ts, \
+     to_char(e.\"timestamp\", 'YYYY-MM-DD') AS day, \
+     to_char(e.\"timestamp\", 'HH24:MI') AS clock, \
+     COALESCE(p.name, e.details ->> 'person') AS person_name, \
+     e.details ->> 'device_name' AS device_name, \
+     CASE WHEN e.details ->> 'last_seen_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
+          THEN to_char((e.details ->> 'last_seen_at')::timestamptz, 'HH24:MI') END AS last_seen_clock, \
+     d.mac AS device_mac, d.display_name AS device_display_name, \
+     d.resolved_name AS device_resolved_name, d.hostname AS device_hostname \
+     FROM ng_events e \
+     LEFT JOIN ng_devices d ON d.id = e.device_id \
+     LEFT JOIN ng_people p ON p.item_id::text = e.details ->> 'person_item_id' \
+     WHERE e.notified \
+     ORDER BY e.\"timestamp\" DESC LIMIT $1::bigint";
+
+/// How many devices there are, and how many of them alert when they come back
+/// online. Hidden devices are counted in neither. No parameter.
+pub const SELECT_ALERTING_COUNTS: &str = "SELECT \
+     count(*) FILTER (WHERE notify) AS alerting, count(*) AS devices \
+     FROM ng_devices WHERE NOT hidden";
+
+/// The devices that alert, grouped by owner (people first, by name) and then by
+/// name. `$1` is the row limit.
+pub const SELECT_DEVICES_ALERTING: &str = device_read!(
+    "WHERE d.notify AND NOT d.hidden \
+     ORDER BY owner_name NULLS LAST, \
+              lower(COALESCE(d.display_name, d.resolved_name, d.hostname, d.mac)) \
+     LIMIT $1::bigint"
+);
+
+/// Every device the bulk alerts form lists: all but the hidden ones, the same
+/// order. `$1` is the row limit.
+pub const SELECT_DEVICES_FOR_ALERTS: &str = device_read!(
+    "WHERE NOT d.hidden \
+     ORDER BY owner_name NULLS LAST, \
+              lower(COALESCE(d.display_name, d.resolved_name, d.hostname, d.mac)) \
+     LIMIT $1::bigint"
+);
+
 /// Every statement above, for the tests that check them as a set.
 pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DIRTY_DEVICES", SELECT_DIRTY_DEVICES),
@@ -518,6 +611,14 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_PERSON_MOVEMENT_COUNT", SELECT_PERSON_MOVEMENT_COUNT),
     ("MERGE_PERSON_RECORD", MERGE_PERSON_RECORD),
     ("UNDO_PERSON_MERGE", UNDO_PERSON_MERGE),
+    // Alerts (U3).
+    ("SELECT_NOTIFY_STATUS", SELECT_NOTIFY_STATUS),
+    ("SELECT_LATEST_TEST_REQUEST", SELECT_LATEST_TEST_REQUEST),
+    ("INSERT_TEST_REQUEST", INSERT_TEST_REQUEST),
+    ("SELECT_RECENTLY_SENT", SELECT_RECENTLY_SENT),
+    ("SELECT_ALERTING_COUNTS", SELECT_ALERTING_COUNTS),
+    ("SELECT_DEVICES_ALERTING", SELECT_DEVICES_ALERTING),
+    ("SELECT_DEVICES_FOR_ALERTS", SELECT_DEVICES_FOR_ALERTS),
 ];
 
 #[cfg(test)]
@@ -557,6 +658,11 @@ mod tests {
         "\"timestamp\"",
         "last_arrived_at",
         "last_departed_at",
+        // netgraspd V4: the notify status and test request tables.
+        "last_delivery_at",
+        "updated_at",
+        "requested_at",
+        "handled_at",
     ];
 
     /// The select items of a `SELECT`, as `(expression, alias)` pairs. A bare

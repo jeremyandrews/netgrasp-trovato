@@ -1,5 +1,5 @@
--- The netgrasp daemon's schema, milestones 1 through 3, exactly as the daemon
--- creates it.
+-- The netgrasp daemon's schema, milestones 1 through 3 and the notify tables
+-- of V4, exactly as the daemon creates them.
 --
 -- This is the canonical text. It is NOT the plugin's migration: the plugin ships
 -- a guarded copy in plugins/netgrasp/migrations/001_netgrasp_schema.sql so an
@@ -128,3 +128,35 @@ CREATE UNIQUE INDEX uniq_ng_presence_open
     ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
 CREATE UNIQUE INDEX uniq_ng_location_open
     ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+
+-- V4: whether alerts can be delivered, and a test somebody asked for. Daemon
+-- owned, except that the plugin inserts ng_notify_requests rows. The daemon
+-- guards these two with IF NOT EXISTS because the plugin ships a copy; here
+-- they are unguarded like everything else, for the reason at the top.
+CREATE TABLE ng_notify_status (
+    id                     BIGINT      PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    notify_configured      BOOLEAN     NOT NULL,
+    notify_backend         TEXT,
+    last_delivery_ok       BOOLEAN,
+    last_delivery_at       TIMESTAMPTZ,
+    updated_at             TIMESTAMPTZ NOT NULL,
+    last_delivery_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_delivery_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    updated_at_epoch       BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (updated_at AT TIME ZONE 'UTC'))::bigint) STORED
+);
+
+CREATE TABLE ng_notify_requests (
+    id                 BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind               TEXT        NOT NULL DEFAULT 'test' CHECK (kind = 'test'),
+    requested_by       TEXT,
+    requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    handled_at         TIMESTAMPTZ,
+    outcome            TEXT        CHECK (outcome IN ('sent', 'failed', 'not_configured')),
+    requested_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (requested_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    handled_at_epoch   BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (handled_at AT TIME ZONE 'UTC'))::bigint) STORED
+);
+CREATE INDEX ng_notify_requests_pending_idx ON ng_notify_requests (id)
+    WHERE handled_at IS NULL;

@@ -421,6 +421,46 @@ pub(crate) fn move_devices(devices: &[DeviceFacts], to: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Turn several devices' alerts on or off: one [`apply_device_edit`] each,
+/// naming `notify` and nothing else, the write the device notify form makes.
+///
+/// If one fails, every device already changed is put back to the setting it
+/// had, and the error names the device that failed. The bulk alerts form is
+/// all or nothing, as the bulk owner form is.
+pub(crate) fn set_device_alerts(changes: &[(DeviceFacts, bool)]) -> Result<(), String> {
+    for (done, (facts, to)) in changes.iter().enumerate() {
+        let edit = DeviceEdit {
+            notify: Some(*to),
+            ..DeviceEdit::default()
+        };
+        if let Err(e) = apply_device_edit(facts, &edit) {
+            restore_alerts(&changes[..=done]);
+            return Err(format!("could not change {}: {e}", facts.phrase()));
+        }
+    }
+    Ok(())
+}
+
+/// Put each device's alerts back as they were, newest first. Re-read before
+/// each write for the reason [`restore_owners`] gives.
+fn restore_alerts(changes: &[(DeviceFacts, bool)]) {
+    for (original, _) in changes.iter().rev() {
+        let edit = DeviceEdit {
+            notify: Some(original.notify),
+            ..DeviceEdit::default()
+        };
+        let restored = load_device(&DeviceRef::Id(original.id))
+            .and_then(|current| apply_device_edit(&current, &edit));
+        if let Err(e) = restored {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not put {}'s alerts back: {e}", original.mac),
+            );
+        }
+    }
+}
+
 /// Put each device back to the owner it had, newest first.
 ///
 /// Re-read before each write, because the forward write may have minted the

@@ -87,6 +87,8 @@ files = [
     "migrations/012_netgrasp_device_tabs_search.sql",
     "migrations/013_netgrasp_home.sql",
     "migrations/014_netgrasp_people.sql",
+    "migrations/015_netgrasp_notify_schema.sql",
+    "migrations/016_netgrasp_alerts.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -164,6 +166,12 @@ db_tables = [
     # view joins it so a merged person's past arrivals belong to the person
     # kept, without rewriting the daemon's events.
     "ng_person_merge",
+    # netgraspd's notify tables (its schema V4; 015 is the guarded copy). The
+    # Alerts page reads whether delivery is configured from ng_notify_status,
+    # and Send test inserts one row into ng_notify_requests for the daemon to
+    # answer. Neither holds the topic or the token.
+    "ng_notify_status",
+    "ng_notify_requests",
 ]
 
 # Lightweight record types (P11g / D-53).

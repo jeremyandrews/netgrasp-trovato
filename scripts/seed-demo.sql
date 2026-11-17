@@ -340,6 +340,11 @@ JOIN ng_devices d ON d.mac = v.mac;
 -- through. The times agree with the people rows above: Jamie home three hours,
 -- Aurora forty minutes, Arlo left this morning after a night home.
 --
+-- Since netgraspd's schema V4 the daemon also names the device (`device_name`)
+-- and, for a departure, when it was last heard from (`last_seen_at`), which is
+-- what the alert text and the Alerts page's "Recently sent" read. Arlo's phone
+-- fell silent half an hour before the offline timeout declared him gone.
+--
 -- Arlo's departure also sets `last_departed_at`, which the people insert above
 -- leaves null, so the one person who is away has a time to be away since.
 UPDATE ng_people SET last_departed_at = NOW() - INTERVAL '5 hours'
@@ -352,7 +357,12 @@ SELECT d.id, v.event_type, NOW() - (v.ago || ' minutes')::interval,
            'person_item_id', v.person_item_id,
            'device', v.mac,
            'location', v.location,
-           'via', v.via
+           'via', v.via,
+           'device_name', COALESCE(d.display_name, d.resolved_name, d.hostname, d.mac),
+           'last_seen_at', to_char(
+               (NOW() - ((v.ago + CASE WHEN v.event_type = 'person_departed' THEN 30 ELSE 0 END)
+                         || ' minutes')::interval) AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS"Z"')
        ),
        TRUE, 'clean'
 FROM (VALUES
@@ -361,6 +371,18 @@ FROM (VALUES
     ('02:00:5e:00:00:0a', 'person_arrived',   40, 'Aurora', '5eed0000-0000-4000-8000-000000000002', 'Living room', NULL)
 ) AS v(mac, event_type, ago, person, person_item_id, location, via)
 JOIN ng_devices d ON d.mac = v.mac;
+
+-- ---------------------------------------------------------------------------
+-- Delivery, for the Alerts page
+-- ---------------------------------------------------------------------------
+-- netgraspd's status row (its schema V4; the plugin's 015 creates the table on
+-- an install with no daemon): ntfy configured, and the last alert, Aurora's
+-- arrival forty minutes ago, accepted. DO NOTHING, so a row a real daemon wrote
+-- is left as it is.
+INSERT INTO ng_notify_status
+    (id, notify_configured, notify_backend, last_delivery_ok, last_delivery_at, updated_at)
+VALUES (1, TRUE, 'ntfy', TRUE, NOW() - INTERVAL '40 minutes', NOW())
+ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- One device's history, for the device page's timelines
