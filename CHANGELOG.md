@@ -90,6 +90,41 @@ a device. People and Home now have tabs: Everyone, Home now, Comings and goings.
 
 ### Fixed
 
+**The plugin installs when the kernel's role does not own the daemon's tables.**
+`015` created `ng_notify_requests_pending_idx` with `CREATE INDEX IF NOT
+EXISTS`, but Postgres checks ownership of the table before it looks at the index
+name, so a kernel connecting as a role of its own (the daemon migrated first, as
+documented) failed `plugin install` with `must be owner of table
+ng_notify_requests`, and a deployment that runs `plugin install && serve` never
+started. The index is now guarded on ownership, as `001`'s are. A test applies
+`001`, `015` and `017` as a role that owns no daemon table, and the same failure
+was reproduced and cleared against the published kernel image.
+
+**No second copy of the daemon's open-row indexes (#15).** Where the kernel
+connected as the role that owns the `ng_` tables, `001` added
+`uniq_ng_presence_open` and `uniq_ng_location_open` beside the daemon's own
+identical `ng_presence_open_idx` and `ng_location_history_open_idx`, so every
+presence and location write maintained two indexes, and the daemon's preflight
+never saw the extras. `017` drops one of the plugin's two names only where
+another valid unique index on the same table covers exactly `device_id` with
+the same predicate, so a daemon index is never touched, and an install with no
+daemon keeps its own as the only guarantee of one open row per device. The test
+fixture now gives the daemon's indexes the daemon's names, which is how the
+duplicate went unseen.
+
+**Stale kernel versions (#14).** The demo compose file said the manifest
+declares `api_version 0.99`; it declares `0.102`, and the comment now says where
+both come from. The README's count of the published image's plugins is the one
+`0.102.0` has.
+
+**Installing from the Release tarball onto the published image (#16).** The
+README said the demo compose file shows how, but it builds from source, mounts
+the clone and brings its own database. It now has the `docker run` lines for
+the published image with the tarball and the daemon's database, which database
+role to use and the grants a separate one needs (including `INSERT` on
+`ng_notify_requests` for Send test), and why the `WASM not found` warning is
+harmless.
+
 **A person write that fails part way leaves nothing behind.** Creating,
 assigning in bulk, merging and deleting each touch two stores the plugin cannot
 hold in one transaction (the kernel's `item` table through `item-api`, and the

@@ -123,10 +123,12 @@ CREATE TABLE ng_people (
     last_departed_at TIMESTAMPTZ
 );
 
--- At most one open row per device, on both timelines that have one.
-CREATE UNIQUE INDEX uniq_ng_presence_open
+-- At most one open row per device, on both timelines that have one, under the
+-- daemon's own names (V1 and V3). The plugin's 001 gives its copies different
+-- names, which is how 017 tells them apart.
+CREATE UNIQUE INDEX ng_presence_open_idx
     ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
-CREATE UNIQUE INDEX uniq_ng_location_open
+CREATE UNIQUE INDEX ng_location_history_open_idx
     ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
 
 -- V4: whether alerts can be delivered, and a test somebody asked for. Daemon
