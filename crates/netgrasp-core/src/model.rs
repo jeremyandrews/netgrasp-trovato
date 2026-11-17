@@ -348,6 +348,33 @@ pub fn is_security_event(event_type: &str) -> bool {
     SECURITY_EVENT_TYPES.contains(&event_type)
 }
 
+/// The security events a person can act on, out of [`SECURITY_EVENT_TYPES`].
+///
+/// The rest of that list is noise to a reader: on the live network `arp_scan`
+/// alone was 20,644 events in seven days, and with `identity_change` it was 98%
+/// of the security total. A spoofed gateway, a second DHCP server and two
+/// devices claiming one address are things somebody goes and looks at, so Home
+/// counts these three over the last day and Activity's Notable tab lists them.
+///
+/// Sorted, because a test asserts it is.
+pub const ACTIONABLE_SECURITY_EVENT_TYPES: &[&str] = &["arp_spoof", "ip_conflict", "rogue_dhcp"];
+
+/// The events Activity's default tab lists: comings and goings, a device seen
+/// for the first time, and [`ACTIONABLE_SECURITY_EVENT_TYPES`].
+///
+/// `ip_changed` is about 95% of every event the daemon writes (526,962 in seven
+/// days on the live network), which is why the default is a short list and the
+/// whole log is a tab of its own. The same list is the `in` filter of the
+/// `ng_activity` gather, and a test in the plugin holds the two together.
+pub const NOTABLE_EVENT_TYPES: &[&str] = &[
+    "person_arrived",
+    "person_departed",
+    "new_device",
+    "arp_spoof",
+    "ip_conflict",
+    "rogue_dhcp",
+];
+
 /// The daemon-owned state a device page shows above its timelines.
 ///
 /// The projection is [`crate::queries::SELECT_DEVICE_STATE`]; the two times are
@@ -678,6 +705,35 @@ mod tests {
     #[test]
     fn new_device_is_a_real_event_but_not_a_security_one() {
         assert!(!is_security_event("new_device"));
+    }
+
+    #[test]
+    fn the_actionable_security_types_are_security_types_sorted_and_unique() {
+        let mut sorted = ACTIONABLE_SECURITY_EVENT_TYPES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, ACTIONABLE_SECURITY_EVENT_TYPES.to_vec());
+        for t in ACTIONABLE_SECURITY_EVENT_TYPES {
+            assert!(is_security_event(t), "{t} is not a security event type");
+        }
+        // The scan noise is exactly what this list exists to leave out.
+        assert!(!ACTIONABLE_SECURITY_EVENT_TYPES.contains(&"arp_scan"));
+        assert!(!ACTIONABLE_SECURITY_EVENT_TYPES.contains(&"identity_change"));
+    }
+
+    #[test]
+    fn the_notable_events_are_movements_new_devices_and_the_actionable_security_types() {
+        for t in ACTIONABLE_SECURITY_EVENT_TYPES {
+            assert!(NOTABLE_EVENT_TYPES.contains(t), "{t} is not notable");
+        }
+        for t in ["person_arrived", "person_departed", "new_device"] {
+            assert!(NOTABLE_EVENT_TYPES.contains(&t), "{t} is not notable");
+        }
+        assert!(!NOTABLE_EVENT_TYPES.contains(&"ip_changed"));
+        assert_eq!(
+            NOTABLE_EVENT_TYPES.len(),
+            3 + ACTIONABLE_SECURITY_EVENT_TYPES.len()
+        );
     }
 
     #[test]

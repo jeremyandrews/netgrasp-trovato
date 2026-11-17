@@ -23,6 +23,23 @@ Compatibility section has the table.
 
 ### Added
 
+**Four entries in the site menu instead of fifteen.** Home, Devices, People and
+Activity, written as `menu_link` rows by `011_netgrasp_navigation.sql`. The
+kernel draws `menu_link` rows in place of every plugin's `tap_menu` entries
+whenever there are any, so the kernel's own Home, Translate, Post, Blog, Terms,
+Translate Language and Media left the bar along with netgrasp's eight flat
+entries; at 1440 px the old row was 1593 px wide. Netgrasp's `tap_menu` now says
+the same four things, as the fallback for a site with no `menu_link` rows. The
+kernel draws no second menu level, so a section's other pages are tabs the page
+draws itself. `/devices` opens on what is online, the full list moved to
+`/devices/all`, and `/who-is-home` is a 301 to `/people/home`; every other path
+answers as it did.
+
+**Activity** (`/activity`): arrivals, departures, new devices, and the three
+security events a person can act on, newest first, with the rest of the event
+pages as its tabs. The whole log is 95% `ip_changed` on a real network, which is
+why it is not the default.
+
 **The plugin as a container image.** `ghcr.io/jeremyandrews/netgrasp-trovato`,
 multi-arch (arm64 and amd64), published on every push to `main` as
 `sha-<12 character commit>` and on every `v*` tag as the version and `latest`.

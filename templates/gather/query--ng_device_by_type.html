@@ -18,10 +18,10 @@
 {% block summary %}
 <p class="ng-page__description">
     {%- if filter_values.device_type -%}
-    Type <strong>{{ filter_values.device_type }}</strong>. <a href="/devices">All devices</a>
+    Type <strong>{{ filter_values.device_type }}</strong>. <a href="/devices/all">All devices</a>
     {%- else -%}
     No type given, so this is every device. Pick a type from a device's Type
-    column, or go to <a href="/devices">all devices</a>.
+    column, or go to <a href="/devices/all">all devices</a>.
     {%- endif -%}
 </p>
 {% include "gather/netgrasp/device-summary.html" %}
@@ -35,7 +35,7 @@
     No device is typed <strong>{{ filter_values.device_type }}</strong>.
     {% else %}
     This page needs a type: reach it by clicking a device's type in
-    <a href="/devices">the device list</a>.
+    <a href="/devices/all">the device list</a>.
     {% endif %}
 </span>
 {% endblock %}

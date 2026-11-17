@@ -13,6 +13,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
 {% block results %}
 {% set ng_movements = rows %}
 {% include "gather/netgrasp/movement-table.html" %}

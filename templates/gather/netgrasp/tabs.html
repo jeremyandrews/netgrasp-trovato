@@ -1,0 +1,50 @@
+{#
+    The tabs under a section's heading: Activity's five views of the event log.
+
+    Why tabs and not a second menu level: the kernel never draws a child menu
+    entry (docs/UI.md, "Why tabs on the page, not a second menu level"), and
+    its active-link check is an exact path match, so the site menu cannot say
+    which of a section's pages is open. These can, because each tab is its own
+    gather and the page knows which gather it is.
+
+    Set `ng_tabs` to the section before including this:
+
+        {% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}
+
+    The active tab is the one whose gather is this page's (`query.query_id`).
+    A page that is in the section but is none of its tabs (one device's
+    events) draws the strip with nothing marked, which is still the way back.
+
+    The path is printed `safe` because it is a literal written above, never
+    anything a request supplied, and escaped it would read `&#x2F;activity`.
+
+    Each tab is one "gather|path|label" string rather than a nested array,
+    because a Tera array literal holds literals and not other arrays.
+
+    Plain links, so the strip works with scripting off. On a phone it stays one
+    line and scrolls sideways inside itself (netgrasp.css, `.ng-tabs`); the
+    page never does.
+#}
+{%- if ng_tabs == "activity" -%}
+{%- set ng_tab_list = [
+    "ng_activity|/activity|Notable",
+    "ng_person_movements|/people/movements|Comings and goings",
+    "ng_event_new_devices|/events/new-devices|New devices",
+    "ng_event_security|/events/security|Security",
+    "ng_event_log|/events|Everything"
+] -%}
+{%- set ng_tab_label = "Activity" -%}
+{%- else -%}
+{%- set ng_tab_list = [] -%}
+{%- set ng_tab_label = "" -%}
+{%- endif -%}
+{%- if ng_tab_list | length > 0 %}
+<nav class="ng-tabs" aria-label="{{ ng_tab_label }}">
+    <ul class="ng-tabs__list">
+        {%- for entry in ng_tab_list %}
+        {%- set tab = entry | split(pat="|") %}
+        <li class="ng-tabs__item"><a class="ng-tabs__tab{% if query.query_id == tab[0] %} ng-tabs__tab--active{% endif %}" href="{{ tab[1] | safe }}"{% if query.query_id == tab[0] %} aria-current="page"{% endif %}>{{ tab[2] }}</a></li>
+        {%- endfor %}
+    </ul>
+</nav>
+{%- endif %}
