@@ -151,17 +151,26 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// serialize to the same shape the registry reads, so this is a change of SDK
 /// type and not of contract.
 ///
-/// The order below is the order a person reads them in: the overview, what is
-/// left to do, then what is here now, then everything, then who, then what
-/// happened.
+/// Four entries, in the order of the site menu `011_netgrasp_navigation.sql`
+/// writes: Home, Devices, People, Activity (docs/UI.md, "Navigation"). Alerts is
+/// the fifth and arrives with its page, at weight 3.
 ///
-/// Navigation is all the eight below are. `callback` is left empty on every one:
-/// the kernel routes an entry only when `handler_type` is `"api"` and a callback
-/// is set, and `MenuRoute::page` is a plain link (`G-NO-PLUGIN-HTTP`). The paths
-/// work because `002_netgrasp_gathers.sql` (and, for `/overview` and `/devices/todo`,
-/// 008 and 010) aliases each one onto a
-/// `/gather/<query_id>` route — the menu makes them findable, the URL aliases
-/// make them exist.
+/// **These are the fallback, not the menu.** The kernel draws `menu_link` rows
+/// whenever the site has any, and ignores every plugin's `tap_menu` entries when
+/// it does; 011 writes four. These say the same four things so that a site that
+/// empties `menu_link` gets the same navigation back rather than the fifteen
+/// flat entries this replaced. A test holds the two lists together.
+///
+/// Every other page is a tab on one of these four, or is reached from a row.
+/// The kernel never draws a child menu entry (`MenuRegistry::root_menus` keeps
+/// only parentless ones), so a second level here would hide the entry and do
+/// nothing else; the tabs are drawn by the plugin's own templates instead.
+///
+/// `callback` is left empty on every one: the kernel routes an entry only when
+/// `handler_type` is `"api"` and a callback is set, and `MenuRoute::page` is a
+/// plain link (`G-NO-PLUGIN-HTTP`). The paths work because a migration aliases
+/// each one onto a `/gather/<query_id>` route: the menu makes them findable, the
+/// URL aliases make them exist.
 ///
 /// The row menu's forms follow them, and are the other kind of entry: invisible,
 /// each naming a callback, each routed to [`tap_api`]. `tap_menu` is where a
@@ -170,30 +179,18 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 #[plugin_tap]
 pub fn tap_menu() -> Vec<MenuRoute> {
     let mut menu = vec![
-        MenuRoute::page("/overview", "Overview")
+        MenuRoute::page("/overview", "Home")
             .permission(PERM_VIEW_DEVICES)
             .weight(0),
-        MenuRoute::page("/devices/todo", "To do")
+        MenuRoute::page("/devices", "Devices")
             .permission(PERM_VIEW_DEVICES)
             .weight(1),
-        MenuRoute::page("/devices/online", "Online now")
-            .permission(PERM_VIEW_DEVICES)
-            .weight(2),
-        MenuRoute::page("/devices", "All devices")
-            .permission(PERM_VIEW_DEVICES)
-            .weight(3),
-        MenuRoute::page("/who-is-home", "Who is home")
-            .permission(PERM_VIEW_DEVICES)
-            .weight(4),
         MenuRoute::page("/people", "People")
             .permission(PERM_VIEW_DEVICES)
-            .weight(5),
-        MenuRoute::page("/events", "Events")
+            .weight(2),
+        MenuRoute::page("/activity", "Activity")
             .permission(PERM_VIEW_DEVICES)
-            .weight(6),
-        MenuRoute::page("/events/security", "Security events")
-            .permission(PERM_VIEW_DEVICES)
-            .weight(7),
+            .weight(4),
     ];
     // The row menu's forms. Invisible, gated on `administer netgrasp`, and each
     // one naming a callback — which is the only combination the kernel routes
@@ -770,24 +767,12 @@ mod tests {
         let mut menus = navigation();
         menus.sort_by_key(|m| m.weight);
         let ordered: Vec<&str> = menus.iter().map(|m| m.path.as_str()).collect();
-        assert_eq!(
-            ordered,
-            [
-                "/overview",
-                "/devices/todo",
-                "/devices/online",
-                "/devices",
-                "/who-is-home",
-                "/people",
-                "/events",
-                "/events/security",
-            ]
-        );
+        assert_eq!(ordered, ["/overview", "/devices", "/people", "/activity"]);
 
         let mut weights: Vec<i32> = navigation().iter().map(|m| m.weight).collect();
         weights.sort_unstable();
         weights.dedup();
-        assert_eq!(weights.len(), 8, "two menu entries share a weight");
+        assert_eq!(weights.len(), 4, "two menu entries share a weight");
     }
 
     /// A navigation entry must be visible, or it is filtered out by
@@ -812,20 +797,222 @@ mod tests {
     /// or the navigation links to a 404.
     #[test]
     fn every_menu_path_is_an_alias_the_migration_seeds() {
-        let migrations = [
-            include_str!("../migrations/002_netgrasp_gathers.sql"),
-            include_str!("../migrations/008_netgrasp_overview.sql"),
-            include_str!("../migrations/010_netgrasp_new_devices.sql"),
-        ];
         for m in navigation() {
             assert!(
-                migrations
-                    .iter()
-                    .any(|migration| migration.contains(&format!("'{}'", m.path))),
-                "menu path {} has no url_alias in 002, 008 or 010",
+                aliased_paths().contains(&m.path),
+                "menu path {} has no url_alias in any migration",
                 m.path
             );
         }
+    }
+
+    /// Every migration the manifest ships, in order, as text.
+    fn all_migrations() -> Vec<&'static str> {
+        vec![
+            include_str!("../migrations/002_netgrasp_gathers.sql"),
+            include_str!("../migrations/008_netgrasp_overview.sql"),
+            include_str!("../migrations/009_netgrasp_locations.sql"),
+            include_str!("../migrations/010_netgrasp_new_devices.sql"),
+            include_str!("../migrations/011_netgrasp_navigation.sql"),
+        ]
+    }
+
+    /// Every friendly path a migration aliases onto a gather: the second quoted
+    /// string of each `(gen_random_uuid(), '/gather/…', '<alias>', 'en', …)`
+    /// row, which is the shape every `url_alias` insert here uses.
+    fn aliased_paths() -> Vec<String> {
+        let mut paths = Vec::new();
+        for migration in all_migrations() {
+            for line in migration.lines() {
+                let Some((_, rest)) = line.split_once("(gen_random_uuid(), '/gather/") else {
+                    continue;
+                };
+                let quoted: Vec<&str> = rest.split('\'').collect();
+                // rest = "ng_x', '/alias', 'en', …": the alias is the third piece.
+                if let Some(alias) = quoted.get(2) {
+                    paths.push((*alias).to_string());
+                }
+            }
+        }
+        paths
+    }
+
+    /// The site menu the kernel actually draws: the `menu_link` rows 011
+    /// writes, as (path, title, weight).
+    fn site_menu_rows() -> Vec<(String, String, i32)> {
+        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let mut rows: Vec<(String, String, i32)> = migration
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("('main', '"))
+            .map(|rest| {
+                let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+                let path = parts[0].trim_end_matches('\'').to_string();
+                let title = parts[1].trim_matches('\'').to_string();
+                let weight = parts[2].parse().unwrap_or_else(|e| panic!("{rest}: {e}"));
+                (path, title, weight)
+            })
+            .collect();
+        rows.sort_by_key(|r| r.2);
+        rows
+    }
+
+    /// **The menu as built**: Home, Devices, People, Activity, in that order,
+    /// and nothing else. Alerts joins it with its page, between People and
+    /// Activity, which is why the weights skip 3.
+    #[test]
+    fn the_site_menu_reads_home_devices_people_activity() {
+        let rows = site_menu_rows();
+        let titles: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(titles, ["Home", "Devices", "People", "Activity"]);
+        let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(paths, ["/overview", "/devices", "/people", "/activity"]);
+        let weights: Vec<i32> = rows.iter().map(|r| r.2).collect();
+        assert_eq!(weights, [0, 1, 2, 4]);
+    }
+
+    /// The kernel draws the `menu_link` rows when there are any and the
+    /// `tap_menu` entries when there are none, so the two have to be the same
+    /// menu, or emptying a table changes the navigation.
+    #[test]
+    fn the_tap_menu_fallback_is_the_same_menu_as_the_site_menu_rows() {
+        let mut fallback: Vec<(String, String, i32)> = navigation()
+            .into_iter()
+            .map(|m| (m.path, m.title, m.weight))
+            .collect();
+        fallback.sort_by_key(|r| r.2);
+        assert_eq!(fallback, site_menu_rows());
+    }
+
+    /// The rows are written so that running the migration again, or after an
+    /// operator edited one in the admin UI, changes nothing, and so that they
+    /// land on the live stage the kernel reads the main menu from.
+    #[test]
+    fn the_site_menu_rows_are_idempotent_live_stage_rows_of_the_main_menu() {
+        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let (_, insert) = migration
+            .split_once("INSERT INTO menu_link")
+            .unwrap_or_default();
+        let (insert, _) = insert.split_once(';').unwrap_or_default();
+        assert!(
+            insert.contains("ON CONFLICT (path, menu_name, stage_id) DO NOTHING"),
+            "{insert}"
+        );
+        assert_eq!(
+            insert
+                .matches("'0193a5a0-0000-7000-8000-000000000001'")
+                .count(),
+            4,
+            "every row must be on the live stage: {insert}"
+        );
+        assert_eq!(insert.matches("'netgrasp'").count(), 4, "{insert}");
+        assert!(
+            !insert.contains("parent_id"),
+            "the kernel draws no child rows"
+        );
+    }
+
+    /// **Every path that worked before still works.** Each is either a
+    /// `url_alias` some migration writes or a 301 011 writes, and the one page
+    /// that went away, /who-is-home, is the 301.
+    #[test]
+    fn every_old_path_still_answers_through_an_alias_or_a_redirect() {
+        let navigation = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let aliased = aliased_paths();
+        for path in [
+            "/overview",
+            "/devices",
+            "/devices/online",
+            "/devices/new",
+            "/devices/todo",
+            "/devices/type",
+            "/devices/owner",
+            "/devices/location",
+            "/people",
+            "/people/home",
+            "/people/movements",
+            "/events",
+            "/events/security",
+            "/events/new-devices",
+            "/events/device",
+            "/who-is-home",
+        ] {
+            let redirected = navigation.contains(&format!("'{path}', '/"))
+                && navigation.contains("INSERT INTO redirect");
+            assert!(
+                aliased.contains(&path.to_string()) || redirected,
+                "{path} no longer answers"
+            );
+        }
+        for new in ["/devices/all", "/activity"] {
+            assert!(aliased.contains(&new.to_string()), "{new} is not aliased");
+        }
+    }
+
+    /// /who-is-home is a real 301 to the Home now tab, from the `redirect`
+    /// table, and the table is made before it is written to: on a new
+    /// database this migration runs before the redirects plugin's own.
+    #[test]
+    fn who_is_home_is_a_301_to_people_home_written_after_the_table_exists() {
+        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let create = migration
+            .find("CREATE TABLE IF NOT EXISTS redirect")
+            .unwrap_or(usize::MAX);
+        let insert = migration.find("INSERT INTO redirect").unwrap_or(usize::MAX);
+        assert!(create < insert && insert < usize::MAX, "{migration}");
+        assert!(
+            migration.contains("'/who-is-home', '/people/home', 301"),
+            "/who-is-home is not a 301 to /people/home"
+        );
+        assert!(
+            migration
+                .contains("WHERE NOT EXISTS (SELECT 1 FROM redirect WHERE source = '/who-is-home'"),
+            "a second run would write a second /who-is-home row"
+        );
+        // The redirect the kernel wrote from the old canonical URL is moved,
+        // and only where it still says what the kernel wrote.
+        assert!(migration.contains(
+            "UPDATE redirect SET destination = '/devices/all'\nWHERE source = '/gather/ng_device_list' AND destination = '/devices'"
+        ));
+    }
+
+    /// /devices is the Online tab now, and every device is /devices/all. The
+    /// alias insert's DO UPDATE is what moves /devices on a site that already
+    /// had it pointing at the full list.
+    #[test]
+    fn devices_opens_on_what_is_online_and_the_full_list_moves_to_devices_all() {
+        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        assert!(migration.contains("'/gather/ng_device_online', '/devices',"));
+        assert!(migration.contains("'/gather/ng_device_list',   '/devices/all',"));
+        let (_, alias) = migration
+            .split_once("INSERT INTO url_alias")
+            .unwrap_or_default();
+        let (alias, _) = alias.split_once(';').unwrap_or_default();
+        assert!(
+            alias.contains(
+                "ON CONFLICT (alias, language, stage_id) DO UPDATE SET source = EXCLUDED.source"
+            ),
+            "an existing /devices alias would keep pointing at the full list"
+        );
+        assert!(migration.contains("('ng_device_list',   '/devices/all')"));
+        assert!(migration.contains("('ng_device_online', '/devices')"));
+    }
+
+    /// Activity's default tab and `NOTABLE_EVENT_TYPES` are one list written
+    /// twice.
+    #[test]
+    fn the_activity_gather_lists_exactly_the_notable_event_types() {
+        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let (_, gather) = migration.split_once("'ng_activity',").unwrap_or_default();
+        let (definition, _) = gather.split_once("::jsonb").unwrap_or_default();
+        let listed = netgrasp_core::model::NOTABLE_EVENT_TYPES
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            definition.contains(&format!("\"value\": [{listed}]")),
+            "the ng_activity filter is not NOTABLE_EVENT_TYPES: {definition}"
+        );
     }
 
     /// The front page is the overview, on a fresh install and on one that
@@ -1594,6 +1781,139 @@ mod tests {
         );
         assert!(events.contains("href=\"/devices/todo\""), "{events}");
         assert!(events.contains("ng-menu__button"), "{events}");
+    }
+
+    /// **Activity renders**, with rows and without, and its tab strip marks
+    /// the tab that is open on every page in the section, and no other.
+    #[test]
+    fn activity_and_its_tabs_render_with_rows_and_without() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+        let render = |template: &str, query_id: &str, rows: serde_json::Value| {
+            let mut context = tera::Context::new();
+            context.insert("total", &rows.as_array().map_or(0, Vec::len));
+            context.insert("rows", &rows);
+            context.insert("page", &1);
+            context.insert("total_pages", &1);
+            context.insert("base_path", "/activity");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": query_id, "label": "Activity"}),
+            );
+            context.insert("filter_values", &serde_json::json!({}));
+            tera.render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+        };
+
+        let full = render(
+            "gather/query--ng_activity.html",
+            "ng_activity",
+            serde_json::json!([
+                {"id": 3, "device_id": 2, "event_type": "arp_spoof",
+                 "timestamp_epoch": 1_757_000_200, "details": {"claimed_ip": "10.0.1.1"}},
+                {"id": 2, "device_id": 1, "event_type": "person_arrived",
+                 "timestamp_epoch": 1_757_000_100, "details": {"person": "Jamie"}},
+                {"id": 1, "device_id": null, "event_type": "new_device",
+                 "timestamp_epoch": null, "details": null}
+            ]),
+        );
+        assert!(full.contains("3</span>"), "{full}");
+        assert!(full.contains("notable events"), "{full}");
+        assert!(full.contains("ng-row--security"), "{full}");
+        assert!(full.contains("ng-menu__button"), "{full}");
+        assert!(
+            full.contains("<nav class=\"ng-tabs\" aria-label=\"Activity\">"),
+            "{full}"
+        );
+        assert!(
+            full.contains("ng-tabs__tab ng-tabs__tab--active\" href=\"/activity\" aria-current=\"page\">Notable"),
+            "{full}"
+        );
+        assert_eq!(full.matches("aria-current=\"page\"").count(), 1, "{full}");
+        for href in [
+            "/people/movements",
+            "/events/new-devices",
+            "/events/security",
+            "href=\"/events\"",
+        ] {
+            assert!(full.contains(href), "the strip lost {href}: {full}");
+        }
+
+        let empty = render(
+            "gather/query--ng_activity.html",
+            "ng_activity",
+            serde_json::json!([]),
+        );
+        assert!(
+            empty.contains("Nothing notable has happened")
+                || empty.contains("Nobody has come or gone"),
+            "{empty}"
+        );
+        assert!(!empty.contains("<table"), "{empty}");
+        // The way out of an empty tab is still there.
+        assert!(empty.contains("class=\"ng-tabs\""), "{empty}");
+
+        // Each of the other four pages marks its own tab.
+        for (template, query_id, label) in [
+            (
+                "gather/query--ng_event_log.html",
+                "ng_event_log",
+                "Everything",
+            ),
+            (
+                "gather/query--ng_event_security.html",
+                "ng_event_security",
+                "Security",
+            ),
+            (
+                "gather/query--ng_event_new_devices.html",
+                "ng_event_new_devices",
+                "New devices",
+            ),
+            (
+                "gather/query--ng_person_movements.html",
+                "ng_person_movements",
+                "Comings and goings",
+            ),
+        ] {
+            let html = render(template, query_id, serde_json::json!([]));
+            assert!(
+                html.contains(&format!("aria-current=\"page\">{label}</a>")),
+                "{template} does not mark {label}: {html}"
+            );
+            assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{html}");
+        }
+        // One device's events are in the section and are none of its tabs.
+        let device = render(
+            "gather/query--ng_event_by_device.html",
+            "ng_event_by_device",
+            serde_json::json!([]),
+        );
+        assert!(device.contains("class=\"ng-tabs\""), "{device}");
+        assert!(!device.contains("aria-current"), "{device}");
+    }
+
+    /// The tab strip is styled, stays one line, and has a dark-mode rule.
+    #[test]
+    fn the_stylesheet_keeps_the_tabs_on_one_line_in_both_schemes() {
+        let css = include_str!("../../../static/css/netgrasp.css");
+        let (_, tabs) = css.split_once(".ng-tabs {").unwrap_or_default();
+        assert!(
+            tabs.contains("overflow-x: auto"),
+            "the strip would push the page sideways"
+        );
+        assert!(css.contains("flex-wrap: nowrap"));
+        assert!(
+            css.contains("min-height: 44px"),
+            "the tabs are smaller than a thumb"
+        );
+        let dark = css
+            .split("@media (prefers-color-scheme: dark)")
+            .skip(1)
+            .collect::<String>();
+        assert!(dark.contains(".ng-tabs__tab--active"), "no dark-mode tab");
     }
 
     /// Tera comments are not markup, and this file's comments discuss the very

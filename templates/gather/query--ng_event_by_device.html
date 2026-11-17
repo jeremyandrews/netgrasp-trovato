@@ -7,6 +7,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
 {# An unresolved `url_arg` filter is dropped rather than matched as empty, so
    this route with no `device` returns the whole event log rather than none. #}
 {% block summary %}

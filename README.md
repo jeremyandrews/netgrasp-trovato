@@ -19,7 +19,7 @@ docker compose -f docker-compose.demo.yml up
 ```
 
 Then open **http://localhost:3101/**, which redirects to `/overview`. The
-[eight-entry navigation](#the-pages) reaches every page from there.
+[four-entry navigation](#the-pages) reaches every page from there.
 `scripts/verify-demo.sh` checks the same thing from a terminal, and CI runs it
 against this demo.
 
@@ -185,6 +185,26 @@ this table, and the daemon is upgraded and migrated first: `netgraspd migrate`
 against an empty database, then this plugin. A release of either that does not
 touch the schema pairs with the other side's current release, and says so here.
 
+## Deploying: the kernel's own plugins
+
+The four-entry menu needs nothing from the deployment. What the deployment
+decides is whether the kernel plugins behind the old entries stay enabled at
+all: a network monitor uses none of them, and netgrasp does not switch off
+another plugin, because a site that has a blog would lose it. On a netgrasp-only
+site, add these to the container's startup command, before `serve`. Each takes
+one name, writes `plugin_status`, and takes effect at the next start:
+
+```bash
+./trovato plugin disable trovato_blog
+./trovato plugin disable trovato_media
+./trovato plugin disable trovato_categories
+./trovato plugin disable trovato_content_translation
+```
+
+Keep `trovato_redirects` enabled: `/who-is-home` and the `/gather/<id>` paths
+answer with its 301s. Verified on the demo stack: with the four disabled every
+netgrasp page still renders and `scripts/verify-demo.sh` passes.
+
 ## Installing onto a stock Trovato
 
 ### From a release
@@ -242,7 +262,7 @@ export TEMPLATES_DIR="$TROVATO/templates:$PWD/templates"
 export STATIC_DIR="$TROVATO/static:$PWD/static"
 export DATABASE_URL=postgres://trovato:trovato@localhost:5432/netgrasp
 
-# 3. Install. Runs the six migrations and enables the plugin.
+# 3. Install. Runs the migrations and enables the plugin.
 $TROVATO/target/release/trovato plugin install netgrasp
 
 # 4. Serve.
@@ -279,29 +299,44 @@ without being copied into the image.
 | URL | What it is |
 |---|---|
 | `/` | redirects to `/overview` |
-| `/overview` | who is home and since when, today's arrivals and departures, devices new this week, the security event count |
+| `/overview` | **Home** in the menu: who is home and since when, today's arrivals and departures, devices new this week, the security event count |
+| `/devices` | **Devices** in the menu: what is on the network right now (the Online tab) |
+| `/devices/all` | every device the daemon has seen, except the hidden ones |
+| `/activity` | **Activity** in the menu: arrivals, departures, new devices, and the three security events worth acting on (spoofing, rogue DHCP, address conflicts) |
 | `/people/home` | the people the daemon counts as home, with the time each arrived |
 | `/people/movements` | every arrival and departure; `?day=YYYY-MM-DD` for one day |
 | `/devices/new` | devices first seen in the last seven days, with the daemon's fingerprint and how sure it is |
 | `/devices/todo` | devices nobody has named or given an owner: what is left to do after a new device appears |
 | `/events/new-devices` | every `new_device` event the daemon recorded |
-| `/devices/online` | what is on the network right now |
+| `/devices/online` | what is on the network right now; the same page as `/devices` |
 | `/devices/location` | devices grouped by where the daemon's UniFi enrichment placed them; empty, and saying why, when enrichment is off |
-| `/devices` | every device the daemon has seen |
 | `/devices/type?device_type=…` | one device type; reached by clicking a Type cell |
 | `/devices/owner?owner=…` | one person's devices; reached by clicking an Owner chip |
-| `/who-is-home` | online devices grouped by the person who owns them |
-| `/people` | people devices can belong to |
+| `/who-is-home` | a 301 to `/people/home` |
+| `/people` | **People** in the menu: people devices can belong to |
 | `/events` | everything the daemon noticed, security rows flagged in place |
 | `/events/security` | scans, spoofs, rogue DHCP, conflicts, identity changes |
 | `/events/device?device=…` | one device's events; reached by clicking a Device chip |
 
-The navigation is eight `tap_menu` entries the kernel renders as the site menu.
-They appear because `005_netgrasp_web_interface.sql` grants
-`view netgrasp devices` to the anonymous role — the assumption being a localhost
-dashboard with no login. To put the whole thing behind a login, delete that one
-`INSERT`: the `network_viewer` role already holds the same permission, so an
-authenticated viewer keeps the navigation with no further change.
+The navigation is four entries: **Home, Devices, People, Activity**
+(`docs/UI.md`, "Navigation"). Every other page is a tab on one of them or is
+reached from a row. `011_netgrasp_navigation.sql` writes them as `menu_link`
+rows, and the kernel draws `menu_link` rows instead of every plugin's `tap_menu`
+entries whenever the site has any, so they are the whole site menu from the
+next request: the kernel's own Home, Translate, Post, Blog, Terms, Translate
+Language and Media entries leave the bar with no restart. The plugin's
+`tap_menu` declares the same four as the fallback for a site that empties
+`menu_link`. The rows are editable at `/admin/structure/menus`, and a second run
+of the migration leaves an edited row alone.
+
+The kernel draws no second menu level, so a section's pages are tabs drawn by
+the page itself (`templates/gather/netgrasp/tabs.html`). Activity's tabs are
+Notable, Comings and goings, New devices, Security and Everything.
+
+Every old path still answers. `/devices` now opens on what is online and the
+full list is `/devices/all`; `/who-is-home` is a real 301 to `/people/home`,
+from the `redirect` table, which the `trovato_redirects` plugin serves (it is on
+by default; keep it on).
 
 `/` lands on the online devices because the same migration sets
 `site_front_page`, which Trovato serves as a redirect for any internal path. It
@@ -403,7 +438,7 @@ scripting off.
 
 ## Verifying a change
 
-- `cargo test --workspace` — 289 tests, including drift checks that tie the
+- `cargo test --workspace` — over 300 tests, including drift checks that tie the
   templates, the manifest, the migrations and the demo compose file to each
   other. Several exist because
   a Tera render that reaches for an undefined variable does not warn: it aborts,

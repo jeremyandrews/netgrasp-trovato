@@ -1,0 +1,40 @@
+{#
+    Activity, the Notable tab. /activity, and the site menu's Activity entry.
+
+    Comings and goings, devices seen for the first time, and the three security
+    events a person can act on (spoofing, a second DHCP server, an address
+    conflict), newest first. The list is `NOTABLE_EVENT_TYPES` in
+    netgrasp-core and the `ng_activity` gather's filter in
+    011_netgrasp_navigation.sql, which says why the default is short: the
+    whole log is mostly `ip_changed`, and it is the Everything tab.
+
+    The rows are ordinary `ng_event` records, so the table is the event table
+    every event page draws, security rows flagged in place and a row menu on
+    every row that has a device.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block tabs %}{% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">notable event{{ total | pluralize }}</span>
+    </span>
+    <span class="ng-summary__scope">
+        {%- if total_pages > 1 %}page {{ page }} of {{ total_pages }} &middot; {% endif -%}
+        arrivals, departures, new devices, spoofing, rogue DHCP and address conflicts.
+        <a href="/events">Everything</a>
+    </span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/event-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    Nobody has come or gone, no new device has appeared, and nothing has been
+    spoofed. Routine changes are under <a href="/events">Everything</a>.
+</span>
+{% endblock %}

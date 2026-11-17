@@ -1,5 +1,9 @@
 {#
-    Who is home. /who-is-home
+    Who is home. /gather/ng_who_is_home
+
+    /who-is-home was this page's address until 011_netgrasp_navigation.sql made
+    it a 301 to /people/home, the People page's Home now tab. The gather stays,
+    and answers at its own /gather/ path, so nothing that read it breaks.
 
     A device gather read as a people page. The rows are online devices that
     belong to somebody — with no grouping in QueryDefinition, a person with
@@ -101,6 +105,6 @@
 <span class="ng-empty__hint">
     A device counts as somebody being home once it has an owner. Nothing here
     means no owned device is online — or that no device has been given an owner
-    yet. <a href="/people">People</a>, <a href="/devices/online">online devices</a>.
+    yet. <a href="/people">People</a>, <a href="/devices">online devices</a>.
 </span>
 {% endblock %}

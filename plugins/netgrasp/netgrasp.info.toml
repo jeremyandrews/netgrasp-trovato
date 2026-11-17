@@ -79,6 +79,7 @@ files = [
     "migrations/008_netgrasp_overview.sql",
     "migrations/009_netgrasp_locations.sql",
     "migrations/010_netgrasp_new_devices.sql",
+    "migrations/011_netgrasp_navigation.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).

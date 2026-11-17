@@ -62,11 +62,38 @@ expect 'class="ng-menu"' "a row menu on a new device"
 echo "    /overview renders the overview, with the seeded people and devices"
 
 # The three pages the overview links to.
-for path in /people/home /people/movements /devices/new /devices/location /devices/todo /events/new-devices; do
+# The site menu: exactly Home, Devices, People and Activity from netgrasp, in
+# that order, and none of the kernel's own entries (Translate, Post, Blog, Terms,
+# Media, a second Home). The menu is the `site-nav__link` anchors before the
+# divider; Login, Admin, Profile and Logout come after it and are the theme's.
+curl -s -o "$PAGE" "$BASE/overview"
+menu="$(sed -n '/<nav class="site-nav"/,/site-nav__divider/p' "$PAGE" \
+    | grep -o 'class="site-nav__link[^"]*"[^>]*>[^<]*' | sed 's/.*>//' | tr '\n' '|')"
+[ "$menu" = "Home|Devices|People|Activity|" ] || fail "the site menu reads '$menu'"
+echo "    the menu reads Home, Devices, People, Activity"
+
+# Every page a person can reach, old paths included, renders netgrasp's chrome.
+for path in /devices /devices/online /devices/all /devices/new /devices/todo \
+    /devices/type /devices/location /people /people/home /people/movements \
+    /activity /events /events/security /events/new-devices; do
     code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE$path")"
     [ "$code" = "200" ] || fail "$path answered $code"
     grep -q 'class="ng-page ' "$PAGE" || fail "$path did not render netgrasp's page chrome"
     echo "    $path renders"
 done
+
+# The one page that went away answers with a real 301.
+redirect="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/who-is-home")"
+case "$redirect" in
+    "301 "*/people/home) echo "    /who-is-home is a 301 to /people/home" ;;
+    *) fail "/who-is-home answered '$redirect', not a 301 to /people/home" ;;
+esac
+
+# /devices is the Online tab: the online gather's page, not the full list.
+curl -s -o "$PAGE" "$BASE/devices"
+grep -q 'data-query-id="ng_device_online"' "$PAGE" || fail "/devices is not the online devices"
+curl -s -o "$PAGE" "$BASE/devices/all"
+grep -q 'data-query-id="ng_device_list"' "$PAGE" || fail "/devices/all is not every device"
+echo "    /devices is what is online, /devices/all is everything"
 
 echo "==> the demo's front page is the overview"

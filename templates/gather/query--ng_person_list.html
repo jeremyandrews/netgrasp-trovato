@@ -19,7 +19,7 @@
         <span class="ng-summary__count">{{ total }}</span>
         <span class="ng-summary__label">{{ total | pluralize(singular="person", plural="people") }}</span>
     </span>
-    <span class="ng-summary__scope"><a href="/who-is-home">Who is home</a></span>
+    <span class="ng-summary__scope"><a href="/people/home">Home now</a></span>
 </div>
 {% endblock %}
 
@@ -102,6 +102,6 @@
 {% block empty %}
 <span class="ng-empty__hint">
     A person is an Item, created like any other content. Add one, then set it as
-    a device's owner to see them on <a href="/who-is-home">Who is home</a>.
+    a device's owner to see them on <a href="/people/home">Home now</a>.
 </span>
 {% endblock %}

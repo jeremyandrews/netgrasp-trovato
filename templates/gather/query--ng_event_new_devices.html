@@ -12,6 +12,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
 {% block summary %}
 <div class="ng-summary">
     <span class="ng-summary__item">

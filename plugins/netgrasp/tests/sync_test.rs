@@ -4387,3 +4387,125 @@ fn a_post_with_no_token_never_reaches_the_plugin() {
         );
     });
 }
+
+/// **The navigation, applied to a real kernel database**: the site menu is
+/// exactly the four rows the kernel will draw, /devices opens on what is online,
+/// the full list moved to /devices/all, and /who-is-home is one 301 to the Home
+/// now tab, however many times the migrations have run (every test here runs
+/// them all again on the same database).
+#[test]
+fn the_navigation_migration_writes_four_menu_rows_the_aliases_and_one_redirect() {
+    serial(async {
+        let pool = fresh_pool().await;
+
+        let menu: Vec<(String, String, i32)> = sqlx::query_as(
+            "SELECT path::text, title::text, weight FROM menu_link \
+             WHERE menu_name = 'main' AND stage_id = '0193a5a0-0000-7000-8000-000000000001' \
+             ORDER BY weight, title",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let titles: Vec<&str> = menu.iter().map(|m| m.1.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Home", "Devices", "People", "Activity"],
+            "{menu:?}"
+        );
+
+        let source = |alias: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT source::text FROM url_alias WHERE alias = $1 AND language = 'en'",
+                )
+                .bind(alias)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{alias} has no alias: {e}"))
+            }
+        };
+        assert_eq!(source("/devices").await, "/gather/ng_device_online");
+        assert_eq!(source("/devices/online").await, "/gather/ng_device_online");
+        assert_eq!(source("/devices/all").await, "/gather/ng_device_list");
+        assert_eq!(source("/activity").await, "/gather/ng_activity");
+        // The page that went away keeps its alias; the redirect answers first.
+        assert_eq!(source("/who-is-home").await, "/gather/ng_who_is_home");
+
+        let redirects: Vec<(String, i16)> = sqlx::query_as(
+            "SELECT destination::text, status_code FROM redirect WHERE source = '/who-is-home'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(redirects, [("/people/home".to_string(), 301)]);
+
+        let canonical: String = sqlx::query_scalar(
+            "SELECT display ->> 'canonical_url' FROM gather_query WHERE query_id = 'ng_device_list'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(canonical, "/devices/all");
+    });
+}
+
+/// **Activity's default tab** lists the arrivals, departures, new devices and
+/// the three actionable security events, and none of the routine or noisy
+/// ones, and renders them in the event table with its tabs.
+#[test]
+fn activity_lists_the_notable_events_and_leaves_out_the_noise() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let device = seed_device(&pool, "aa:bb:cc:00:00:31", None, "online").await;
+        for event_type in [
+            "ip_changed",
+            "ip_changed",
+            "arp_scan",
+            "identity_change",
+            "name_updated",
+            "new_device",
+            "person_arrived",
+            "person_departed",
+            "arp_spoof",
+            "ip_conflict",
+            "rogue_dhcp",
+        ] {
+            sqlx::query(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+                 VALUES ($1, $2, to_timestamp($3))",
+            )
+            .bind(device)
+            .bind(event_type)
+            .bind(now() as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_activity", HashMap::new()).await;
+        let mut types: Vec<String> = rows
+            .iter()
+            .map(|r| r["event_type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        types.sort();
+        let mut expected: Vec<String> = netgrasp_core::model::NOTABLE_EVENT_TYPES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(types, expected);
+        assert_eq!(
+            run_gather(&gather, &pool, "ng_event_log", HashMap::new()).await,
+            11,
+            "Everything is still everything"
+        );
+
+        let html = render_page("ng_activity", "Activity", "/activity", &rows);
+        assert!(html.contains("ng-tabs__tab--active"), "{html}");
+        assert!(html.contains("ng-row--security"), "{html}");
+        assert!(html.contains("ng-menu__button"), "{html}");
+    });
+}

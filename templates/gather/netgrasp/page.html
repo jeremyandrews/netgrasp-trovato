@@ -29,6 +29,9 @@
     ===========================================================================
     Blocks a child fills
     ===========================================================================
+    - `tabs`     — the section's tab strip, under the heading. Drawn whether
+                   or not there are rows, since an empty tab is still a tab
+                   somebody has to be able to leave (gather/netgrasp/tabs.html).
     - `summary`  — an optional line above the table (the device pages count
                    states here).
     - `results`  — the table or list itself. Rendered only when there are rows;
@@ -70,6 +73,8 @@
 <div class="ng-page ng-page--{{ query.query_id }}" data-query-id="{{ query.query_id }}"
      data-ng-refresh="{{ ng_refresh }}">
     <h1 class="ng-page__title">{{ query.label }}</h1>
+
+    {% block tabs %}{% endblock %}
 
     {#
         The network assistant, on every listing page.

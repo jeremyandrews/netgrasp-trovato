@@ -838,3 +838,109 @@
         color: #94a3b8;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * Section tabs (gather/netgrasp/tabs.html)
+ * --------------------------------------------------------------------------
+ * A section's pages, as a strip under its heading. The site menu cannot show
+ * which of them is open (the kernel's active-link check is an exact path
+ * match, and it draws no second level), so the strip does.
+ *
+ * One line at every width. On a phone it scrolls sideways inside itself and the
+ * page never does (docs/UI.md, phone rule 3). Each tab is at least 44 px tall,
+ * which is a thumb (rule 2).
+ * ------------------------------------------------------------------------ */
+
+.ng-tabs {
+    margin: 0.5rem 0 1rem 0;
+    border-bottom: 1px solid var(--ng-border);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+}
+
+.ng-tabs__list {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0.25rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.ng-tabs__item {
+    flex: 0 0 auto;
+    margin: 0;
+}
+
+.ng-tabs__tab {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 0.875rem;
+    border-bottom: 3px solid transparent;
+    color: var(--gray-600);
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.ng-tabs__tab:hover {
+    color: var(--gray-900);
+    background: var(--ng-hover);
+}
+
+.ng-tabs__tab:focus-visible {
+    outline: 2px solid var(--primary, #6366f1);
+    outline-offset: -2px;
+}
+
+.ng-tabs__tab--active {
+    border-bottom-color: var(--primary, #6366f1);
+    color: var(--gray-900);
+    font-weight: 600;
+}
+
+/* --------------------------------------------------------------------------
+ * The site menu on a phone
+ * --------------------------------------------------------------------------
+ * The menu is the kernel's, and on a narrow screen its theme only wraps the
+ * row. Four entries plus Admin, Profile and Logout wrap to three rows at the
+ * theme's padding; at this padding they take two (docs/UI.md, phone rule 6).
+ * Scoped to the width where it matters, and only on netgrasp's pages, since
+ * that is where this stylesheet is loaded.
+ * ------------------------------------------------------------------------ */
+
+@media (max-width: 640px) {
+    .site-nav {
+        gap: 0;
+        row-gap: 0.125rem;
+    }
+
+    .site-nav .site-nav__link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 0 0.6rem;
+    }
+
+    .site-nav__divider {
+        margin: 0 0.125rem;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .ng-tabs__tab {
+        color: #94a3b8;
+    }
+
+    .ng-tabs__tab:hover,
+    .ng-tabs__tab--active {
+        color: #e2e8f0;
+    }
+
+    .ng-tabs__tab--active {
+        border-bottom-color: #818cf8;
+    }
+}
