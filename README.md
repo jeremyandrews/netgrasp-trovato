@@ -246,9 +246,80 @@ export TEMPLATES_DIR="$TROVATO/templates:$NG/templates"
 export STATIC_DIR="$TROVATO/static:$NG/static"
 ```
 
-Then install and serve as in steps 3 to 5 below. With the published kernel
-image, mount the three directories and set the same variables on the container;
-`docker-compose.demo.yml` shows how.
+Then install and serve as in steps 3 to 5 below.
+
+#### Onto the published kernel image, beside the daemon
+
+`docker-compose.demo.yml` is not this case: it builds the module from source,
+bind-mounts `templates/` and `static/` from the clone, and brings its own
+Postgres with demo rows. With the tarball extracted to `$NG` as above, a daemon
+that has already run `netgraspd migrate` on its database, and no Rust:
+
+```bash
+img=ghcr.io/jeremyandrews/trovato:0.102.0   # or any later 0.x
+run() {
+  docker run --rm --network host \
+    -e DATABASE_URL=postgres://ROLE:PASSWORD@127.0.0.1:5432/netgrasp \
+    -e REDIS_URL=redis://127.0.0.1:6379 \
+    -e PLUGINS_DIR=/app/plugins:/netgrasp/plugins \
+    -e TEMPLATES_DIR=/app/templates:/netgrasp/templates \
+    -e STATIC_DIR=/app/static:/netgrasp/static \
+    -v "$NG/plugins:/netgrasp/plugins:ro" \
+    -v "$NG/templates:/netgrasp/templates:ro" \
+    -v "$NG/static:/netgrasp/static:ro" \
+    "$@"
+}
+run "$img" ./trovato plugin install netgrasp   # migrations, then enable
+run -d -e PORT=3000 "$img" ./trovato serve
+scripts/first-run.sh http://127.0.0.1:3000     # a brand new database only (step 5)
+```
+
+`podman run` takes the same arguments. Under Kubernetes the image in the next
+section does the copying, and the variables are the same.
+
+**Which database role.** The kernel shares the daemon's database, so
+`DATABASE_URL` names a role there. Two ways work:
+
+- **The daemon's own role**, the one that owns the `ng_` tables. Nothing to
+  grant. It is the simplest, and the kernel can then write any daemon column,
+  which the plugin's code is the only thing preventing.
+- **A role of the kernel's own**, which needs `CREATE` on the schema (for the
+  kernel's tables and the plugin's own `ng_state` and `ng_person_merge`) and
+  these on the daemon's tables, run as their owner after every
+  `netgraspd migrate` so tables a new daemon version adds are covered:
+
+  ```sql
+  -- every ng_ table and view; run as their owner, this reaches only the
+  -- tables that role owns, and Postgres warns about the rest
+  GRANT SELECT ON ALL TABLES IN SCHEMA public TO trovato;
+  -- the admin's edits, the Item link and the dirty flag the cron sweep lowers
+  GRANT UPDATE (display_name, notes, hidden, notify, owner_item_id,
+                trovato_item_id, sync_state) ON ng_devices TO trovato;
+  -- the person mirror: an upsert on item_id, and a delete when a person goes
+  GRANT INSERT (item_id, name, notes, notify_arrive, notify_depart),
+        UPDATE (item_id, name, notes, notify_arrive, notify_depart),
+        DELETE ON ng_people TO trovato;
+  -- the cron sweep prunes expired events
+  GRANT DELETE ON ng_events TO trovato;
+  -- Send test on /alerts
+  GRANT INSERT (requested_by) ON ng_notify_requests TO trovato;
+  ```
+
+  The plugin's migrations are written for this: wherever they touch a daemon
+  table they create nothing on it unless the role owns it, and a test applies
+  them as a role that owns no daemon table.
+
+**The expected warning.** `plugin install` from the tarball prints
+
+```
+Warning: WASM not found at '/netgrasp/target/wasm32-wasip1/release/netgrasp.wasm'. Build it first with:
+  cargo build --target wasm32-wasip1 -p netgrasp --release
+```
+
+It is harmless and needs no Rust. `plugin install` offers to copy a fresh build
+over the module in the plugin directory, looking for one under a `target/` next
+to it; a release has none, so it carries on with the tarball's `netgrasp.wasm`,
+runs the migrations and enables the plugin.
 
 ### From the image
 
@@ -304,8 +375,8 @@ than one plugins directory; the later directory on the search path wins`, naming
 both. That is over. Trovato removed its copy when netgrasp was extracted, so
 neither the source tree nor the published image carries one, and the overlay is
 the only netgrasp the kernel discovers. Verified against the
-published kernel image this repository pins, whose `/app/plugins` holds 38
-plugin directories and no `netgrasp`.
+published kernel image this repository pins (`0.102.0`), whose `/app/plugins`
+holds 39 entries, 37 of them plugins with a manifest, and no `netgrasp`.
 
 The precedence still matters for the other two paths, and it is still the reason
 they are search paths: `TEMPLATES_DIR` is how a netgrasp template could override

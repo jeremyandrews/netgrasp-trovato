@@ -1815,3 +1815,127 @@ async fn the_alerting_devices_are_counted_and_listed_by_owner() {
         "every visible device, muted too"
     );
 }
+
+// ===========================================================================
+// 017: the plugin's duplicate open-row indexes
+// ===========================================================================
+
+/// The plugin's 017, which drops 001's copies of the daemon's two open-row
+/// indexes where the daemon already has its own (issue #15).
+const DROP_DUPLICATE_INDEXES: &str = include_str!(
+    "../../../plugins/netgrasp/migrations/017_netgrasp_drop_duplicate_open_indexes.sql"
+);
+
+/// The unique indexes on one table, by name.
+async fn unique_indexes_on(conn: &mut PgConnection, test: &str, table: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_class t ON t.oid = i.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = $1 AND t.relname = $2 AND i.indisunique AND NOT i.indisprimary \
+         ORDER BY 1",
+    )
+    .bind(format!("ng_fx_{}_{test}", std::process::id()))
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap()
+}
+
+/// The supported order: the daemon migrates, then the plugin installs as a
+/// role that owns the tables. 001 adds a second identical index to each of the
+/// two timelines; 017 drops exactly those, keeps the daemon's, and a rerun of
+/// 017 is a no-op.
+#[tokio::test]
+async fn the_plugins_duplicate_open_indexes_go_and_the_daemons_stay() {
+    let mut conn = scratch(
+        "dup_shared",
+        &format!("{DAEMON_SCHEMA}\n{PLUGIN_MIGRATION}"),
+    )
+    .await;
+    assert_eq!(
+        unique_indexes_on(&mut conn, "dup_shared", "ng_presence").await,
+        ["ng_presence_open_idx", "uniq_ng_presence_open"],
+        "001 no longer adds the duplicate this test is about"
+    );
+
+    for _ in 0..2 {
+        sqlx::raw_sql(DROP_DUPLICATE_INDEXES)
+            .execute(&mut conn)
+            .await
+            .expect("017 applies");
+        assert_eq!(
+            unique_indexes_on(&mut conn, "dup_shared", "ng_presence").await,
+            ["ng_presence_open_idx"]
+        );
+        assert_eq!(
+            unique_indexes_on(&mut conn, "dup_shared", "ng_location_history").await,
+            ["ng_location_history_open_idx"]
+        );
+    }
+}
+
+/// With no daemon, the plugin created the tables and its index is the only
+/// thing keeping one open row per device, so 017 must leave it.
+#[tokio::test]
+async fn with_no_daemon_the_plugins_open_indexes_stay() {
+    let mut conn = scratch(
+        "dup_alone",
+        &format!("{PLUGIN_MIGRATION}\n{DROP_DUPLICATE_INDEXES}"),
+    )
+    .await;
+    assert_eq!(
+        unique_indexes_on(&mut conn, "dup_alone", "ng_presence").await,
+        ["uniq_ng_presence_open"]
+    );
+    assert_eq!(
+        unique_indexes_on(&mut conn, "dup_alone", "ng_location_history").await,
+        ["uniq_ng_location_open"]
+    );
+}
+
+/// The kernel connecting as a role that does NOT own the daemon's tables, the
+/// way a deployment that grants the kernel a role of its own runs: 001, 015 and
+/// 017 must all apply, and leave the daemon's indexes alone. An unguarded
+/// `CREATE INDEX IF NOT EXISTS` on a daemon table fails here with `must be
+/// owner`, which fails `trovato plugin install`, which stops the kernel.
+#[tokio::test]
+async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
+    let test = "not_owner";
+    let mut conn = daemon_db(test).await;
+    let schema = format!("ng_fx_{}_{test}", std::process::id());
+    let role = format!("ng_fx_kernel_{}", std::process::id());
+    conn.execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+        .await
+        .ok();
+    conn.execute(format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER").as_str())
+        .await
+        .unwrap();
+    conn.execute(format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}").as_str())
+        .await
+        .unwrap();
+    conn.execute(format!("SET ROLE {role}").as_str())
+        .await
+        .unwrap();
+
+    let applied = sqlx::raw_sql(&format!(
+        "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}"
+    ))
+    .execute(&mut conn)
+    .await;
+
+    conn.execute("RESET ROLE").await.unwrap();
+    let presence = unique_indexes_on(&mut conn, test, "ng_presence").await;
+    let location = unique_indexes_on(&mut conn, test, "ng_location_history").await;
+    conn.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    conn.execute(format!("DROP ROLE {role}").as_str())
+        .await
+        .unwrap();
+
+    applied.expect("001, 015 and 017 apply as a role that owns no daemon table");
+    assert_eq!(presence, ["ng_presence_open_idx"]);
+    assert_eq!(location, ["ng_location_history_open_idx"]);
+}

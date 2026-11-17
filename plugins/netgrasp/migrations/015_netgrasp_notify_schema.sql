@@ -41,5 +41,19 @@ CREATE TABLE IF NOT EXISTS ng_notify_requests (
     handled_at_epoch   BIGINT GENERATED ALWAYS AS
         (EXTRACT(EPOCH FROM (handled_at AT TIME ZONE 'UTC'))::bigint) STORED
 );
-CREATE INDEX IF NOT EXISTS ng_notify_requests_pending_idx ON ng_notify_requests (id)
-    WHERE handled_at IS NULL;
+-- Guarded on ownership, as 001's indexes are. On a shared install the daemon
+-- owns this table and has already created this index, and `CREATE INDEX IF NOT
+-- EXISTS` is no way out: Postgres checks ownership of the table before it looks
+-- at the index name, so a kernel connecting as any other role would fail here
+-- with `must be owner of table ng_notify_requests`, and the install with it.
+DO $$
+BEGIN
+    IF pg_catalog.pg_has_role(
+        current_user,
+        (SELECT relowner FROM pg_catalog.pg_class WHERE oid = 'ng_notify_requests'::regclass),
+        'USAGE'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS ng_notify_requests_pending_idx ON ng_notify_requests (id)
+            WHERE handled_at IS NULL;
+    END IF;
+END $$;
