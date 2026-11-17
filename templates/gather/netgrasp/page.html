@@ -100,7 +100,24 @@
         search for a name would be a different and wrong one. `filter_values`
         holds only the keys a request gave, hence `is defined`.
     #}
-    {% if rows | length == 0 and filter_values.search is defined and filter_values.search %}
+    {#
+        Rows that arrived with nothing in them: the viewer does not hold `view
+        netgrasp devices`, and the plugin's `tap_field_access` had the kernel
+        strip every field (013). A row keeps only the columns no field maps,
+        such as its id, so the test is that none of the fields a netgrasp row
+        is drawn from survived: a device's MAC, an event's type, a person's
+        name, Home's date, an Item's title. Saying "sign in" beats drawing a
+        table of blanks, and beats raising on the first missing column, which
+        would fall back to the kernel's dump of the row.
+    #}
+    {% set ng_first = rows | first %}
+    {% if rows | length > 0 and ng_first.mac is undefined and ng_first.event_type is undefined
+          and ng_first.name is undefined and ng_first.today is undefined and ng_first.title is undefined %}
+    <p class="ng-empty ng-empty--signin">
+        Sign in to see the devices on this network.
+        <span class="ng-empty__hint"><a href="/user/login">Sign in</a></span>
+    </p>
+    {% elif rows | length == 0 and filter_values.search is defined and filter_values.search %}
     <p class="ng-empty ng-empty--search">
         No device matches &lsquo;{{ filter_values.search }}&rsquo;.
         <span class="ng-empty__hint"><a href="{{ base_path }}">Show them all</a>.</span>

@@ -1493,8 +1493,11 @@ fn no_overview_include_is_named_after_a_column_it_would_overwrite() {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Both relations: the overview view and Home's view over it, which is
+        // what the record type now reads and so what the includes land on.
         let columns: HashSet<String> = sqlx::query_scalar(
-            "SELECT column_name::text FROM information_schema.columns WHERE table_name = 'ng_overview'",
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_name IN ('ng_overview', 'ng_home')",
         )
         .fetch_all(&pool)
         .await
@@ -1502,7 +1505,7 @@ fn no_overview_include_is_named_after_a_column_it_would_overwrite() {
         .into_iter()
         .collect();
         let names: Vec<&String> = includes.as_object().unwrap().keys().collect();
-        assert_eq!(names.len(), 3, "{includes}");
+        assert_eq!(names.len(), 5, "{includes}");
         for name in names {
             assert!(
                 !columns.contains(name),
@@ -1564,6 +1567,34 @@ fn each_overview_list_agrees_with_the_page_it_links_to() {
                 assert_ne!(child["sorts"], page["sorts"], "{include}");
             }
         }
+
+        // Home's "Needs attention" is /devices/new's definition plus exactly
+        // the To sort tab's two conditions, and at most six rows.
+        let attention = &overview["includes"]["attention"];
+        let new = definition("ng_devices_new").await;
+        let todo = definition("ng_devices_todo").await;
+        assert_eq!(attention["definition"]["record_type"], new["record_type"]);
+        assert_eq!(attention["definition"]["sorts"], new["sorts"]);
+        let mut expected: Vec<serde_json::Value> = new["filters"].as_array().unwrap().clone();
+        expected.extend(
+            todo["filters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["operator"] == "is_null")
+                .cloned(),
+        );
+        assert_eq!(
+            attention["definition"]["filters"].as_array().unwrap(),
+            &expected,
+            "Needs attention is not New this week and To sort"
+        );
+        assert_eq!(attention["display"]["items_per_page"], 6);
+        // Who is away reads the same people, by the other state.
+        assert_eq!(
+            overview["includes"]["away"]["definition"]["record_type"],
+            overview["includes"]["home"]["definition"]["record_type"]
+        );
     });
 }
 
@@ -1621,10 +1652,28 @@ fn the_overview_counts_and_lists_what_the_house_is_doing_today() {
         // thing ng_people could not give it.
         assert!(ov["home"][0]["last_arrived_at_epoch"].is_i64(), "{ov}");
 
+        // Home's own counts and lists (013): who is out, what is unsorted (the
+        // year-old NAS too, but not the hidden device nor the owned phone),
+        // what of that is new, and the actionable security events by type.
+        assert_eq!(names(&ov["away"], "name"), ["Arlo"], "{ov}");
+        assert_eq!(ov["devices_unsorted"], 3, "{ov}");
+        assert_eq!(
+            names(&ov["attention"], "mac"),
+            ["aa:bb:cc:00:01:04", "aa:bb:cc:00:01:05"],
+            "new and unsorted, newest first"
+        );
+        assert_eq!(ov["arp_spoof_24h"], 1, "{ov}");
+        assert_eq!(ov["ip_conflict_24h"], 1, "{ov}");
+        assert_eq!(ov["rogue_dhcp_24h"], 0, "{ov}");
+
         let html = render_page("ng_overview", "Overview", "/overview", &rows);
         for expected in [
             "Aurora",
-            "Home since",
+            "home since",
+            "Away:",
+            "1 ARP spoofing warning today",
+            "1 address conflict today",
+            "1 more device has no owner.",
             "via Driveway",
             "via Gate",
             "Left",
@@ -1633,13 +1682,14 @@ fn the_overview_counts_and_lists_what_the_house_is_doing_today() {
             "aa:bb:cc:00:01:05",
             "ng-menu__button",
             "href=\"/events/security\"",
-            "ng-stat--alert",
+            "ng-attention__alert",
         ] {
             assert!(
                 html.contains(expected),
                 "the overview lost {expected:?}: {html}"
             );
         }
+        assert!(!html.contains("rogue DHCP"), "{html}");
     });
 }
 
@@ -1702,12 +1752,17 @@ fn an_empty_house_still_has_an_overview() {
         let gather = wire_gather(&pool).await;
         let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
         assert_eq!(rows.len(), 1);
-        for list in ["home", "movements", "new_devices"] {
+        for list in ["home", "away", "movements", "new_devices", "attention"] {
             assert_eq!(rows[0][list], serde_json::json!([]), "{list}: {}", rows[0]);
         }
         let html = render_page("ng_overview", "Overview", "/overview", &rows);
-        assert!(html.contains("Nobody is home."), "{html}");
-        assert!(!html.contains("ng-stat--alert"), "{html}");
+        // Nobody added yet: the one sentence that says so, not "0 of 0".
+        assert!(
+            html.contains("Netgrasp doesn't know whose devices are whose yet."),
+            "{html}"
+        );
+        assert!(html.contains("Nothing needs you."), "{html}");
+        assert!(!html.contains("ng-attention__alert"), "{html}");
     });
 }
 
@@ -2235,6 +2290,16 @@ async fn run_gather(
     gather_items(gather, query_id, url_args).await.len()
 }
 
+/// Somebody allowed to see the network: an authenticated viewer holding
+/// `view netgrasp devices`, which is who these pages are for. The kernel runs a
+/// gather with no viewer as an anonymous one, and since the plugin's
+/// `tap_field_access` an anonymous viewer gets every row with its fields
+/// stripped, so the gathers below are run as this viewer, and the anonymous
+/// case has a test of its own.
+fn network_viewer() -> UserContext {
+    UserContext::authenticated(Uuid::now_v7(), vec!["view netgrasp devices".into()])
+}
+
 /// The rows a seeded gather returns, for the assertions that are about what a
 /// row contains rather than how many there are.
 async fn gather_items(
@@ -2242,8 +2307,19 @@ async fn gather_items(
     query_id: &str,
     url_args: HashMap<String, String>,
 ) -> Vec<serde_json::Value> {
+    gather_items_as(gather, query_id, url_args, network_viewer()).await
+}
+
+/// The rows a seeded gather returns to one particular viewer.
+async fn gather_items_as(
+    gather: &GatherService,
+    query_id: &str,
+    url_args: HashMap<String, String>,
+    viewer: UserContext,
+) -> Vec<serde_json::Value> {
     let context = QueryContext {
         url_args,
+        viewer: Some(viewer),
         ..QueryContext::default()
     };
     gather
@@ -4527,6 +4603,7 @@ async fn searched(
 ) -> Vec<String> {
     let context = QueryContext {
         url_args,
+        viewer: Some(network_viewer()),
         ..QueryContext::default()
     };
     let exposed = if search.is_empty() {
@@ -4707,5 +4784,86 @@ fn by_type_with_no_type_lists_every_visible_device_typed_ones_first() {
         );
         assert!(html.contains("id=\"type-laptop\""), "{html}");
         assert!(html.contains("Not yet identified"), "{html}");
+    });
+}
+
+/// **Home never lists more than six devices to sort**, however many arrived
+/// this week, and says how many more there are.
+#[test]
+fn home_lists_at_most_six_devices_to_sort_and_counts_the_rest() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        for i in 0..9 {
+            seed_device(&pool, &format!("aa:bb:cc:00:02:{i:02x}"), None, "online").await;
+        }
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        let ov = &rows[0];
+        assert_eq!(ov["attention"].as_array().map(Vec::len), Some(6), "{ov}");
+        assert_eq!(ov["devices_unsorted"], 9, "{ov}");
+        let html = render_page("ng_overview", "Home", "/overview", &rows);
+        assert!(html.contains("3 more devices have no owner."), "{html}");
+        assert_eq!(html.matches("class=\"ng-assign\"").count(), 6, "{html}");
+    });
+}
+
+/// **An anonymous visitor reads no device data** (docs/UI.md, U1 check 7):
+/// through the real kernel gather and the plugin's real `tap_field_access`,
+/// every device, event and Home row reaches an anonymous viewer with no MAC,
+/// no name and no address in it, and the page asks them to sign in. A viewer
+/// with the permission sees everything, and so does an administrator.
+#[test]
+fn an_anonymous_viewer_gets_rows_with_nothing_in_them_and_a_sign_in() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let gather = wire_gather(&pool).await;
+
+        for (query_id, base) in [
+            ("ng_device_online", "/devices"),
+            ("ng_device_list", "/devices/all"),
+            ("ng_event_log", "/events"),
+            ("ng_activity", "/activity"),
+            ("ng_overview", "/overview"),
+            ("ng_people_home", "/people/home"),
+        ] {
+            let anon =
+                gather_items_as(&gather, query_id, HashMap::new(), UserContext::anonymous()).await;
+            assert!(!anon.is_empty(), "{query_id} returned no rows at all");
+            let text = serde_json::to_string(&anon).unwrap();
+            for secret in ["aa:bb:cc", "192.168.1.10", "Jamie", "jamie-phone", "Apple"] {
+                assert!(
+                    !text.contains(secret),
+                    "{query_id} showed {secret} to an anonymous viewer: {text}"
+                );
+            }
+            let html = render_page(query_id, "Netgrasp", base, &anon);
+            assert!(
+                html.contains("Sign in to see the devices on this network."),
+                "{query_id}: {html}"
+            );
+            assert!(!html.contains("aa:bb:cc"), "{query_id}: {html}");
+
+            let seen = gather_items(&gather, query_id, HashMap::new()).await;
+            let text = serde_json::to_string(&seen).unwrap();
+            assert!(
+                text.contains("aa:bb:cc") || text.contains("Jamie") || text.contains("event_type"),
+                "{query_id} hid data from a viewer with the permission: {text}"
+            );
+        }
+
+        // The permission is a role grant, and the anonymous role no longer
+        // holds it after 013.
+        let anonymous: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM role_permissions \
+             WHERE role_id = '00000000-0000-0000-0000-000000000001' \
+               AND permission = 'view netgrasp devices'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anonymous, 0);
     });
 }

@@ -32,6 +32,7 @@
 use netgrasp_core::{DEVICE_TYPE, PERSON_TYPE};
 use trovato_sdk::host;
 use trovato_sdk::prelude::*;
+use trovato_sdk::types::{FieldAccessBatchInput, FieldAccessBatchResult, FieldAccessResult};
 
 mod assist_host;
 mod db;
@@ -211,6 +212,67 @@ pub fn tap_menu() -> Vec<MenuRoute> {
 #[plugin_tap]
 pub fn tap_api(request: ApiRequest) -> ApiResponse {
     forms::serve(&request)
+}
+
+/// Every record type `netgrasp.info.toml` declares. A test holds this list to
+/// the manifest, so a record type added there and not here is caught rather
+/// than left readable by anybody.
+pub const RECORD_TYPES: &[&str] = &[
+    "ng_device_state",
+    "ng_event",
+    "ng_presence",
+    "ng_location",
+    "ng_ip_history",
+    "ng_person_mirror",
+    "ng_person_presence",
+    "ng_person_movement",
+    "ng_device_new",
+    "ng_overview",
+];
+
+/// Device data is for a viewer who holds `view netgrasp devices`.
+///
+/// A gather has no permission of its own, so before this every netgrasp page
+/// answered an anonymous request with every row in full: on the live network
+/// `curl /devices/online` with no session returned 100 MAC addresses. The
+/// permission gated the menu entries and nothing else.
+///
+/// The kernel asks this tap about the fields of every record gather and every
+/// Item gather it runs, includes included (`apply_record_field_filtering`), and
+/// removes the fields any plugin denies. So for a viewer without the permission
+/// every field of every netgrasp record type, and of the two Item types, is
+/// denied, and the rows reach the templates empty; `page.html` sees that and
+/// asks the reader to sign in instead of drawing a table of blanks.
+///
+/// Anybody else gets no opinion, which the kernel reads as allowed, and an
+/// administrator never reaches this tap at all (the kernel's admin bypass).
+/// Other plugins' types are not netgrasp's business and get no opinion either.
+///
+/// Only `view` is decided. `edit` is the Item's own permission, which the
+/// kernel checks before any field is considered.
+#[plugin_tap]
+pub fn tap_field_access(input: FieldAccessBatchInput) -> FieldAccessBatchResult {
+    field_access(&input)
+}
+
+fn field_access(input: &FieldAccessBatchInput) -> FieldAccessBatchResult {
+    let ours = RECORD_TYPES.contains(&input.item_type.as_str())
+        || input.item_type == DEVICE_TYPE
+        || input.item_type == PERSON_TYPE;
+    let may_see = input
+        .user
+        .permissions
+        .iter()
+        .any(|p| p == PERM_VIEW_DEVICES || p == PERM_ADMINISTER);
+    let mut result = FieldAccessBatchResult::default();
+    if ours && input.operation == "view" && !may_see {
+        for field in &input.fields {
+            result
+                .decisions
+                .insert(field.clone(), FieldAccessResult::Deny);
+        }
+    }
+    result
 }
 
 // ===========================================================================
@@ -1529,9 +1591,21 @@ mod tests {
                 "security_events": 5,
                 "security_events_24h": 1,
                 "generated_at_epoch": 1_757_000_600,
+                // Home's own columns (013's ng_home view). A quiet day is one
+                // with nothing new, nothing unsorted and nothing spoofed.
+                "away_state": "away",
+                "devices_unsorted": if new_devices.as_array().is_some_and(|a| a.is_empty()) { 0 } else { 9 },
+                "arp_spoof_24h": if new_devices.as_array().is_some_and(|a| a.is_empty()) { 0 } else { 2 },
+                "ip_conflict_24h": 0,
+                "rogue_dhcp_24h": if new_devices.as_array().is_some_and(|a| a.is_empty()) { 0 } else { 1 },
                 "home": home,
+                "away": [{"item_id": "0193a5a0-0000-7000-8000-00000000000d", "name": "Wren",
+                          "state": "away", "current_location": null,
+                          "last_arrived_at_epoch": null, "last_departed_at_epoch": 1_756_990_000,
+                          "devices_online": 0}],
                 "movements": movements,
-                "new_devices": new_devices
+                "new_devices": new_devices,
+                "attention": new_devices
             }])
         };
         let empty = serde_json::json!([]);
@@ -1558,18 +1632,28 @@ mod tests {
             &overview_row(&home, &movements, &new_devices),
         );
         for expected in [
-            "Home since",
+            "home since",
             "Jamie",
             "Arlo",
+            "Studio",
+            "Away:",
+            "Wren",
             "Arrived",
             "Left",
             "via Driveway",
             "Somebody",
+            "Needs attention",
             "92%",
             "Not yet identified",
             "ng-menu__button",
+            "class=\"ng-assign\"",
             "href=\"/events/security\"",
-            "ng-stat--alert",
+            "ng-attention__alert",
+            "2 ARP spoofing warnings today",
+            "1 rogue DHCP server seen today",
+            "7 more devices have no owner.",
+            "href=\"/devices/todo\">Sort them</a>",
+            "7</strong> devices online",
             "/people/movements?day=2025-09-04",
         ] {
             assert!(
@@ -1580,6 +1664,18 @@ mod tests {
         // The row menu comes back to the overview, not to a gather path.
         // Autoescaping writes the slash as an entity, which an href decodes.
         assert!(full.contains("back=&#x2F;overview&amp;"), "{full}");
+        // The one-tap Assign goes straight to the owner form for that device.
+        assert!(
+            full.contains(
+                "/netgrasp/device/owner?back=&#x2F;overview&amp;target=02%3A00%3A5e%3A00%3A00%3A0c"
+            ),
+            "{full}"
+        );
+        // No raw security total, no "N of M people home" card, and no address
+        // conflict line when there was none.
+        assert!(!full.contains("security event"), "{full}");
+        assert!(!full.contains("people home"), "{full}");
+        assert!(!full.contains("address conflict"), "{full}");
 
         // Every include empty, and a quiet day: three empty states, no table.
         let quiet = render(
@@ -1592,8 +1688,24 @@ mod tests {
             quiet.contains("Nobody has arrived or left today."),
             "{quiet}"
         );
-        assert!(quiet.contains("Nothing new has appeared"), "{quiet}");
+        assert!(quiet.contains("Nothing needs you."), "{quiet}");
+        assert!(!quiet.contains("ng-attention__alert"), "{quiet}");
+        assert!(!quiet.contains("more device"), "{quiet}");
         assert!(!quiet.contains("<table"), "{quiet}");
+
+        // Nobody added yet, which is the live network today: one sentence in
+        // place of "0 of 0 people home".
+        let mut unknown = overview_row(&empty, &empty, &new_devices);
+        unknown[0]["people_total"] = serde_json::json!(0);
+        unknown[0]["people_home"] = serde_json::json!(0);
+        unknown[0]["away"] = serde_json::json!([]);
+        let start = render("gather/query--ng_overview.html", "ng_overview", &unknown);
+        assert!(
+            start.contains("Netgrasp doesn't know whose devices are whose yet."),
+            "{start}"
+        );
+        assert!(start.contains("Add the people in your home"), "{start}");
+        assert!(!start.contains("Nobody is home."), "{start}");
 
         for (template, query_id, rows, expected) in [
             (
@@ -2277,6 +2389,92 @@ mod tests {
             .skip(1)
             .collect::<String>();
         assert!(dark.contains(".ng-tabs__tab--active"), "no dark-mode tab");
+    }
+
+    fn field_request(
+        item_type: &str,
+        operation: &str,
+        permissions: &[&str],
+    ) -> FieldAccessBatchInput {
+        serde_json::from_value(serde_json::json!({
+            "user": {
+                "user_id": "00000000-0000-0000-0000-000000000000",
+                "authenticated": !permissions.is_empty(),
+                "permissions": permissions,
+            },
+            "item_type": item_type,
+            "operation": operation,
+            "fields": ["mac", "last_ip", "owner_name"],
+        }))
+        .unwrap_or_else(|e| panic!("the kernel's field-access payload no longer parses: {e}"))
+    }
+
+    /// **An anonymous viewer reads no device data**: every field of every
+    /// netgrasp record type and Item type is denied to a viewer without
+    /// `view netgrasp devices`, and nothing is denied to one with it.
+    #[test]
+    fn a_viewer_without_the_permission_is_denied_every_netgrasp_field() {
+        for item_type in RECORD_TYPES
+            .iter()
+            .copied()
+            .chain([DEVICE_TYPE, PERSON_TYPE])
+        {
+            let denied = field_access(&field_request(item_type, "view", &[]));
+            assert_eq!(denied.decisions.len(), 3, "{item_type}");
+            assert!(
+                denied
+                    .decisions
+                    .values()
+                    .all(|d| *d == FieldAccessResult::Deny),
+                "{item_type}"
+            );
+            for perms in [&[PERM_VIEW_DEVICES][..], &[PERM_ADMINISTER][..]] {
+                let allowed = field_access(&field_request(item_type, "view", perms));
+                assert!(allowed.decisions.is_empty(), "{item_type} {perms:?}");
+            }
+            // Edit is the Item's own permission; this tap stays out of it.
+            assert!(
+                field_access(&field_request(item_type, "edit", &[]))
+                    .decisions
+                    .is_empty()
+            );
+        }
+        // Another plugin's type is not netgrasp's to decide.
+        assert!(
+            field_access(&field_request("article", "view", &[]))
+                .decisions
+                .is_empty()
+        );
+    }
+
+    /// The list of record types the tap guards is the manifest's list, so a
+    /// record type added later is guarded from the start.
+    #[test]
+    fn the_field_access_tap_guards_every_record_type_the_manifest_declares() {
+        let manifest = include_str!("../netgrasp.info.toml");
+        let declared: Vec<&str> = manifest
+            .split("[[record_types]]")
+            .skip(1)
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("name = \""))
+                    .map(|n| n.trim_end_matches('"'))
+            })
+            .collect();
+        assert_eq!(declared.len(), RECORD_TYPES.len(), "{declared:?}");
+        for name in declared {
+            assert!(RECORD_TYPES.contains(&name), "{name} is not guarded");
+        }
+        assert!(
+            manifest.contains("\"tap_field_access\","),
+            "the kernel would never call it"
+        );
+        let migration = include_str!("../migrations/013_netgrasp_home.sql");
+        assert!(
+            migration.contains("DELETE FROM role_permissions\nWHERE role_id = '00000000-0000-0000-0000-000000000001'\n  AND permission = 'view netgrasp devices';"),
+            "the anonymous role keeps the permission, so the tap changes nothing for it"
+        );
     }
 
     /// Tera comments are not markup, and this file's comments discuss the very
