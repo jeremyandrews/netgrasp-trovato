@@ -61,6 +61,10 @@ implements = [
     # the _token. Without this line the paths are registered and every request
     # to one is dispatched to a plugin that does not answer.
     "tap_api",
+    # Device data only for a viewer who holds `view netgrasp devices` (U1). A
+    # gather has no permission of its own; this is what keeps an anonymous
+    # visitor from reading every MAC on the network. 013 explains.
+    "tap_field_access",
 ]
 weight = 0
 
@@ -81,6 +85,7 @@ files = [
     "migrations/010_netgrasp_new_devices.sql",
     "migrations/011_netgrasp_navigation.sql",
     "migrations/012_netgrasp_device_tabs_search.sql",
+    "migrations/013_netgrasp_home.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -150,6 +155,10 @@ db_tables = [
     # 006 and 007 must stay re-runnable (012 explains).
     "ng_devices_listed",
     "ng_devices_new_listed",
+    # Home's row since 013: ng_overview plus the counts Home asks that the
+    # overview did not (who is away, how many are unsorted, the three
+    # actionable security events over the last day).
+    "ng_home",
 ]
 
 # Lightweight record types (P11g / D-53).
@@ -404,9 +413,10 @@ search = "search_text"
 
 # The overview's single row. Its columns are counts, which is the only way a
 # gather page gets a number that is not a pager total.
+# Declared over `ng_home` since 013: the same row plus Home's own counts.
 [[record_types]]
 name = "ng_overview"
-table = "ng_overview"
+table = "ng_home"
 id_column = "id"
 title_column = "today"
 created_column = "generated_at_epoch"
@@ -424,3 +434,8 @@ movements_today = "movements_today"
 security_events = "security_events"
 security_events_24h = "security_events_24h"
 generated_at = "generated_at_epoch"
+away_state = "away_state"
+devices_unsorted = "devices_unsorted"
+arp_spoof_24h = "arp_spoof_24h"
+ip_conflict_24h = "ip_conflict_24h"
+rogue_dhcp_24h = "rogue_dhcp_24h"

@@ -50,6 +50,18 @@ security events a person can act on, newest first, with the rest of the event
 pages as its tabs. The whole log is 95% `ip_changed` on a real network, which is
 why it is not the default.
 
+**Home answers who is home and whether anything needs you.** `/overview`, the
+menu's first entry, is now one line per person at home with since when and
+where, the people who are away in one muted line, today's comings and goings,
+and *Needs attention*: one line each for ARP spoofing, a rogue DHCP server or an
+address conflict in the last day, up to six devices new this week that nobody
+has named or assigned (each with an Assign link to the owner form), and "N more
+devices have no owner. Sort them". Then how many devices are online. The raw
+security total is gone: on the live network it was 169,785, 98% scan noise. With
+nobody added yet the page says so in one sentence and links to adding a person.
+The counts are a view over the old one, `ng_home` (`013`), for the same
+re-runnable-migration reason as `012`.
+
 **The plugin as a container image.** `ghcr.io/jeremyandrews/netgrasp-trovato`,
 multi-arch (arm64 and amd64), published on every push to `main` as
 `sha-<12 character commit>` and on every `v*` tag as the version and `latest`.
@@ -93,6 +105,16 @@ up `docker-compose.demo.yml` as the README describes, then checks that `/`
 redirects to `/overview` and that the page is the overview's own template: a
 gather template that raises answers 200 with the kernel's column dump, so a
 status code alone would pass a broken page.
+
+### Changed
+
+**Device data needs a sign-in.** Before, `curl /devices/online` with no session
+returned every MAC address on the network: a gather has no permission of its
+own, and the anonymous role held `view netgrasp devices`. The plugin now
+implements `tap_field_access`, denying every netgrasp field to a viewer without
+that permission, and `013` revokes it from the anonymous role. A visitor sees
+the pages empty, with a line asking them to sign in. The README gives the one
+statement that grants it back for a wall screen.
 
 ### Tests
 

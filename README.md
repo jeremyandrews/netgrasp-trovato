@@ -42,14 +42,30 @@ included. `up --build` rebuilds the plugin after an edit. The compose file
 documents the ordering a brand new database needs, and the one expected warning
 on first run.
 
-### Putting it behind a login
+### Who sees device data
 
-The demo assumes a localhost dashboard, so the navigation and every page are
-visible to an anonymous viewer. That is one line:
-`plugins/netgrasp/migrations/005_netgrasp_web_interface.sql` grants
-`view netgrasp devices` to the anonymous role. Delete that `INSERT` and the pages
-need a login, with no other change: the `network_viewer` role already holds the
-same permission, so an authenticated viewer keeps the whole navigation.
+Signing in is required. A visitor who is not signed in still gets the menu and
+every page's frame, but every row arrives empty and the page says "Sign in to see
+the devices on this network." The plugin's `tap_field_access` denies every field
+of every netgrasp record type, and of its two Item types, to a viewer without
+`view netgrasp devices`, and the kernel strips denied fields from each row of a
+gather, includes too. `013_netgrasp_home.sql` takes that permission back from
+the anonymous role, which `005` had granted it for a localhost dashboard. In the
+demo, sign in as `admin` with the password in `docker-compose.demo.yml`. The
+`network_viewer` role holds the permission for everyone else.
+
+A wall screen or a trusted LAN that wants the old open view grants it back. Run
+it once; the migration never runs a second time, so it will not be undone:
+
+```sql
+INSERT INTO role_permissions (role_id, permission)
+VALUES ('00000000-0000-0000-0000-000000000001', 'view netgrasp devices')
+ON CONFLICT DO NOTHING;
+```
+
+What a visitor still sees: the four menu entries (the kernel does not filter
+`menu_link` rows by permission) and, on `/people`, people's names, which are
+Item titles and not fields, so the field tap cannot reach them.
 
 ## The one architectural rule
 
@@ -299,7 +315,7 @@ without being copied into the image.
 | URL | What it is |
 |---|---|
 | `/` | redirects to `/overview` |
-| `/overview` | **Home** in the menu: who is home and since when, today's arrivals and departures, devices new this week, the security event count |
+| `/overview` | **Home** in the menu: who is home and since when, who is away, today's arrivals and departures, then what needs attention (spoofing, rogue DHCP or an address conflict in the last day, up to six new devices nobody has sorted, each with an Assign link, and a count of the rest), then how many devices are online. On a phone, Needs attention moves up under Home now |
 | `/devices` | **Devices** in the menu: what is on the network right now (the Online tab) |
 | `/devices/all` | every device the daemon has seen, except the hidden ones |
 | `/devices/hidden` | the devices somebody hid, which no other list shows |
@@ -459,8 +475,11 @@ scripting off.
   listing when it finishes, and every listing above is a `count(*)` you can hold
   a page against. The `installer` container fails the run if `/overview`
   answers anything but 200, and `scripts/verify-demo.sh` then checks that `/`
-  redirects there and that the page is the overview's own template rather than
-  the kernel's column dump.
+  redirects there and that the page is Home's own template rather than the
+  kernel's column dump, that a visitor who is not signed in gets no MAC address
+  and a sign-in line, and then, signed in (`ADMIN_USER` and `ADMIN_PASSWORD`,
+  the demo's by default), the menu, every old path, the redirects, the tabs, the
+  search, and Home's sections.
 - `scripts/serve-demo.sh <trovato> --seed --bg` for the same thing against a
   Trovato source checkout, which is the path to use when the kernel is what you
   are changing.

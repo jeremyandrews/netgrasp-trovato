@@ -27,7 +27,14 @@ set -eu
 
 BASE="${1:-http://localhost:3101}"
 PAGE="$(mktemp)"
-trap 'rm -f "$PAGE"' EXIT
+JAR="$(mktemp)"
+trap 'rm -f "$PAGE" "$JAR"' EXIT
+
+# The demo's administrator, as docker-compose.demo.yml and scripts/first-run.sh
+# create it. Device data is for a viewer holding `view netgrasp devices` (013),
+# so everything after the anonymous check below is read signed in.
+ADMIN_USER="${NETGRASP_ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${NETGRASP_ADMIN_PASSWORD:-netgrasp-demo-password}"
 
 fail() {
     echo "error: $*" >&2
@@ -44,21 +51,53 @@ case "$redirect" in
 esac
 
 # The overview itself, rendered by netgrasp's template.
-code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE/overview")"
+# Anonymous: the page answers, and carries no device data at all. A gather has
+# no permission of its own, so before 013 this returned every MAC on the network.
+code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE/devices/online")"
+[ "$code" = "200" ] || fail "/devices/online answered $code to an anonymous visitor"
+if grep -Eiq '([0-9a-f]{2}:){5}[0-9a-f]{2}' "$PAGE"; then
+    fail "an anonymous visitor can read MAC addresses on /devices/online"
+fi
+grep -q 'Sign in to see the devices on this network.' "$PAGE" \
+    || fail "/devices/online does not ask an anonymous visitor to sign in"
+echo "    an anonymous visitor sees no MAC address, and is asked to sign in"
+
+# Sign in, through the kernel's own form and its token.
+token="$(curl -s -c "$JAR" "$BASE/user/login" \
+    | sed -n 's/.*name="_token" value="\([^"]*\)".*/\1/p' | head -n 1)"
+[ -n "$token" ] || fail "the login form carries no token"
+code="$(curl -s -b "$JAR" -c "$JAR" -o /dev/null -w '%{http_code}' \
+    --data-urlencode "_token=$token" \
+    --data-urlencode "username=$ADMIN_USER" \
+    --data-urlencode "password=$ADMIN_PASSWORD" \
+    "$BASE/user/login")"
+case "$code" in
+    30*) echo "    signed in as $ADMIN_USER" ;;
+    *) fail "signing in as $ADMIN_USER answered $code" ;;
+esac
+
+code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE/overview")"
 [ "$code" = "200" ] || fail "/overview answered $code"
 
 expect() {
     grep -q -- "$1" "$PAGE" || fail "/overview does not contain $2"
 }
 expect 'data-query-id="ng_overview"' "the overview's page element (did the template fall back to the column dump?)"
-expect 'class="ng-stats"' "the four figures"
+expect 'Needs attention' "the needs-attention section"
 expect 'href="/events/security"' "the link to the security events"
 expect 'Home now' "the people-home section"
 expect 'Jamie' "the seeded person Jamie, who is home"
 expect 'Aurora' "the seeded person Aurora, who is home"
-expect 'New this week' "the new-device section"
 expect '02:00:5e:00:00:0c' "the seeded device first seen 35 minutes ago"
 expect 'class="ng-menu"' "a row menu on a new device"
+expect 'more devices have no owner' "the line counting the devices left to sort"
+# Home shows no raw security total, and at most six devices to sort.
+if grep -q 'security events\?, ' "$PAGE" || grep -q 'class="ng-stats"' "$PAGE"; then
+    fail "/overview still shows the raw security total"
+fi
+attention="$(grep -c 'class="ng-assign"' "$PAGE" || true)"
+[ "$attention" -ge 1 ] && [ "$attention" -le 6 ] \
+    || fail "Needs attention lists $attention devices, not one to six"
 echo "    /overview renders the overview, with the seeded people and devices"
 
 # The three pages the overview links to.
@@ -66,7 +105,7 @@ echo "    /overview renders the overview, with the seeded people and devices"
 # that order, and none of the kernel's own entries (Translate, Post, Blog, Terms,
 # Media, a second Home). The menu is the `site-nav__link` anchors before the
 # divider; Login, Admin, Profile and Logout come after it and are the theme's.
-curl -s -o "$PAGE" "$BASE/overview"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/overview"
 menu="$(sed -n '/<nav class="site-nav"/,/site-nav__divider/p' "$PAGE" \
     | grep -o 'class="site-nav__link[^"]*"[^>]*>[^<]*' | sed 's/.*>//' | tr '\n' '|')"
 [ "$menu" = "Home|Devices|People|Activity|" ] || fail "the site menu reads '$menu'"
@@ -76,7 +115,7 @@ echo "    the menu reads Home, Devices, People, Activity"
 for path in /devices /devices/online /devices/all /devices/new /devices/todo \
     /devices/hidden /devices/type /devices/location /people /people/home /people/movements \
     /activity /events /events/security /events/new-devices; do
-    code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE$path")"
+    code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE$path")"
     [ "$code" = "200" ] || fail "$path answered $code"
     grep -q 'class="ng-page ' "$PAGE" || fail "$path did not render netgrasp's page chrome"
     echo "    $path renders"
@@ -90,9 +129,9 @@ case "$redirect" in
 esac
 
 # /devices is the Online tab: the online gather's page, not the full list.
-curl -s -o "$PAGE" "$BASE/devices"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices"
 grep -q 'data-query-id="ng_device_online"' "$PAGE" || fail "/devices is not the online devices"
-curl -s -o "$PAGE" "$BASE/devices/all"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/all"
 grep -q 'data-query-id="ng_device_list"' "$PAGE" || fail "/devices/all is not every device"
 echo "    /devices is what is online, /devices/all is everything"
 
@@ -100,15 +139,15 @@ echo "    /devices is what is online, /devices/all is everything"
 # blank search is the whole list. Counted by row, since each device row is one
 # `<tr data-id=`.
 rows() { grep -c '<tr data-id=' "$PAGE" || true; }
-curl -s -o "$PAGE" "$BASE/devices/all?search=motivo"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/all?search=motivo"
 [ "$(rows)" = "1" ] || fail "searching motivo found $(rows) rows, not 1"
 grep -q '02:00:5e:00:00:10' "$PAGE" || fail "searching motivo did not find motivo"
-curl -s -o "$PAGE" "$BASE/devices/all?search="
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/all?search="
 blank="$(rows)"
-curl -s -o "$PAGE" "$BASE/devices/all"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/all"
 [ "$blank" = "$(rows)" ] || fail "a blank search found $blank rows, not every device"
 echo "    searching motivo finds motivo alone, and a blank search finds all $blank"
-curl -s -o "$PAGE" "$BASE/devices/hidden"
+curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/hidden"
 [ "$(rows)" -gt 0 ] || fail "/devices/hidden has no rows"
 echo "    /devices/hidden lists the hidden devices"
 

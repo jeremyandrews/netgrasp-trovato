@@ -1,60 +1,85 @@
 {#
-    The overview. /overview, and the site's front page.
+    Home. /overview, the site's front page and the menu's first entry.
 
-    One gather over `ng_overview`, a view with exactly one row. That row's
-    columns are the counts; its three lists arrive on it as includes, each a
-    child gather the kernel ran after the parent: `home` (people home now),
-    `movements` (today's arrivals and departures, oldest first) and
-    `new_devices` (first seen this week). 008_netgrasp_overview.sql explains why
-    a page with four questions on it is built this way and not out of tiles.
+    It answers three questions, in order (docs/UI.md, "Home"): who is here,
+    what changed today, and does anything need me. Then one line for what is
+    online. There is no raw security total: on the live network it was
+    169,785, almost all scan noise, and a number that size tells a person
+    nothing. Only the three security events somebody can act on appear, one
+    line each, and only when they happened in the last day.
 
-    `rows` therefore has one element, and the loop below runs once. It is a loop
-    and not `rows[0]` so that the template reads the same whether the kernel ever
-    hands it zero rows (it renders page.html's empty state, not an index error)
-    or one.
+    One gather over `ng_overview`, whose record type reads the `ng_home` view
+    (013): one row of counts, with the lists attached as includes the kernel
+    ran after it. `home` (people in), `away` (people out), `movements` (today's
+    arrivals and departures, oldest first) and `attention` (new this week and
+    not sorted, at most six). 008 explains why a page of several lists is built
+    this way. `new_devices` is still attached and not drawn: it is the
+    definition /devices/new is held equal to.
 
-    The row menus in the new-device table need `base_path`, which is this
-    page's canonical URL, so a rename started here comes back here.
+    `rows` therefore has one element, and the loop runs once. It is a loop and
+    not `rows[0]` so that a page with no row is page.html's empty state rather
+    than an index error.
+
+    The sections are a column whose order a phone changes: below 640 px "Needs
+    attention" moves up under "Home now", so the first screen answers both
+    (phone rule 4). The markup keeps the order docs/UI.md gives.
 #}
 {% extends "gather/netgrasp/page.html" %}
 
 {% block results %}
 {% for ov in rows %}
-<div class="ng-stats">
-    <a class="ng-stat ng-stat--home" href="/people/home">
-        <span class="ng-stat__count">{{ ov.people_home }}</span>
-        <span class="ng-stat__label">of {{ ov.people_total }} {{ ov.people_total | pluralize(singular="person", plural="people") }} home</span>
-    </a>
-    <a class="ng-stat" href="/devices/online">
-        <span class="ng-stat__count">{{ ov.devices_online }}</span>
-        <span class="ng-stat__label">device{{ ov.devices_online | pluralize }} online</span>
-    </a>
-    <a class="ng-stat" href="/devices/new">
-        <span class="ng-stat__count">{{ ov.devices_new }}</span>
-        <span class="ng-stat__label">new this week</span>
-    </a>
-    {# The count is exactly the pager total of the page it links to: the view
-       counts the same six event types /events/security filters on. #}
-    <a class="ng-stat ng-stat--security{% if ov.security_events_24h > 0 %} ng-stat--alert{% endif %}" href="/events/security">
-        <span class="ng-stat__count">{{ ov.security_events }}</span>
-        <span class="ng-stat__label">security event{{ ov.security_events | pluralize }},
-            {{ ov.security_events_24h }} in the last 24 hours</span>
-    </a>
-</div>
+<div class="ng-home">
 
-<section class="ng-section" aria-labelledby="ng-section-home">
+{% if ov.people_total == 0 %}
+{#
+    Nobody has been added yet, which is the live network's state today. One
+    sentence instead of "0 of 0 people home" and two empty sections.
+#}
+<section class="ng-section ng-section--start" aria-labelledby="ng-section-start">
+    <h2 class="ng-section__title" id="ng-section-start">Home now</h2>
+    <p class="ng-empty">Netgrasp doesn't know whose devices are whose yet.
+        <span class="ng-empty__hint"><a href="/item/add/ng_person">Add the people in your home</a>
+        or <a href="/devices/todo">sort the devices</a>.</span>
+    </p>
+</section>
+{% else %}
+<section class="ng-section ng-section--home" aria-labelledby="ng-section-home">
     <h2 class="ng-section__title" id="ng-section-home">Home now</h2>
     {% if ov.home | length > 0 %}
-    {% set ng_people = ov.home %}
-    {% include "gather/netgrasp/people-home.html" %}
+    <ul class="ng-lines">
+        {% for person in ov.home %}
+        <li class="ng-line">
+            <a class="ng-line__who" href="/devices/owner?owner={{ person.item_id }}">
+                {%- if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif -%}
+            </a>
+            {%- if person.last_arrived_at_epoch -%}
+            , home since <span class="ng-mono ng-nowrap" data-ng-epoch="{{ person.last_arrived_at_epoch }}">
+                {{- person.last_arrived_at_epoch | date(format="%Y-%m-%d %H:%M") -}}
+            </span>
+            {%- else -%}
+            , home
+            {%- endif -%}
+            {%- if person.current_location %}, {{ person.current_location }}{% endif -%}
+        </li>
+        {% endfor %}
+    </ul>
     {% else %}
     <p class="ng-empty">Nobody is home.
-        <span class="ng-empty__hint">A person is home when any device they own is online. <a href="/people">People</a>.</span>
+        <span class="ng-empty__hint">A person is home when any device they own is online.</span>
+    </p>
+    {% endif %}
+    {% if ov.away is defined and ov.away | length > 0 %}
+    <p class="ng-away">Away:
+        {% for person in ov.away -%}
+        <a href="/devices/owner?owner={{ person.item_id }}">{% if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif %}</a>
+        {%- if not loop.last %}, {% endif %}
+        {%- endfor %}
     </p>
     {% endif %}
 </section>
+{% endif %}
 
-<section class="ng-section" aria-labelledby="ng-section-today">
+<section class="ng-section ng-section--today" aria-labelledby="ng-section-today">
     <h2 class="ng-section__title" id="ng-section-today">Today
         <a class="ng-section__more" href="/people/movements?day={{ ov.today }}">All of today</a>
     </h2>
@@ -68,17 +93,53 @@
     {% endif %}
 </section>
 
-<section class="ng-section" aria-labelledby="ng-section-new">
-    <h2 class="ng-section__title" id="ng-section-new">New this week
-        <a class="ng-section__more" href="/devices/todo">Still to name or assign</a>
-        <a class="ng-section__more" href="/devices/new">All new devices</a>
-    </h2>
-    {% if ov.new_devices | length > 0 %}
-    {% set ng_devices = ov.new_devices %}
+{#
+    At most six devices, because the include asks for six; the rest are one
+    line. `devices_unsorted` counts every device with no name and no owner,
+    new or not, so the line is "how many more", never a second list.
+#}
+{% if ov.attention is defined %}{% set ng_attention = ov.attention %}{% else %}{% set ng_attention = [] %}{% endif %}
+{# Two lines, not one: Tera applies a filter after the arithmetic beside it. #}
+{% set ng_shown = ng_attention | length %}
+{% set ng_more = ov.devices_unsorted - ng_shown %}
+{% set ng_alerts = ov.arp_spoof_24h + ov.ip_conflict_24h + ov.rogue_dhcp_24h %}
+<section class="ng-section ng-section--attention" aria-labelledby="ng-section-attention">
+    <h2 class="ng-section__title" id="ng-section-attention">Needs attention</h2>
+    {% if ng_alerts > 0 %}
+    <ul class="ng-alerts">
+        {% if ov.arp_spoof_24h > 0 %}
+        <li class="ng-attention__alert"><a href="/events/security">{{ ov.arp_spoof_24h }} ARP spoofing warning{{ ov.arp_spoof_24h | pluralize }} today</a></li>
+        {% endif %}
+        {% if ov.rogue_dhcp_24h > 0 %}
+        <li class="ng-attention__alert"><a href="/events/security">{{ ov.rogue_dhcp_24h }} rogue DHCP server{{ ov.rogue_dhcp_24h | pluralize }} seen today</a></li>
+        {% endif %}
+        {% if ov.ip_conflict_24h > 0 %}
+        <li class="ng-attention__alert"><a href="/events/security">{{ ov.ip_conflict_24h }} address conflict{{ ov.ip_conflict_24h | pluralize }} today</a></li>
+        {% endif %}
+    </ul>
+    {% endif %}
+    {% if ng_attention | length > 0 %}
+    <p class="ng-section__lead">New this week, and nobody has said whose they are:</p>
+    {% set ng_devices = ng_attention %}
+    {% set ng_assign = true %}
     {% include "gather/netgrasp/new-device-table.html" %}
-    {% else %}
-    <p class="ng-empty">Nothing new has appeared on the network this week.</p>
+    {% endif %}
+    {% if ng_more > 0 %}
+    <p class="ng-more">
+        {{ ng_more }} {% if ng_shown > 0 %}more {% endif %}device{{ ng_more | pluralize }} {{ ng_more | pluralize(singular="has", plural="have") }} no owner.
+        <a href="/devices/todo">Sort them</a>
+    </p>
+    {% endif %}
+    {% if ng_alerts == 0 and ng_attention | length == 0 and ng_more <= 0 %}
+    <p class="ng-empty">Nothing needs you. Every device has a name or an owner, and nothing was spoofed today.</p>
     {% endif %}
 </section>
+
+<section class="ng-section ng-section--online" aria-labelledby="ng-section-online">
+    <h2 class="ng-visually-hidden" id="ng-section-online">Online</h2>
+    <p class="ng-online"><a href="/devices"><strong>{{ ov.devices_online }}</strong> device{{ ov.devices_online | pluralize }} online</a></p>
+</section>
+
+</div>
 {% endfor %}
 {% endblock %}

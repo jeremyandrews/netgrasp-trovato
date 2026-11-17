@@ -1117,3 +1117,146 @@
         color: #0f172a;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * Home (gather/query--ng_overview.html)
+ * --------------------------------------------------------------------------
+ * A column of sections in the order docs/UI.md gives: Home now, Today, Needs
+ * attention, Online. On a phone Needs attention moves up under Home now, so
+ * the first screen answers "who is here" and "does anything need me" without
+ * scrolling (phone rule 4). `order` moves the box and not the markup, so the
+ * reading order with a screen reader stays the documented one.
+ * ------------------------------------------------------------------------ */
+
+.ng-home {
+    display: flex;
+    flex-direction: column;
+}
+
+.ng-lines {
+    margin: 0;
+    padding: 0 1rem;
+    list-style: none;
+    border: 1px solid var(--ng-border);
+    border-radius: 0.5rem;
+    background: var(--ng-surface);
+}
+
+.ng-line {
+    padding: 0.625rem 0;
+    border-bottom: 1px solid var(--ng-border);
+    font-size: 1.05rem;
+}
+
+.ng-line:last-child {
+    border-bottom: none;
+}
+
+.ng-line__who {
+    font-weight: 600;
+}
+
+.ng-away {
+    margin: 0.5rem 0 0 0;
+    color: var(--gray-500);
+    font-size: 0.9rem;
+}
+
+.ng-away a {
+    color: inherit;
+}
+
+.ng-alerts {
+    margin: 0 0 0.75rem 0;
+    padding: 0;
+    list-style: none;
+}
+
+.ng-attention__alert {
+    margin: 0 0 0.375rem 0;
+    padding: 0.5rem 0.75rem;
+    border-left: 4px solid var(--danger, #dc2626);
+    border-radius: 0.25rem;
+    background: #fef2f2;
+}
+
+.ng-attention__alert a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    color: #991b1b;
+    font-weight: 600;
+}
+
+.ng-section__lead {
+    margin: 0 0 0.5rem 0;
+    color: var(--gray-600);
+}
+
+.ng-more {
+    margin: 0.75rem 0 0 0;
+}
+
+.ng-assign {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    padding: 0 0.75rem;
+    border: 1px solid var(--primary, #6366f1);
+    border-radius: 999px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.ng-online {
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.ng-empty--signin {
+    font-size: 1.05rem;
+}
+
+@media (max-width: 640px) {
+    .ng-section--start,
+    .ng-section--home {
+        order: 0;
+    }
+
+    .ng-section--attention {
+        order: 1;
+    }
+
+    .ng-section--today {
+        order: 2;
+    }
+
+    .ng-section--online {
+        order: 3;
+    }
+
+    .ng-assign {
+        min-height: 44px;
+    }
+}
+
+/*
+ * The lines Home writes straight onto the page, not into a card. The page
+ * around `.ng-page` is the kernel's and stays light in both schemes, so the
+ * dark block's light text would vanish here; these keep a dark grey always.
+ */
+@media (prefers-color-scheme: dark) {
+    .ng-away,
+    .ng-section__lead,
+    .ng-more {
+        color: var(--gray-600, #475569);
+    }
+
+    .ng-attention__alert {
+        background: #3b1218;
+    }
+
+    .ng-attention__alert a {
+        color: #fecaca;
+    }
+}

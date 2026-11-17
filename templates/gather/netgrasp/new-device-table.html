@@ -16,6 +16,11 @@
     `device_type_confidence` is a REAL between 0 and 1. It is printed as a whole
     percentage, and only beside a type: a confidence with no verdict attached
     is a number about nothing.
+
+    Home sets `ng_assign` to put a one-tap **Assign** link in the Owner cell of
+    a device nobody owns, straight to the owner form (a page the plugin serves,
+    for the reason row-actions.html gives). Elsewhere the cell says "Nobody
+    yet" and the row menu is the way.
 #}
 <div class="ng-table-scroll">
     <table class="ng-table ng-device-table ng-new-device-table">
@@ -76,6 +81,8 @@
                     {%- elif row.owner_item_id -%}
                     <a class="ng-id-chip" href="/devices/owner?owner={{ row.owner_item_id }}"
                        title="Person {{ row.owner_item_id }} has no mirror row">{{ row.owner_item_id | split(pat="-") | last }}</a>
+                    {%- elif ng_assign is defined and ng_assign -%}
+                    <a class="ng-assign" href="/netgrasp/device/owner?back={{ base_path | urlencode }}&amp;target={{ row.mac | urlencode }}">Assign</a>
                     {%- else -%}<span class="ng-muted">Nobody yet</span>{%- endif -%}
                 </td>
 
