@@ -241,11 +241,15 @@ it, where its data comes from, and what it shows when empty.
 
 - **Question.** What will I be told about, and will it reach me?
 - **Content.**
-  1. **Delivery.** "Last alert delivered: never" or "today at 18:42", from
-     `max(timestamp) WHERE notified`. When it says never, add: "netgraspd has
-     no ntfy destination. Add `[notify.ntfy]` to its config." The plugin cannot
-     read the daemon's TOML, so this is inferred from what was actually
-     delivered. That is the honest test of "does it work".
+  1. **Delivery.** "Alerts go to ntfy. Last alert delivered today at 18:42.",
+     or "Alerts are not delivered anywhere yet." with the missing
+     `[notify.ntfy]` named. This is read from `ng_notify_status`, one row the
+     daemon (netgraspd schema V4) writes when its notifier starts and after
+     every delivery attempt: `notify_configured`, `notify_backend`,
+     `last_delivery_ok`, `last_delivery_at`. It names the transport and never
+     the topic, server or token. A failed last attempt says so and points at
+     netgraspd's log. Without a daemon that has V4, the row is absent and the
+     page says "netgraspd has not said whether alerts can be delivered."
   2. **People.** One sentence per rule: "Tell me when Jamie gets home." and
      "Tell me when Jamie leaves." Each has an on/off switch-link (the existing
      person notify form).
@@ -255,13 +259,22 @@ it, where its data comes from, and what it shows when empty.
      and the list of devices whose `notify` is on.
   4. **Recently sent.** The last 20 `ng_events` with `notified = true`, in
      words.
-- **Send test.** Not possible from the plugin: the destination lives only in
-  the daemon's config, and the daemon has no test command. The button is not
-  shown until the daemon follow-up below exists.
-- **Arrival wording.** The daemon writes the alert text (today it says "Jamie
-  arrived"). The target wording is "Jamie is home: Jamie's iPhone joined at
-  18:42". It uses the name, not "her", because netgrasp stores no pronouns and
-  should not guess them. This is a daemon change.
+- **Add.** `/alerts/add` sets "Tell me when <person> gets home" or "leaves"
+  through the person notify save, or "Tell me when <device> comes online"
+  through the device notify save. Nothing new is written that those two forms
+  do not already write.
+- **Send test.** Shown when the daemon reports a destination. It inserts one
+  row into `ng_notify_requests`; the daemon picks it up on its reconcile tick,
+  sends one test alert ("Netgrasp test alert": "Alerts from netgraspd reach
+  this device. Sent at 18:43."), and writes `handled_at` and an `outcome`
+  word (`sent`, `failed` or `not_configured`). The confirmation page returns
+  to `/alerts` after 12 seconds, where the outcome is shown. The plugin never
+  sends anything.
+- **Wording.** The daemon writes the alert text. An arrival reads "Jamie is
+  home: Jamie's iPhone joined at 18:42" and a departure "Jamie left: last seen
+  07:55", in the daemon's local time. It uses the name, not "her", because
+  netgrasp stores no pronouns and should not guess them. Recently sent uses
+  the same sentences.
 
 ### Activity: `/activity`
 
@@ -316,7 +329,7 @@ within seconds. The restart limitation in `docs/JOINT-RUN.md` no longer holds.
 | Flash message after a write | no | the confirmation page names what changed |
 | Person page | yes | `tap_item_view` for `ng_person` |
 | Keep anonymous visitors out of device data | partly | `tap_field_access` denies every `ng_*` record field to a viewer without `view netgrasp devices`. Rows still render, but blank. Full fix is a kernel follow-up |
-| Show ntfy status, send a test, change alert wording | no (all daemon-side) | infer delivery from `notified`; daemon follow-ups |
+| Show ntfy status, send a test, change alert wording | no kernel change | netgraspd V4: a status row the daemon writes, a request table the plugin inserts into, and the new wording |
 | Cards on a phone instead of tables | yes | the plugin owns the table templates and `netgrasp.css` |
 
 ## Phone layout rules
@@ -396,12 +409,19 @@ devices I choose" bulk form, and the Alerts menu row.
 Checks:
 
 1. The menu reads Home, Devices, People, Alerts, Activity.
-2. On the live site, `/alerts` says "Last alert delivered: never" and names the
-   missing `[notify.ntfy]`.
+2. On the live site, `/alerts` says "Alerts are not delivered anywhere yet."
+   and names the missing `[notify.ntfy]`.
 3. It says "166 devices alert when they come back online", with the bulk form
    linked.
 4. With a person who has arrival alerts on (on the demo stack), the rule reads
    "Tell me when <name> gets home." with an off link.
+5. Screenshots at 1440 and 390 px on the demo stack are in `docs/screenshots/u3/`:
+   the Alerts page with rules and recent sends (`alerts-*.png`), the add form
+   (`alerts-add-*.png`), and the Send test confirmation
+   (`alerts-test-sent-*.png`, then `alerts-test-outcome-1440.png`). They were
+   taken with netgraspd from the paired branch running against the demo
+   database and posting to a local request logger, so "Jamie is home" and the
+   test outcome there are real deliveries.
 
 ## Kernel follow-ups
 
@@ -424,12 +444,6 @@ These are not in U1 to U3.
 
 These are outside this repository, and not in U1 to U3.
 
-- **netgraspd: a test alert and delivery status.** Add a `notify test` command,
-  or a request row the daemon picks up, and record the last delivery result
-  where the plugin can read it.
-- **netgraspd: arrival wording.** "Jamie is home: Jamie's iPhone joined at
-  18:42". Use the device's `display_name`, falling back to the name the daemon
-  resolved.
 - **netgraspd: `notify` default.** Decide whether new devices should alert on
   `returned` by default. Today all 166 would.
 - **netgraspd: `ip_changed` volume.** About 52 a minute. This is worth a look,

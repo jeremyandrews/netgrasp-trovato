@@ -101,15 +101,15 @@ attention="$(grep -c 'class="ng-assign"' "$PAGE" || true)"
 echo "    /overview renders the overview, with the seeded people and devices"
 
 # The three pages the overview links to.
-# The site menu: exactly Home, Devices, People and Activity from netgrasp, in
+# The site menu: exactly Home, Devices, People, Alerts and Activity from netgrasp, in
 # that order, and none of the kernel's own entries (Translate, Post, Blog, Terms,
 # Media, a second Home). The menu is the `site-nav__link` anchors before the
 # divider; Login, Admin, Profile and Logout come after it and are the theme's.
 curl -s -b "$JAR" -o "$PAGE" "$BASE/overview"
 menu="$(sed -n '/<nav class="site-nav"/,/site-nav__divider/p' "$PAGE" \
     | grep -o 'class="site-nav__link[^"]*"[^>]*>[^<]*' | sed 's/.*>//' | tr '\n' '|')"
-[ "$menu" = "Home|Devices|People|Activity|" ] || fail "the site menu reads '$menu'"
-echo "    the menu reads Home, Devices, People, Activity"
+[ "$menu" = "Home|Devices|People|Alerts|Activity|" ] || fail "the site menu reads '$menu'"
+echo "    the menu reads Home, Devices, People, Alerts, Activity"
 
 # Every page a person can reach, old paths included, renders netgrasp's chrome.
 for path in /devices /devices/online /devices/all /devices/new /devices/todo \
@@ -186,5 +186,24 @@ for path in /people/add /devices/assign "/netgrasp/person/delete?target=$person"
     esac
 done
 echo "    an anonymous visitor is refused the People forms ($code)"
+
+# Alerts (U3). Read-only, like the People checks: the page says where alerts go
+# (the seed's status row), every rule as a sentence, and what was sent, and its
+# two forms render. Send test is not pressed: nothing here answers it.
+form /alerts 'Tell me when Jamie gets home\.'
+grep -q 'Alerts go to ntfy\.' "$PAGE" || fail "/alerts does not say where alerts go"
+grep -q 'Send a test alert' "$PAGE" || fail "/alerts has no Send test button"
+grep -q 'alert when they come back online\.' "$PAGE" || fail "/alerts does not count the devices"
+grep -q 'Aurora is home: ' "$PAGE" || fail "/alerts does not list what was sent"
+form /alerts/add 'name="when"'
+form /alerts/devices 'name="listed"'
+for path in /alerts /alerts/add /alerts/devices; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE$path")"
+    case "$code" in
+        401|403) ;;
+        *) fail "$path answered $code to an anonymous visitor" ;;
+    esac
+done
+echo "    an anonymous visitor is refused the Alerts pages ($code)"
 
 echo "==> the demo's front page is the overview"

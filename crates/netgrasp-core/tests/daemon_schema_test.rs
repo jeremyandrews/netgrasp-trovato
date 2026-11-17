@@ -49,6 +49,11 @@ const DAEMON_SCHEMA: &str = include_str!("fixtures/daemon_schema.sql");
 const PLUGIN_MIGRATION: &str =
     include_str!("../../../plugins/netgrasp/migrations/001_netgrasp_schema.sql");
 
+/// The plugin's guarded copy of the daemon's V4 notify tables, for the same
+/// drift check.
+const NOTIFY_MIGRATION: &str =
+    include_str!("../../../plugins/netgrasp/migrations/015_netgrasp_notify_schema.sql");
+
 /// The plugin's overview views, applied on top of the daemon's DDL: the
 /// assistant's overview reads select from them, and they are defined over the
 /// daemon's tables, so the daemon's schema is the one they have to hold on.
@@ -999,7 +1004,11 @@ async fn a_timestamptz_is_null_through_the_db_host_and_its_epoch_twin_is_not() {
 #[tokio::test]
 async fn the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema() {
     let mut daemon = scratch("copy_daemon", DAEMON_SCHEMA).await;
-    let mut plugin = scratch("copy_plugin", PLUGIN_MIGRATION).await;
+    let mut plugin = scratch(
+        "copy_plugin",
+        &format!("{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}"),
+    )
+    .await;
 
     for table in [
         "ng_devices",
@@ -1008,6 +1017,8 @@ async fn the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema() {
         "ng_ip_history",
         "ng_location_history",
         "ng_people",
+        "ng_notify_status",
+        "ng_notify_requests",
     ] {
         let expected = columns_of(&mut daemon, "copy_daemon", table).await;
         let actual = columns_of(&mut plugin, "copy_plugin", table).await;
@@ -1606,4 +1617,201 @@ async fn the_overview_reads_decode_through_the_db_host_over_the_daemons_schema()
     let confidence = new[0].device_type_confidence.expect("a REAL decodes");
     assert!((confidence - 0.75).abs() < 1e-6, "{confidence}");
     assert!(new[0].first_seen.is_some());
+}
+
+// ===========================================================================
+// Alerts (U3): the notify tables and the delivered events
+// ===========================================================================
+
+/// The status row, read the way the Alerts page reads it: no row is "never
+/// reported", and a row decodes with its clock time as text and its epoch as
+/// a number, through the `db` host's own conversion.
+#[tokio::test]
+async fn the_alerts_page_reads_the_daemons_notify_status() {
+    use netgrasp_core::alerts::{NotifyStatus, delivery_sentences};
+
+    let mut conn = daemon_db("notify_status").await;
+    let none: Vec<NotifyStatus> = query_rows(&mut conn, queries::SELECT_NOTIFY_STATUS, &[]).await;
+    assert!(none.is_empty(), "no row until the daemon writes one");
+
+    sqlx::query(
+        "INSERT INTO ng_notify_status \
+             (notify_configured, notify_backend, last_delivery_ok, last_delivery_at, updated_at) \
+         VALUES (TRUE, 'ntfy', TRUE, '2026-11-17 18:42:00+00', now())",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query("SET TIME ZONE 'UTC'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let rows: Vec<NotifyStatus> = query_rows(&mut conn, queries::SELECT_NOTIFY_STATUS, &[]).await;
+    let status = &rows[0];
+    assert!(status.notify_configured);
+    assert_eq!(status.notify_backend.as_deref(), Some("ntfy"));
+    assert_eq!(status.last_delivery_ok, Some(true));
+    assert_eq!(status.last_delivery_at, Some(1_794_940_920));
+    assert_eq!(status.last_delivery_clock.as_deref(), Some("18:42"));
+    assert!(status.updated_at.is_some(), "the epoch twin, not a null");
+    assert_eq!(
+        delivery_sentences(Some(status), "2026-11-17"),
+        ["Alerts go to ntfy.", "Last alert delivered today at 18:42."]
+    );
+}
+
+/// Send test is one insert the daemon answers. The plugin's statement inserts
+/// a row with nothing for the daemon's columns, and the latest-request read
+/// follows it to the outcome the daemon writes.
+#[tokio::test]
+async fn a_test_request_is_inserted_and_its_outcome_read_back() {
+    use netgrasp_core::alerts::{TestRequest, test_sentence};
+
+    let mut conn = daemon_db("notify_request").await;
+    sqlx::query("SET TIME ZONE 'UTC'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let inserted = exec(
+        &mut conn,
+        queries::INSERT_TEST_REQUEST,
+        &[json!("11111111-1111-4111-8111-111111111111")],
+    )
+    .await;
+    assert_eq!(inserted, 1);
+    let id: i64 = sqlx::query_scalar("SELECT max(id) FROM ng_notify_requests")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+
+    let rows: Vec<TestRequest> =
+        query_rows(&mut conn, queries::SELECT_LATEST_TEST_REQUEST, &[]).await;
+    assert_eq!(rows[0].id, id);
+    assert!(rows[0].requested_at.is_some());
+    assert_eq!(rows[0].outcome, None, "the plugin writes no outcome");
+    assert_eq!(rows[0].handled_at, None);
+
+    // What the daemon does on its tick.
+    sqlx::query(
+        "UPDATE ng_notify_requests SET handled_at = '2026-11-17 18:43:00+00', outcome = 'sent' \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let rows: Vec<TestRequest> =
+        query_rows(&mut conn, queries::SELECT_LATEST_TEST_REQUEST, &[]).await;
+    assert_eq!(rows[0].outcome.as_deref(), Some("sent"));
+    assert_eq!(
+        test_sentence(rows.first(), "2026-11-17").unwrap(),
+        "Test alert sent today at 18:43. Check your phone."
+    );
+}
+
+/// Recently sent is the events the daemon marked `notified`, and nothing else,
+/// in the words the daemon sent them with.
+#[tokio::test]
+async fn recently_sent_lists_only_delivered_events_in_the_daemons_words() {
+    use netgrasp_core::alerts::{SentAlert, sent_sentence};
+
+    let mut conn = daemon_db("recently_sent").await;
+    sqlx::query("SET TIME ZONE 'UTC'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let phone = seed_device(&mut conn, "02:00:5e:00:00:02", Some("jamies-iphone"), now()).await;
+    seed_person(&mut conn, PERSON, "Jamie", "home").await;
+    sqlx::query(
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified) VALUES \
+         ($1, 'person_arrived', '2026-11-17 18:42:00+00', \
+          jsonb_build_object('person', 'Jamie (old name)', 'person_item_id', $2::text, \
+                             'device_name', 'Jamie''s iPhone'), TRUE), \
+         ($1, 'person_departed', '2026-11-17 08:25:00+00', \
+          jsonb_build_object('person', 'Jamie', 'person_item_id', $2::text, \
+                             'last_seen_at', '2026-11-17T07:55:00Z'), TRUE), \
+         ($1, 'returned', '2026-11-17 19:00:00+00', '{}'::jsonb, FALSE), \
+         ($1, 'person_departed', '2026-11-17 09:00:00+00', \
+          jsonb_build_object('person', 'Jamie', 'last_seen_at', 'not a time'), TRUE)",
+    )
+    .bind(phone)
+    .bind(PERSON)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let rows: Vec<SentAlert> =
+        query_rows(&mut conn, queries::SELECT_RECENTLY_SENT, &[json!(20)]).await;
+    let words: Vec<String> = rows.iter().map(sent_sentence).collect();
+    assert_eq!(
+        words,
+        [
+            "Jamie is home: Jamie's iPhone joined at 18:42",
+            "Jamie left: last seen 09:00",
+            "Jamie left: last seen 07:55",
+        ],
+        "newest first, the undelivered return left out, the current name used, \
+         and a malformed last-seen time read as absent rather than failing the page"
+    );
+    assert!(
+        rows.iter().all(|r| r.ts.is_some()),
+        "epoch twins, not nulls"
+    );
+}
+
+/// The device counts and the alerting list leave hidden devices out, and the
+/// list is grouped by owner, people first.
+#[tokio::test]
+async fn the_alerting_devices_are_counted_and_listed_by_owner() {
+    use netgrasp_core::alerts::AlertingCounts;
+    use netgrasp_core::assist::DeviceFacts;
+
+    let mut conn = daemon_db("alerting").await;
+    seed_person(&mut conn, PERSON, "Jamie", "home").await;
+    let printer = seed_device(&mut conn, "02:00:5e:00:00:31", Some("printer"), now()).await;
+    let phone = seed_device(&mut conn, "02:00:5e:00:00:32", Some("phone"), now()).await;
+    let hidden = seed_device(&mut conn, "02:00:5e:00:00:33", Some("hidden"), now()).await;
+    let muted = seed_device(&mut conn, "02:00:5e:00:00:34", Some("muted"), now()).await;
+    sqlx::query("UPDATE ng_devices SET owner_item_id = $1::uuid WHERE id = $2")
+        .bind(PERSON)
+        .bind(phone)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ng_devices SET hidden = TRUE WHERE id = $1")
+        .bind(hidden)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ng_devices SET notify = FALSE WHERE id = $1")
+        .bind(muted)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let counts: Vec<AlertingCounts> =
+        query_rows(&mut conn, queries::SELECT_ALERTING_COUNTS, &[]).await;
+    assert_eq!(
+        counts[0],
+        AlertingCounts {
+            alerting: 2,
+            devices: 3
+        }
+    );
+
+    let alerting: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICES_ALERTING, &[json!(50)]).await;
+    let ids: Vec<i64> = alerting.iter().map(|d| d.id).collect();
+    assert_eq!(ids, [phone, printer], "the owned device first");
+    assert_eq!(alerting[0].owner_name.as_deref(), Some("Jamie"));
+
+    let all: Vec<DeviceFacts> =
+        query_rows(&mut conn, queries::SELECT_DEVICES_FOR_ALERTS, &[json!(50)]).await;
+    let ids: Vec<i64> = all.iter().map(|d| d.id).collect();
+    assert_eq!(
+        ids,
+        [phone, muted, printer],
+        "every visible device, muted too"
+    );
 }

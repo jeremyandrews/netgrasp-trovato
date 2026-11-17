@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alerts;
 pub mod assist;
 pub mod columns;
 pub mod error;

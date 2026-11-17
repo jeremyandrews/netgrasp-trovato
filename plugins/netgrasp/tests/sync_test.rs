@@ -222,6 +222,7 @@ async fn reset(pool: &PgPool) {
         "TRUNCATE ng_people",
         "TRUNCATE ng_state",
         "TRUNCATE ng_person_merge",
+        "TRUNCATE ng_notify_status, ng_notify_requests RESTART IDENTITY",
     ] {
         sqlx::query(stmt).execute(pool).await.unwrap();
     }
@@ -4481,7 +4482,7 @@ fn a_post_with_no_token_never_reaches_the_plugin() {
 /// now tab, however many times the migrations have run (every test here runs
 /// them all again on the same database).
 #[test]
-fn the_navigation_migration_writes_four_menu_rows_the_aliases_and_one_redirect() {
+fn the_navigation_migrations_write_five_menu_rows_the_aliases_and_one_redirect() {
     serial(async {
         let pool = fresh_pool().await;
 
@@ -4496,7 +4497,7 @@ fn the_navigation_migration_writes_four_menu_rows_the_aliases_and_one_redirect()
         let titles: Vec<&str> = menu.iter().map(|m| m.1.as_str()).collect();
         assert_eq!(
             titles,
-            ["Home", "Devices", "People", "Activity"],
+            ["Home", "Devices", "People", "Alerts", "Activity"],
             "{menu:?}"
         );
 
@@ -6015,4 +6016,468 @@ async fn dispatch_as_raw(
     let results = disp.dispatch(tap, &payload.to_string(), state).await;
     assert_eq!(results.len(), 1, "expected exactly one {tap} result");
     results[0].output.clone()
+}
+
+// ===========================================================================
+// Alerts (U3)
+// ===========================================================================
+
+const ALERTS: &str = "/alerts";
+const ALERTS_ADD: &str = "/alerts/add";
+const ALERTS_DEVICES: &str = "/alerts/devices";
+
+/// A person's two alert flags on both tiers: the Item's fields and the
+/// mirror the daemon reads.
+async fn person_alerts_both_tiers(pool: &PgPool, id: Uuid) -> ((bool, bool), (bool, bool)) {
+    let (_, arrive) = item_title_and_field(pool, id, "field_notify_arrive").await;
+    let (_, depart) = item_title_and_field(pool, id, "field_notify_depart").await;
+    (
+        (
+            arrive.as_bool().unwrap_or(false),
+            depart.as_bool().unwrap_or(false),
+        ),
+        alerts_of(pool, id).await,
+    )
+}
+
+/// What the daemon writes into its status row when ntfy is configured.
+async fn seed_notify_status(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO ng_notify_status \
+             (id, notify_configured, notify_backend, last_delivery_ok, last_delivery_at, updated_at) \
+         VALUES (1, TRUE, 'ntfy', TRUE, now() - interval '5 minutes', now())",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// **The page says every rule as a sentence**, a person's own first and then
+/// their devices, then the devices nobody owns; where alerts go; and what was
+/// sent, in the words it was sent with. And every switch on it is a form
+/// carrying the kernel's token.
+#[test]
+fn the_alerts_page_says_every_rule_where_alerts_go_and_what_was_sent() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        set_alerts(&pool, jamie, true, false).await;
+        let phone = seed_clean_device(&pool, "02:00:5e:00:09:01", Some(jamie), "online").await;
+        sqlx::query("UPDATE ng_devices SET display_name = 'Jamie''s iPhone' WHERE id = $1")
+            .bind(phone)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let printer = seed_clean_device(&pool, "02:00:5e:00:09:02", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET display_name = 'Office printer' WHERE id = $1")
+            .bind(printer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let muted = seed_clean_device(&pool, "02:00:5e:00:09:03", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET notify = FALSE WHERE id = $1")
+            .bind(muted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_notify_status(&pool).await;
+        sqlx::query(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified) VALUES \
+             ($1, 'person_arrived', now() - interval '5 minutes', \
+              jsonb_build_object('person', 'Jamie', 'person_item_id', $2::text, \
+                                 'device_name', 'Jamie''s iPhone'), TRUE), \
+             ($3, 'returned', now() - interval '4 minutes', '{}'::jsonb, FALSE)",
+        )
+        .bind(phone)
+        .bind(jamie.to_string())
+        .bind(printer)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_form",
+            "GET",
+            ALERTS,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let html = response["body"].as_str().unwrap();
+
+        let rule = html.find("Tell me when Jamie gets home.").expect(html);
+        let device = html
+            .find("Tell me when Jamie&#x27;s iPhone comes online.")
+            .expect(html);
+        let nobodys = html
+            .find("Tell me when Office printer comes online.")
+            .expect(html);
+        assert!(rule < device && device < nobodys, "{html}");
+        assert!(html.contains("2 devices of 3 alert when they come back online."));
+        assert!(html.contains("Alerts go to ntfy."), "{html}");
+        assert!(html.contains("Last alert delivered today at"), "{html}");
+        assert!(html.contains("Send a test alert"), "{html}");
+        assert!(
+            html.contains("Jamie is home: Jamie&#x27;s iPhone joined at"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("Back online: Office printer"),
+            "an alert that was not delivered is not listed as sent"
+        );
+        assert!(!html.contains("<script"), "the page needs no script");
+        assert_eq!(
+            html.matches("<form").count(),
+            html.matches("name=\"_token\" value=\"minted-by-the-kernel\"")
+                .count(),
+            "every switch carries the token"
+        );
+    });
+}
+
+/// **Adding an alert for a person turns on exactly that alert**, on the Item
+/// and in the mirror the daemon reads, through the person save every other
+/// form uses. The other flag is left as it was.
+#[test]
+fn an_alert_added_for_a_person_turns_on_that_alert_alone_on_both_tiers() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        set_alerts(&pool, jamie, false, true).await;
+
+        let form = call_form(
+            &pool,
+            &admin,
+            "alerts_add_form",
+            "GET",
+            ALERTS_ADD,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert_eq!(form["status"], 200, "{form}");
+        let html = form["body"].as_str().unwrap();
+        assert!(html.contains(&format!("value=\"{jamie}\"")), "{html}");
+        assert!(html.contains("gets home"), "{html}");
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_add_save",
+            "POST",
+            ALERTS_ADD,
+            serde_json::json!({}),
+            &format!("kind=person&person={jamie}&when=arrive&back=%2Falerts"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap()
+                .contains("Tell me when Jamie gets home."),
+            "{response}"
+        );
+        assert_eq!(
+            person_alerts_both_tiers(&pool, jamie).await,
+            ((true, true), (true, true)),
+            "arrival on, departure still on, on both tiers"
+        );
+    });
+}
+
+/// **Adding an alert for a device turns its `notify` on** and touches no
+/// other column, and an unknown device changes nothing.
+#[test]
+fn an_alert_added_for_a_device_turns_its_notify_on_and_nothing_else() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:09:11", None, "offline").await;
+        sqlx::query("UPDATE ng_devices SET notify = FALSE WHERE id = $1")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = daemon_snapshot(&pool, device).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_add_save",
+            "POST",
+            ALERTS_ADD,
+            serde_json::json!({}),
+            "kind=device&device=02%3A00%3A5e%3A00%3A09%3A11&back=%2Falerts",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(device_flags(&pool, device).await, (false, true));
+        assert_eq!(
+            before,
+            daemon_snapshot(&pool, device).await,
+            "a daemon-owned column moved"
+        );
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_add_save",
+            "POST",
+            ALERTS_ADD,
+            serde_json::json!({}),
+            "kind=device&device=02%3A00%3A5e%3A00%3A09%3A99&back=%2Falerts",
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+    });
+}
+
+/// **"Only the devices I choose"** mutes every listed device left unticked,
+/// unmutes the ticked ones, and leaves a device the page did not list alone,
+/// so one that appeared while the form was open is not muted for it.
+#[test]
+fn the_bulk_alerts_form_sets_exactly_the_listed_devices() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let keep = seed_clean_device(&pool, "02:00:5e:00:09:21", None, "online").await;
+        let mute = seed_clean_device(&pool, "02:00:5e:00:09:22", None, "online").await;
+        let unmute = seed_clean_device(&pool, "02:00:5e:00:09:23", None, "online").await;
+        let unlisted = seed_clean_device(&pool, "02:00:5e:00:09:24", None, "online").await;
+        sqlx::query("UPDATE ng_devices SET notify = FALSE WHERE id = $1")
+            .bind(unmute)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let form = call_form(
+            &pool,
+            &admin,
+            "alerts_devices_form",
+            "GET",
+            ALERTS_DEVICES,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert_eq!(form["status"], 200, "{form}");
+        let html = form["body"].as_str().unwrap();
+        assert_eq!(html.matches("type=\"checkbox\"").count(), 4, "{html}");
+        assert_eq!(html.matches(" checked>").count(), 3, "{html}");
+
+        let listed = |mac: &str| format!("listed={}", mac.replace(':', "%3A"));
+        let ticked = |mac: &str| format!("device={}", mac.replace(':', "%3A"));
+        let body = [
+            listed("02:00:5e:00:09:21"),
+            ticked("02:00:5e:00:09:21"),
+            listed("02:00:5e:00:09:22"),
+            listed("02:00:5e:00:09:23"),
+            ticked("02:00:5e:00:09:23"),
+            "back=%2Falerts".to_string(),
+        ]
+        .join("&");
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_devices_save",
+            "POST",
+            ALERTS_DEVICES,
+            serde_json::json!({}),
+            &body,
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap()
+                .contains("1 device will now alert; 1 device muted."),
+            "{response}"
+        );
+        assert_eq!(device_flags(&pool, keep).await, (false, true));
+        assert_eq!(device_flags(&pool, mute).await, (false, false));
+        assert_eq!(device_flags(&pool, unmute).await, (false, true));
+        assert_eq!(
+            device_flags(&pool, unlisted).await,
+            (false, true),
+            "a device the page did not list was changed"
+        );
+    });
+}
+
+/// **Send test asks the daemon and does nothing else.** One row in
+/// `ng_notify_requests`, naming who asked, with the daemon's columns empty; no
+/// event, and nothing about where alerts go.
+#[test]
+fn send_test_inserts_one_request_for_the_daemon_and_nothing_else() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        seed_notify_status(&pool).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "alerts_save",
+            "POST",
+            ALERTS,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let html = response["body"].as_str().unwrap();
+        assert!(
+            html.contains("Asked netgraspd to send a test alert."),
+            "{html}"
+        );
+
+        let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT requested_by, outcome, handled_at IS NULL FROM ng_notify_requests",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [(Some(admin.id.to_string()), None, true)]);
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM ng_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 0);
+
+        // The page shows the request waiting, and then what the daemon said.
+        let page = call_form(
+            &pool,
+            &admin,
+            "alerts_form",
+            "GET",
+            ALERTS,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert!(
+            page["body"]
+                .as_str()
+                .unwrap()
+                .contains("waiting for netgraspd"),
+            "{page}"
+        );
+        sqlx::query("UPDATE ng_notify_requests SET handled_at = now(), outcome = 'sent'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let page = call_form(
+            &pool,
+            &admin,
+            "alerts_form",
+            "GET",
+            ALERTS,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert!(
+            page["body"]
+                .as_str()
+                .unwrap()
+                .contains("Test alert sent today at"),
+            "{page}"
+        );
+    });
+}
+
+/// **The page's switch turns one rule off and keeps the other**, through the
+/// person notify save it posts to.
+#[test]
+fn the_alerts_page_switch_turns_one_person_rule_off_and_keeps_the_other() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        set_alerts(&pool, jamie, true, true).await;
+
+        // Exactly the fields the page's "Turn off" beside the arrival rule posts.
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_notify_save",
+            "POST",
+            "/netgrasp/person/notify",
+            serde_json::json!({}),
+            &format!("target={jamie}&back=%2Falerts&depart=1"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(
+            person_alerts_both_tiers(&pool, jamie).await,
+            ((false, true), (false, true))
+        );
+    });
+}
+
+/// **Nobody without the permission reaches any of it**: every Alerts page and
+/// form answers 403 to a caller without `administer netgrasp` and to an
+/// anonymous visitor, and nothing changes.
+#[test]
+fn the_alerts_pages_refuse_a_caller_without_the_permission_and_anonymous() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:09:31", None, "online").await;
+        let nobody = ng_nobody(&pool).await;
+        let calls = [
+            ("alerts_form", "GET", ALERTS, String::new()),
+            ("alerts_save", "POST", ALERTS, String::new()),
+            ("alerts_add_form", "GET", ALERTS_ADD, String::new()),
+            (
+                "alerts_add_save",
+                "POST",
+                ALERTS_ADD,
+                format!("kind=person&person={jamie}&when=arrive"),
+            ),
+            ("alerts_devices_form", "GET", ALERTS_DEVICES, String::new()),
+            (
+                "alerts_devices_save",
+                "POST",
+                ALERTS_DEVICES,
+                "listed=02%3A00%3A5e%3A00%3A09%3A31".to_string(),
+            ),
+        ];
+        for user in [nobody, UserContext::anonymous()] {
+            for (callback, method, path, body) in &calls {
+                let response = call_form(
+                    &pool,
+                    &user,
+                    callback,
+                    method,
+                    path,
+                    serde_json::json!({}),
+                    body,
+                )
+                .await;
+                assert_eq!(response["status"], 403, "{callback}: {response}");
+            }
+        }
+        let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM ng_notify_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(requests, 0, "a refused caller asked for a test");
+        assert_eq!(alerts_of(&pool, jamie).await, (false, false));
+        assert_eq!(device_flags(&pool, device).await, (false, true));
+    });
 }

@@ -562,7 +562,7 @@ pub(crate) fn person_page(item_id: &str) -> String {
 }
 
 /// A return path, or `fallback` when there is none or it leaves the site.
-fn back_or(raw: Option<&str>, fallback: &str) -> String {
+pub(crate) fn back_or(raw: Option<&str>, fallback: &str) -> String {
     match raw.map(str::trim) {
         Some(value) if !value.is_empty() => {
             let safe = safe_back(Some(value));
@@ -578,7 +578,7 @@ fn back_or(raw: Option<&str>, fallback: &str) -> String {
 
 /// The token and the way back, as the two hidden fields every POST form here
 /// starts with.
-fn token_and_back(request: &ApiRequest, back: &str) -> String {
+pub(crate) fn token_and_back(request: &ApiRequest, back: &str) -> String {
     format!(
         r#"<input type="hidden" name="_token" value="{token}">
 <input type="hidden" name="back" value="{back}">"#,
@@ -588,7 +588,7 @@ fn token_and_back(request: &ApiRequest, back: &str) -> String {
 }
 
 /// One line about a device for the bulk list: vendor, address, online or not.
-fn device_meta(device: &DeviceFacts) -> String {
+pub(crate) fn device_meta(device: &DeviceFacts) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(mdns) = device.mdns_name.as_deref().filter(|m| !m.trim().is_empty())
         && device.label() != mdns
@@ -620,7 +620,7 @@ fn alerts_words(arrive: bool, depart: bool) -> &'static str {
 /// The bulk form posts one `device` per ticked box. `ApiRequest::query` keeps
 /// only the last value of a repeated key, which is why the selection travels in
 /// a POST body and is read here, never in the query string (`docs/UI.md`).
-fn fields(body: &str, name: &str) -> Vec<String> {
+pub(crate) fn fields(body: &str, name: &str) -> Vec<String> {
     body.split('&')
         .filter_map(|pair| pair.split_once('='))
         .filter(|(key, _)| *key == name)
@@ -630,7 +630,7 @@ fn fields(body: &str, name: &str) -> Vec<String> {
 }
 
 /// Percent-encode a query value: everything but the unreserved characters.
-fn url_encode(raw: &str) -> String {
+pub(crate) fn url_encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         match byte {

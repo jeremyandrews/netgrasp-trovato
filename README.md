@@ -184,6 +184,7 @@ tables.
 | netgrasp-trovato | netgraspd | `ng_` schema | Trovato kernel |
 |---|---|---|---|
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql` in netgraspd) | 0.102.0 or a later 0.x |
+| unreleased (`main`) | unreleased (`main`) | version 4 (`V4__notify_status_and_requests.sql` in netgraspd) | 0.102.0 or a later 0.x |
 
 **The rule.** A plugin and a daemon pair when they are built for the same `ng_`
 schema version, which is the highest migration in the daemon's `migrations/`.
@@ -191,6 +192,7 @@ The daemon owns that schema and its migrations are the canonical DDL. This
 repository carries the tables it reads twice: `crates/netgrasp-core/tests/
 fixtures/daemon_schema.sql` reproduces the daemon's DDL and is what the plugin's
 queries are tested against, and `plugins/netgrasp/migrations/001_netgrasp_schema.sql`
+(with `015_netgrasp_notify_schema.sql` for version 4's notify tables)
 is a guarded copy so the plugin can be enabled with no daemon.
 `the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema` checks the
 second against the first column by column, and CI fails if it does not run.

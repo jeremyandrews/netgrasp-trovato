@@ -203,6 +203,28 @@ jobs:
               || { echo "::error::$t did not pass"; exit 1; }
           done
 
+      # The Alerts page (U3): the page says every rule and what was sent, each
+      # form writes exactly what it says through the existing saves, Send test
+      # is one request row for the daemon and nothing else, and nobody without
+      # the permission reaches any of it. Named for the same reason as above.
+      - name: The Alerts suite proved the page, each form, Send test and the permission
+        run: |
+          for t in \
+            the_alerts_page_says_every_rule_where_alerts_go_and_what_was_sent \
+            an_alert_added_for_a_person_turns_on_that_alert_alone_on_both_tiers \
+            an_alert_added_for_a_device_turns_its_notify_on_and_nothing_else \
+            the_bulk_alerts_form_sets_exactly_the_listed_devices \
+            send_test_inserts_one_request_for_the_daemon_and_nothing_else \
+            the_alerts_page_switch_turns_one_person_rule_off_and_keeps_the_other \
+            the_alerts_pages_refuse_a_caller_without_the_permission_and_anonymous \
+            the_alerts_page_reads_the_daemons_notify_status \
+            a_test_request_is_inserted_and_its_outcome_read_back \
+            recently_sent_lists_only_delivered_events_in_the_daemons_words
+          do
+            grep -q "$t ... ok" test.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
       # The listing templates are rendered rather than grepped by this one, and
       # it is the only thing anywhere that would notice a Tera error before a
       # reader did — a template that raises falls back to the kernel's dump of
@@ -253,6 +275,19 @@ jobs:
             -f plugins/netgrasp/migrations/001_netgrasp_schema.sql
           psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
             -c "select count(*) from ng_devices"
+
+      # 015 is netgraspd's notify tables (its schema V4), guarded the same way
+      # and standing alone the same way.
+      - name: The notify schema migration applies, twice
+        env:
+          PGPASSWORD: trovato
+        run: |
+          for _ in 1 2; do
+            psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+              -f plugins/netgrasp/migrations/015_netgrasp_notify_schema.sql
+          done
+          psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -c "select count(*) from ng_notify_status, ng_notify_requests"
 
       # 007 is the other migration that stands alone: views over the ng_ tables
       # 001 creates, and nothing in a kernel table. `CREATE OR REPLACE VIEW` is

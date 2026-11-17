@@ -34,6 +34,7 @@ use trovato_sdk::host;
 use trovato_sdk::prelude::*;
 use trovato_sdk::types::{FieldAccessBatchInput, FieldAccessBatchResult, FieldAccessResult};
 
+mod alerts;
 mod assist_host;
 mod db;
 mod device_view;
@@ -154,13 +155,13 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// serialize to the same shape the registry reads, so this is a change of SDK
 /// type and not of contract.
 ///
-/// Four entries, in the order of the site menu `011_netgrasp_navigation.sql`
-/// writes: Home, Devices, People, Activity (docs/UI.md, "Navigation"). Alerts is
-/// the fifth and arrives with its page, at weight 3.
+/// Five entries, in the order of the site menu `011_netgrasp_navigation.sql`
+/// and `016_netgrasp_alerts.sql` write: Home, Devices, People, Alerts, Activity
+/// (docs/UI.md, "Navigation").
 ///
 /// **These are the fallback, not the menu.** The kernel draws `menu_link` rows
 /// whenever the site has any, and ignores every plugin's `tap_menu` entries when
-/// it does; 011 writes four. These say the same four things so that a site that
+/// it does; 011 and 016 write five. These say the same five things so that a site that
 /// empties `menu_link` gets the same navigation back rather than the fifteen
 /// flat entries this replaced. A test holds the two lists together.
 ///
@@ -181,7 +182,19 @@ pub fn tap_perm() -> Vec<PermissionDefinition> {
 /// out of one tap.
 #[plugin_tap]
 pub fn tap_menu() -> Vec<MenuRoute> {
-    let mut menu = vec![
+    // The row menu's forms and the Alerts page's own routes. Invisible, gated
+    // on `administer netgrasp`, and each one naming a callback — which is the
+    // only combination the kernel routes (`routes/plugin_api.rs`). They ride in
+    // the same tap because `tap_menu` is where the kernel learns about a
+    // plugin-served path at all; nothing about them is navigation.
+    //
+    // They come FIRST, because `/alerts` is both: an api route (the page is
+    // served by `tap_api`) and a navigation entry. The kernel routes every
+    // registration, but keeps one entry per path for navigation, and a later
+    // `GET` displaces an earlier one (`MenuRegistry::register`). The visible
+    // page entry has to be the one kept, so it is registered after the route.
+    let mut menu = forms::routes();
+    menu.extend([
         MenuRoute::page("/overview", "Home")
             .permission(PERM_VIEW_DEVICES)
             .weight(0),
@@ -191,16 +204,15 @@ pub fn tap_menu() -> Vec<MenuRoute> {
         MenuRoute::page("/people", "People")
             .permission(PERM_VIEW_DEVICES)
             .weight(2),
+        // Served by tap_api rather than a gather (src/alerts.rs), and every
+        // request to it needs `administer netgrasp`, as the forms do.
+        MenuRoute::page("/alerts", "Alerts")
+            .permission(PERM_ADMINISTER)
+            .weight(3),
         MenuRoute::page("/activity", "Activity")
             .permission(PERM_VIEW_DEVICES)
             .weight(4),
-    ];
-    // The row menu's forms. Invisible, gated on `administer netgrasp`, and each
-    // one naming a callback — which is the only combination the kernel routes
-    // (`routes/plugin_api.rs`). They ride in the same tap because `tap_menu` is
-    // where the kernel learns about a plugin-served path at all; nothing about
-    // them is navigation.
-    menu.extend(forms::routes());
+    ]);
     menu
 }
 
@@ -892,12 +904,15 @@ mod tests {
         let mut menus = navigation();
         menus.sort_by_key(|m| m.weight);
         let ordered: Vec<&str> = menus.iter().map(|m| m.path.as_str()).collect();
-        assert_eq!(ordered, ["/overview", "/devices", "/people", "/activity"]);
+        assert_eq!(
+            ordered,
+            ["/overview", "/devices", "/people", "/alerts", "/activity"]
+        );
 
         let mut weights: Vec<i32> = navigation().iter().map(|m| m.weight).collect();
         weights.sort_unstable();
         weights.dedup();
-        assert_eq!(weights.len(), 4, "two menu entries share a weight");
+        assert_eq!(weights.len(), 5, "two menu entries share a weight");
     }
 
     /// A navigation entry must be visible, or it is filtered out by
@@ -918,17 +933,41 @@ mod tests {
         }
     }
 
-    /// Every menu path must be a route a gather migration actually aliases,
-    /// or the navigation links to a 404.
+    /// Every menu path must be a route a gather migration actually aliases, or
+    /// a page this plugin serves itself through `tap_api`, or the navigation
+    /// links to a 404.
     #[test]
     fn every_menu_path_is_an_alias_the_migration_seeds() {
+        let served: Vec<String> = routes_only()
+            .into_iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.path)
+            .collect();
         for m in navigation() {
             assert!(
-                aliased_paths().contains(&m.path),
-                "menu path {} has no url_alias in any migration",
+                aliased_paths().contains(&m.path) || served.contains(&m.path),
+                "menu path {} has no url_alias in any migration and no route of its own",
                 m.path
             );
         }
+    }
+
+    /// `/alerts` is both a navigation entry and a served route. The kernel
+    /// keeps one entry per path for navigation and a later `GET` displaces an
+    /// earlier one, so the visible page entry must come after the route or the
+    /// menu loses Alerts wherever it falls back to `tap_menu`.
+    #[test]
+    fn the_alerts_menu_entry_is_registered_after_its_route() {
+        let menu = __inner_tap_menu();
+        let route = menu
+            .iter()
+            .position(|m| m.path == "/alerts" && m.handler_type == "api" && m.method == "GET")
+            .expect("the Alerts page is served");
+        let entry = menu
+            .iter()
+            .position(|m| m.path == "/alerts" && m.handler_type == "page")
+            .expect("Alerts is in the navigation");
+        assert!(route < entry, "the route would displace the menu entry");
     }
 
     /// Every migration the manifest ships, in order, as text.
@@ -965,7 +1004,11 @@ mod tests {
     /// The site menu the kernel actually draws: the `menu_link` rows 011
     /// writes, as (path, title, weight).
     fn site_menu_rows() -> Vec<(String, String, i32)> {
-        let migration = include_str!("../migrations/011_netgrasp_navigation.sql");
+        let migration = [
+            include_str!("../migrations/011_netgrasp_navigation.sql"),
+            include_str!("../migrations/016_netgrasp_alerts.sql"),
+        ]
+        .join("\n");
         let mut rows: Vec<(String, String, i32)> = migration
             .lines()
             .filter_map(|line| line.trim().strip_prefix("('main', '"))
@@ -981,18 +1024,21 @@ mod tests {
         rows
     }
 
-    /// **The menu as built**: Home, Devices, People, Activity, in that order,
-    /// and nothing else. Alerts joins it with its page, between People and
-    /// Activity, which is why the weights skip 3.
+    /// **The menu as built**: Home, Devices, People, Alerts, Activity, in that
+    /// order, and nothing else (docs/UI.md, U3 check 1). Alerts arrived with
+    /// its page in 016, at the weight 011 left free.
     #[test]
-    fn the_site_menu_reads_home_devices_people_activity() {
+    fn the_site_menu_reads_home_devices_people_alerts_activity() {
         let rows = site_menu_rows();
         let titles: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        assert_eq!(titles, ["Home", "Devices", "People", "Activity"]);
+        assert_eq!(titles, ["Home", "Devices", "People", "Alerts", "Activity"]);
         let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(paths, ["/overview", "/devices", "/people", "/activity"]);
+        assert_eq!(
+            paths,
+            ["/overview", "/devices", "/people", "/alerts", "/activity"]
+        );
         let weights: Vec<i32> = rows.iter().map(|r| r.2).collect();
-        assert_eq!(weights, [0, 1, 2, 4]);
+        assert_eq!(weights, [0, 1, 2, 3, 4]);
     }
 
     /// The kernel draws the `menu_link` rows when there are any and the
@@ -1034,6 +1080,24 @@ mod tests {
             !insert.contains("parent_id"),
             "the kernel draws no child rows"
         );
+
+        let alerts = include_str!("../migrations/016_netgrasp_alerts.sql");
+        let (_, insert) = alerts
+            .split_once("INSERT INTO menu_link")
+            .unwrap_or_default();
+        let (insert, _) = insert.split_once(';').unwrap_or_default();
+        assert!(
+            insert.contains("ON CONFLICT (path, menu_name, stage_id) DO NOTHING"),
+            "{insert}"
+        );
+        assert_eq!(
+            insert
+                .matches("'0193a5a0-0000-7000-8000-000000000001'")
+                .count(),
+            1,
+            "{insert}"
+        );
+        assert_eq!(insert.matches("'netgrasp'").count(), 1, "{insert}");
     }
 
     /// **Every path that worked before still works.** Each is either a
@@ -1274,7 +1338,22 @@ mod tests {
                 include_str!("../../../templates/gather/query--ng_devices_todo.html"),
             ),
         ];
+        // The Alerts pages: /alerts is in the site menu, and its two forms are
+        // linked from it.
+        let alerts_page = alerts::render(&alerts::AlertsView::default(), "token");
+        let navigation: Vec<String> = navigation().into_iter().map(|m| m.path).collect();
         for path in &served {
+            if path == alerts::ALERTS {
+                assert!(navigation.contains(path), "{path} is not in the menu");
+                continue;
+            }
+            if path.starts_with("/alerts/") {
+                assert!(
+                    alerts_page.contains(&format!("href=\"{path}\"")),
+                    "{path} is served and the Alerts page does not link to it"
+                );
+                continue;
+            }
             if let Some((_, page)) = pages.iter().find(|(p, _)| p == path) {
                 assert!(
                     page.contains(&format!("href=\"{path}\"")),
