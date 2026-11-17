@@ -201,6 +201,77 @@ INSERT INTO ng_devices (
 -- the device's Item; until then trovato_item_id is null and the record id is a
 -- bigint the uuid-keyed item route cannot open. Both branches need to be on the
 -- page, so two devices get one.
+-- More of a real network, so that every Devices tab and every part of Home has
+-- rows (docs/UI.md): two devices somebody hid, a Raspberry Pi called motivo for
+-- the search box, and eight devices that arrived this week that nobody has
+-- named or claimed. Eight plus the two above makes ten to sort this week, which
+-- is more than the six Home's "Needs attention" shows, so its "more" line has
+-- something to say. Four carry a possessive mDNS name, as 22 of 166 do on the
+-- live network.
+INSERT INTO ng_devices (
+    mac, display_name, notes, hidden, notify, owner_item_id,
+    resolved_name, identity_source, identity_confidence, hostname, mdns_name,
+    vendor, device_type, device_type_confidence, os_family,
+    state, last_ip, last_ipv6, last_interface,
+    first_seen_at, last_seen_at, baseline, current_ap, current_location,
+    sync_state, trovato_item_id
+) VALUES
+    ('02:00:5e:00:00:0e', 'Hallway smart plug', 'Always on; hidden so it stops cluttering the lists.', TRUE, FALSE, NULL,
+     'hs103', 'dhcp', 0.82, 'HS103', NULL, 'TP-Link', 'iot', 0.77, NULL,
+     'online', '10.0.1.90', NULL, 'eth0',
+     NOW() - INTERVAL '300 days', NOW() - INTERVAL '40 seconds', TRUE, 'Living room AP', 'Living room',
+     'clean', NULL),
+    ('02:00:5e:00:00:0f', 'Mesh node, upstairs', NULL, TRUE, FALSE, NULL,
+     'mesh-upstairs', 'reverse-dns', 0.96, 'mesh-upstairs.lan', NULL, 'Ubiquiti Inc.', 'router', 0.97, 'Linux',
+     'online', '10.0.1.2', NULL, 'eth0',
+     NOW() - INTERVAL '640 days', NOW() - INTERVAL '8 seconds', TRUE, NULL, 'Rack',
+     'clean', NULL),
+    ('02:00:5e:00:00:10', NULL, NULL, FALSE, TRUE, NULL,
+     'motivo', 'mdns', 0.93, 'motivo.local', 'motivo', 'Raspberry Pi Trading', 'server', 0.81, 'Linux',
+     'online', '10.0.1.12', 'fd00::12', 'eth0',
+     NOW() - INTERVAL '45 days', NOW() - INTERVAL '15 seconds', TRUE, NULL, 'Office',
+     'clean', NULL),
+    ('02:00:5e:00:00:11', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'mdns', 0.88, 'Jamies-iPad', 'Jamie''s iPad', 'Apple, Inc.', 'tablet', 0.90, 'iPadOS',
+     'online', '10.0.1.103', NULL, 'eth0',
+     NOW() - INTERVAL '3 hours', NOW() - INTERVAL '1 minute', FALSE, 'Studio AP', 'Studio',
+     'clean', NULL),
+    ('02:00:5e:00:00:12', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'mdns', 0.86, 'Auroras-Pixel', 'Aurora''s Pixel 8', 'Google, Inc.', 'phone', 0.91, 'Android',
+     'online', '10.0.1.104', NULL, 'eth0',
+     NOW() - INTERVAL '9 hours', NOW() - INTERVAL '50 seconds', FALSE, 'Living room AP', 'Living room',
+     'clean', NULL),
+    ('02:00:5e:00:00:13', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'dhcp', 0.62, 'DESKTOP-7Q2M4KD', NULL, 'Micro-Star INT''L', 'desktop', 0.74, 'Windows',
+     'idle', '10.0.1.118', NULL, 'eth0',
+     NOW() - INTERVAL '1 day', NOW() - INTERVAL '22 minutes', FALSE, NULL, 'Office',
+     'clean', NULL),
+    ('02:00:5e:00:00:14', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'mdns', 0.79, 'Chromecast', 'Living Room TV''s Chromecast', 'Google, Inc.', 'media', 0.85, NULL,
+     'online', '10.0.1.121', NULL, 'eth0',
+     NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 minutes', FALSE, 'Living room AP', 'Living room',
+     'clean', NULL),
+    ('02:00:5e:00:00:15', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, NULL, NULL, 'esp32-4f1a2c', NULL, 'Espressif Inc.', 'iot', 0.58, NULL,
+     'online', '10.0.1.133', NULL, 'eth0',
+     NOW() - INTERVAL '3 days', NOW() - INTERVAL '30 seconds', FALSE, NULL, 'Kitchen',
+     'clean', NULL),
+    ('02:00:5e:00:00:16', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'mdns', 0.84, 'Arlos-Switch', 'Arlo''s Switch', 'Nintendo Co., Ltd.', 'console', 0.88, NULL,
+     'offline', '10.0.2.40', NULL, 'eth0',
+     NOW() - INTERVAL '4 days', NOW() - INTERVAL '1 day', FALSE, NULL, NULL,
+     'clean', NULL),
+    ('02:00:5e:00:00:17', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, 'dhcp', 0.70, 'ring-doorbell', NULL, 'Ring LLC', 'camera', 0.83, NULL,
+     'online', '10.0.1.140', NULL, 'eth0',
+     NOW() - INTERVAL '5 days', NOW() - INTERVAL '45 seconds', FALSE, 'Garage AP', 'Garage',
+     'clean', NULL),
+    ('02:00:5e:00:00:18', NULL, NULL, FALSE, TRUE, NULL,
+     NULL, NULL, NULL, NULL, NULL, 'Murata Manufacturing', NULL, NULL, NULL,
+     'idle', '10.0.2.77', NULL, 'eth0',
+     NOW() - INTERVAL '6 days', NOW() - INTERVAL '3 hours', FALSE, 'Guest AP', 'Guest',
+     'clean', NULL);
+
 INSERT INTO item (id, type, title, author_id, status, created, changed, fields)
 SELECT
     v.id::uuid, 'ng_device', v.title,
@@ -251,7 +322,12 @@ FROM (VALUES
     ('02:00:5e:00:00:02', 'device_online',     5, '{"ip": "10.0.1.31"}'),
     ('02:00:5e:00:00:0b', 'device_online',     3, '{"ip": "10.0.1.10"}'),
     ('02:00:5e:00:00:01', 'location_changed',  2, '{"from": "Living room", "to": "Studio"}'),
-    ('02:00:5e:00:00:08', 'new_device',        1, '{"interface": "eth0"}')
+    ('02:00:5e:00:00:08', 'new_device',        1, '{"interface": "eth0"}'),
+    ('02:00:5e:00:00:11', 'new_device',      180, '{"ip": "10.0.1.103", "interface": "eth0"}'),
+    ('02:00:5e:00:00:12', 'new_device',      540, '{"ip": "10.0.1.104", "interface": "eth0"}'),
+    ('02:00:5e:00:00:13', 'new_device',     1440, '{"ip": "10.0.1.118", "interface": "eth0"}'),
+    ('02:00:5e:00:00:11', 'ip_changed',        4, '{"from": "10.0.1.102", "to": "10.0.1.103"}'),
+    ('02:00:5e:00:00:14', 'ip_changed',        3, '{"from": "10.0.1.120", "to": "10.0.1.121"}')
 ) AS v(mac, event_type, ago, details)
 JOIN ng_devices d ON d.mac = v.mac;
 

@@ -9,6 +9,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
 {#
     An unresolved `url_arg` filter is *dropped* rather than matched as empty, so
     this route with no `device_type` returns every device rather than none. The
@@ -20,14 +22,47 @@
     {%- if filter_values.device_type -%}
     Type <strong>{{ filter_values.device_type }}</strong>. <a href="/devices/all">All devices</a>
     {%- else -%}
-    No type given, so this is every device. Pick a type from a device's Type
-    column, or go to <a href="/devices/all">all devices</a>.
+    Every device, by what the daemon thinks it is. Pick a type to see only
+    that kind.
     {%- endif -%}
 </p>
 {% include "gather/netgrasp/device-summary.html" %}
 {% endblock %}
 
-{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+{#
+    The By type tab is this page with no type given: every device, sorted by type
+    (012), drawn as one section per type the way By place draws one per place.
+    With a type given it is one plain table, as it always was. A device the
+    daemon could not type is in the last section, "Not yet identified".
+#}
+{% block results %}
+{%- if filter_values.device_type is defined and filter_values.device_type -%}
+{% include "gather/netgrasp/device-table.html" %}
+{%- else -%}
+{% set ng_all = rows %}
+{% for ng_kind in ng_all | map(attribute="device_type") | unique %}
+<section class="ng-section" id="type-{{ ng_kind | slugify }}">
+    <h2 class="ng-section__title"><a href="/devices/type?device_type={{ ng_kind | urlencode }}">{{ ng_kind }}</a></h2>
+    {% set rows = ng_all | filter(attribute="device_type", value=ng_kind) %}
+    {% include "gather/netgrasp/device-table.html" %}
+</section>
+{% endfor %}
+{#
+    The untyped devices are the tail of the page: the gather sorts by type
+    ascending, and Postgres puts nulls last in an ascending sort. So they are
+    the rows after the typed ones, which `slice` can say and `filter` cannot
+    (it matches a value, and null is not one).
+#}
+{% set ng_typed = ng_all | map(attribute="device_type") | length %}
+{% if ng_all | length > ng_typed %}
+<section class="ng-section" id="type-unknown">
+    <h2 class="ng-section__title">Not yet identified</h2>
+    {% set rows = ng_all | slice(start=ng_typed) %}
+    {% include "gather/netgrasp/device-table.html" %}
+</section>
+{% endif %}
+{%- endif -%}
+{% endblock %}
 
 {% block empty %}
 <span class="ng-empty__hint">

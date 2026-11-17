@@ -44,7 +44,7 @@
                     {%- if row.trovato_item_id %}</a>{% endif -%}
                 </td>
 
-                <td>
+                <td class="ng-col-type">
                     {%- if row.device_type -%}
                     <a href="/devices/type?device_type={{ row.device_type | urlencode }}">{{ row.device_type }}</a>
                     {%- if row.device_type_confidence %}
@@ -56,21 +56,21 @@
                     {%- else -%}<span class="ng-muted">Not yet identified</span>{%- endif -%}
                 </td>
 
-                <td>
+                <td class="ng-col-os">
                     {%- if row.os_family %}{{ row.os_family }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
                 </td>
 
-                <td>
+                <td class="ng-col-vendor">
                     {%- if row.vendor %}{{ row.vendor }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
                 </td>
 
-                <td class="ng-mono">
+                <td class="ng-mono ng-col-ip">
                     {%- if row.last_ip %}{{ row.last_ip }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
                 </td>
 
-                <td class="ng-mono">{{ row.mac }}</td>
+                <td class="ng-mono ng-col-mac">{{ row.mac }}</td>
 
-                <td>
+                <td class="ng-col-owner">
                     {%- if row.owner_name -%}
                     <a href="/devices/owner?owner={{ row.owner_item_id }}">{{ row.owner_name }}</a>
                     {%- elif row.owner_item_id -%}
@@ -79,7 +79,7 @@
                     {%- else -%}<span class="ng-muted">Nobody yet</span>{%- endif -%}
                 </td>
 
-                <td class="ng-mono ng-nowrap" {% if row.first_seen_at_epoch %}data-ng-epoch="{{ row.first_seen_at_epoch }}"{% endif %}>
+                <td class="ng-mono ng-nowrap ng-col-seen" {% if row.first_seen_at_epoch %}data-ng-epoch="{{ row.first_seen_at_epoch }}"{% endif %}>
                     {%- if row.first_seen_at_epoch -%}
                     {{ row.first_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}

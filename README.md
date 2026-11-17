@@ -30,7 +30,7 @@ kernel image, so it takes a few minutes. After that it is seconds. What comes up
 |---|---|
 | kernel | the published image, unmodified, at the version in `kernel-release.toml` |
 | netgrasp | the plugin, the templates and the assets, mounted read-only on the three search paths |
-| rows | `scripts/seed-demo.sql`: 13 devices, 3 people, 19 events, 6 of them security |
+| rows | `scripts/seed-demo.sql`: 24 devices (2 hidden), 3 people, 27 events, 6 of them security |
 | clock | a container POSTing `/cron/<CRON_KEY>` every 60 seconds, because the kernel runs no scheduler |
 
 Nothing is copied into Trovato and nothing is written to your clone: the
@@ -302,6 +302,8 @@ without being copied into the image.
 | `/overview` | **Home** in the menu: who is home and since when, today's arrivals and departures, devices new this week, the security event count |
 | `/devices` | **Devices** in the menu: what is on the network right now (the Online tab) |
 | `/devices/all` | every device the daemon has seen, except the hidden ones |
+| `/devices/hidden` | the devices somebody hid, which no other list shows |
+| `?search=…` | on every Devices tab: any name, the MAC, the vendor, the IP or the owner, case-insensitive; blank shows everything |
 | `/activity` | **Activity** in the menu: arrivals, departures, new devices, and the three security events worth acting on (spoofing, rogue DHCP, address conflicts) |
 | `/people/home` | the people the daemon counts as home, with the time each arrived |
 | `/people/movements` | every arrival and departure; `?day=YYYY-MM-DD` for one day |
@@ -310,7 +312,7 @@ without being copied into the image.
 | `/events/new-devices` | every `new_device` event the daemon recorded |
 | `/devices/online` | what is on the network right now; the same page as `/devices` |
 | `/devices/location` | devices grouped by where the daemon's UniFi enrichment placed them; empty, and saying why, when enrichment is off |
-| `/devices/type?device_type=…` | one device type; reached by clicking a Type cell |
+| `/devices/type` | every device, one section per type; `?device_type=…` for one type, reached by clicking a Type cell |
 | `/devices/owner?owner=…` | one person's devices; reached by clicking an Owner chip |
 | `/who-is-home` | a 301 to `/people/home` |
 | `/people` | **People** in the menu: people devices can belong to |
@@ -331,7 +333,11 @@ of the migration leaves an edited row alone.
 
 The kernel draws no second menu level, so a section's pages are tabs drawn by
 the page itself (`templates/gather/netgrasp/tabs.html`). Activity's tabs are
-Notable, Comings and goings, New devices, Security and Everything.
+Notable, Comings and goings, New devices, Security and Everything. Devices'
+are Online, All, New, To sort, Hidden, By place and By type, each with the same
+search box: a plain GET form, so it works with scripting off. Below 640 px
+every table is a stack of cards (name and row menu, then owner, state and
+time), so nothing scrolls sideways on a phone.
 
 Every old path still answers. `/devices` now opens on what is online and the
 full list is `/devices/all`; `/who-is-home` is a real 301 to `/people/home`,

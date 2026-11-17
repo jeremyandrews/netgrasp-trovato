@@ -1,0 +1,29 @@
+{#
+    The Hidden tab. /devices/hidden
+
+    Every device somebody hid, which no other list shows: routers, smart plugs,
+    anything that is always there and never interesting. The row menu offers
+    Unhide on each, the way it offers Hide everywhere else.
+#}
+{% extends "gather/netgrasp/page.html" %}
+
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
+{% block summary %}
+<div class="ng-summary">
+    <span class="ng-summary__item">
+        <span class="ng-summary__count">{{ total }}</span>
+        <span class="ng-summary__label">hidden device{{ total | pluralize }}</span>
+    </span>
+    <span class="ng-summary__scope">Left out of every other list. Unhide one from its menu.</span>
+</div>
+{% endblock %}
+
+{% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}
+
+{% block empty %}
+<span class="ng-empty__hint">
+    Hide a device to drop it from every list (routers, smart plugs). It stays
+    here, and its menu brings it back.
+</span>
+{% endblock %}

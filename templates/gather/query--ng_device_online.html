@@ -6,6 +6,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
 {% block summary %}{% include "gather/netgrasp/device-summary.html" %}{% endblock %}
 
 {% block results %}{% include "gather/netgrasp/device-table.html" %}{% endblock %}

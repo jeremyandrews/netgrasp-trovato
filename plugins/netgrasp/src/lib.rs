@@ -1895,6 +1895,369 @@ mod tests {
         assert!(!device.contains("aria-current"), "{device}");
     }
 
+    /// The device-table rows every Devices test below renders: one with
+    /// everything, one with nothing but a MAC, and one with no type.
+    fn device_rows() -> serde_json::Value {
+        let device = |id: i64, name: Option<&str>, kind: Option<&str>| {
+            serde_json::json!({
+                "id": id,
+                "mac": format!("02:00:5e:00:00:{id:02x}"),
+                "display_name": name,
+                "resolved_name": null,
+                "hostname": null,
+                "device_type": kind,
+                "state": "online",
+                "last_ip": "10.0.1.12",
+                "current_location": null,
+                "current_ap": null,
+                "owner_item_id": null,
+                "owner_name": null,
+                "hidden": false,
+                "notify": true,
+                "trovato_item_id": null,
+                "last_seen_at_epoch": 1_757_000_000
+            })
+        };
+        serde_json::json!([
+            device(1, Some("Jamie's laptop"), Some("laptop")),
+            device(2, Some("motivo"), Some("server")),
+            device(3, None, Some("server")),
+            device(4, None, None)
+        ])
+    }
+
+    fn render_devices_page(
+        template: &str,
+        query_id: &str,
+        base_path: &str,
+        rows: serde_json::Value,
+        filter_values: serde_json::Value,
+    ) -> String {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+        let mut context = tera::Context::new();
+        context.insert("total", &rows.as_array().map_or(0, Vec::len));
+        context.insert("rows", &rows);
+        context.insert("page", &1);
+        context.insert("total_pages", &1);
+        context.insert("base_path", base_path);
+        context.insert(
+            "query",
+            &serde_json::json!({"query_id": query_id, "label": "Devices"}),
+        );
+        context.insert("filter_values", &filter_values);
+        tera.render(template, &context)
+            .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+    }
+
+    /// **Every Devices tab renders, with rows and without**, draws the same
+    /// seven tabs and the search box, and marks itself, and only itself.
+    #[test]
+    fn every_devices_tab_renders_and_marks_itself_with_rows_and_without() {
+        let tabs = [
+            (
+                "gather/query--ng_device_online.html",
+                "ng_device_online",
+                "/devices",
+                "Online",
+            ),
+            (
+                "gather/query--ng_device_list.html",
+                "ng_device_list",
+                "/devices/all",
+                "All",
+            ),
+            (
+                "gather/query--ng_devices_todo.html",
+                "ng_devices_todo",
+                "/devices/todo",
+                "To sort",
+            ),
+            (
+                "gather/query--ng_devices_hidden.html",
+                "ng_devices_hidden",
+                "/devices/hidden",
+                "Hidden",
+            ),
+            (
+                "gather/query--ng_device_by_type.html",
+                "ng_device_by_type",
+                "/devices/type",
+                "By type",
+            ),
+        ];
+        for (template, query_id, path, label) in tabs {
+            for rows in [device_rows(), serde_json::json!([])] {
+                let html = render_devices_page(
+                    template,
+                    query_id,
+                    path,
+                    rows.clone(),
+                    serde_json::json!({}),
+                );
+                assert!(
+                    html.contains("<nav class=\"ng-tabs\" aria-label=\"Devices\">"),
+                    "{template}: {html}"
+                );
+                assert_eq!(
+                    html.matches("class=\"ng-tabs__item\"").count(),
+                    7,
+                    "{template}"
+                );
+                assert!(
+                    html.contains(&format!(
+                        "href=\"{path}\" aria-current=\"page\">{label}</a>"
+                    )),
+                    "{template} does not mark {label}: {html}"
+                );
+                assert_eq!(
+                    html.matches("aria-current=\"page\"").count(),
+                    1,
+                    "{template}"
+                );
+                assert!(
+                    html.contains("<form class=\"ng-search\" method=\"get\""),
+                    "{template}"
+                );
+                assert!(html.contains("name=\"search\""), "{template}");
+                if rows.as_array().is_some_and(|r| r.is_empty()) {
+                    assert!(
+                        !html.contains("<table"),
+                        "{template} drew a table of nothing"
+                    );
+                } else {
+                    assert!(html.contains("ng-menu__button"), "{template}: {html}");
+                }
+            }
+        }
+        // New and By place draw their own tables, and still carry the strip.
+        let new = render_devices_page(
+            "gather/query--ng_devices_new.html",
+            "ng_devices_new",
+            "/devices/new",
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        assert!(
+            new.contains("href=\"/devices/new\" aria-current=\"page\">New</a>"),
+            "{new}"
+        );
+        let place = render_devices_page(
+            "gather/query--ng_devices_by_location.html",
+            "ng_devices_by_location",
+            "/devices/location",
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        assert!(
+            place.contains("aria-current=\"page\">By place</a>"),
+            "{place}"
+        );
+        assert!(place.contains("UniFi enrichment"), "{place}");
+        // One person's devices are in the section and are none of its tabs.
+        let owner = render_devices_page(
+            "gather/query--ng_device_by_owner.html",
+            "ng_device_by_owner",
+            "/devices/owner",
+            serde_json::json!([]),
+            serde_json::json!({"owner": "0193a5a0-0000-7000-8000-00000000000a"}),
+        );
+        assert!(owner.contains("aria-label=\"Devices\""), "{owner}");
+        assert!(!owner.contains("aria-current"), "{owner}");
+        assert!(
+            owner.contains("name=\"owner\" value=\"0193a5a0-0000-7000-8000-00000000000a\""),
+            "a search on one person's devices would leave that person: {owner}"
+        );
+    }
+
+    /// **The search box** is a GET form back to the tab, shows what was
+    /// searched, offers a way back to everything, and keeps a type facet.
+    #[test]
+    fn the_search_box_keeps_the_search_and_the_facet_and_posts_nothing() {
+        let html = render_devices_page(
+            "gather/query--ng_device_by_type.html",
+            "ng_device_by_type",
+            "/devices/type",
+            device_rows(),
+            serde_json::json!({"search": "motivo", "device_type": "server"}),
+        );
+        assert!(html.contains("value=\"motivo\""), "{html}");
+        assert!(
+            html.contains("name=\"device_type\" value=\"server\""),
+            "{html}"
+        );
+        assert!(html.contains("class=\"ng-search__clear\""), "{html}");
+        let partial = include_str!("../../../templates/gather/netgrasp/search.html");
+        let markup = strip_tera_comments(partial);
+        assert!(markup.contains("method=\"get\""));
+        assert!(
+            !markup.contains("method=\"post\""),
+            "a gather template cannot carry a form token"
+        );
+        // No search, no Clear link.
+        let plain = render_devices_page(
+            "gather/query--ng_device_list.html",
+            "ng_device_list",
+            "/devices/all",
+            device_rows(),
+            serde_json::json!({}),
+        );
+        assert!(!plain.contains("ng-search__clear"), "{plain}");
+        assert!(plain.contains("value=\"\""), "{plain}");
+    }
+
+    /// A search that matched nothing says so, by name, instead of the tab's
+    /// own empty text; an empty tab with no search keeps its own.
+    #[test]
+    fn a_search_that_matches_nothing_says_so_and_an_empty_tab_says_why() {
+        let none = render_devices_page(
+            "gather/query--ng_devices_hidden.html",
+            "ng_devices_hidden",
+            "/devices/hidden",
+            serde_json::json!([]),
+            serde_json::json!({"search": "zzz"}),
+        );
+        assert!(
+            none.contains("No device matches &lsquo;zzz&rsquo;."),
+            "{none}"
+        );
+        assert!(!none.contains("Hide a device to drop it"), "{none}");
+
+        let hidden = render_devices_page(
+            "gather/query--ng_devices_hidden.html",
+            "ng_devices_hidden",
+            "/devices/hidden",
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        assert!(
+            hidden.contains("Hide a device to drop it from every list (routers, smart plugs)."),
+            "{hidden}"
+        );
+    }
+
+    /// **By type** with no type given is one section per type, in the order
+    /// the gather sorted them, with the devices the daemon could not type last.
+    #[test]
+    fn by_type_draws_one_section_per_type_and_the_untyped_last() {
+        let html = render_devices_page(
+            "gather/query--ng_device_by_type.html",
+            "ng_device_by_type",
+            "/devices/type",
+            device_rows(),
+            serde_json::json!({}),
+        );
+        let laptop = html.find("id=\"type-laptop\"").unwrap_or(usize::MAX);
+        let server = html.find("id=\"type-server\"").unwrap_or(usize::MAX);
+        let unknown = html.find("id=\"type-unknown\"").unwrap_or(usize::MAX);
+        assert!(
+            laptop < server && server < unknown && unknown < usize::MAX,
+            "{html}"
+        );
+        assert!(html.contains("Not yet identified"), "{html}");
+        // Two servers in the server section, one untyped device in the last.
+        let servers = &html[server..unknown];
+        assert_eq!(servers.matches("<tr data-id=").count(), 2, "{servers}");
+        assert_eq!(html[unknown..].matches("<tr data-id=").count(), 1);
+
+        // With a type given it is one table, as it always was.
+        let one = render_devices_page(
+            "gather/query--ng_device_by_type.html",
+            "ng_device_by_type",
+            "/devices/type",
+            device_rows(),
+            serde_json::json!({"device_type": "server"}),
+        );
+        assert!(!one.contains("id=\"type-"), "{one}");
+        assert_eq!(one.matches("<table").count(), 1);
+    }
+
+    /// **The search filter is on every Devices tab**, exposed, `contains`, on
+    /// the one search column, and blank until somebody types.
+    #[test]
+    fn every_devices_tab_takes_the_same_search() {
+        let migration = include_str!("../migrations/012_netgrasp_device_tabs_search.sql");
+        let (_, update) = migration
+            .split_once("-- The search filter, on every tab")
+            .unwrap_or_default();
+        for query_id in [
+            "ng_device_online",
+            "ng_device_list",
+            "ng_devices_new",
+            "ng_devices_todo",
+            "ng_devices_hidden",
+            "ng_devices_by_location",
+            "ng_device_by_type",
+        ] {
+            assert!(
+                update.contains(&format!("'{query_id}'")),
+                "{query_id} cannot be searched"
+            );
+        }
+        assert!(update.contains(
+            "{\"field\": \"search\", \"operator\": \"contains\", \"value\": null, \"exposed\": true"
+        ));
+        assert!(
+            update.contains(
+                "AND NOT (definition -> 'filters') @> '[{\"field\": \"search\"}]'::jsonb"
+            ),
+            "a second run would add a second search filter"
+        );
+        // What it searches: every name, the MAC, the vendor, the IP, the owner.
+        for column in [
+            "display_name",
+            "resolved_name",
+            "hostname",
+            "mdns_name",
+            "mac",
+            "vendor",
+            "last_ip",
+            "owner_name",
+        ] {
+            assert!(
+                migration.contains(&format!("v.{column}")),
+                "the search does not read {column}"
+            );
+        }
+        let manifest = include_str!("../netgrasp.info.toml");
+        assert_eq!(manifest.matches("search = \"search_text\"").count(), 2);
+    }
+
+    /// The phone layout: every table is a stack of cards below 640 px, the
+    /// columns a card drops are named by class, and the cells carry them.
+    #[test]
+    fn below_640_px_every_table_is_a_stack_of_cards_with_its_menu() {
+        let css = include_str!("../../../static/css/netgrasp.css");
+        let phone = css
+            .split("@media (max-width: 640px)")
+            .skip(1)
+            .collect::<String>();
+        for rule in [
+            ".ng-table thead",
+            ".ng-table tr",
+            "display: flex",
+            ".ng-table td.ng-actions",
+            ".ng-table td.ng-col-mac",
+            "min-height: 44px",
+        ] {
+            assert!(phone.contains(rule), "the phone layout lost {rule}");
+        }
+        let table = include_str!("../../../templates/gather/netgrasp/device-table.html");
+        for class in [
+            "ng-col-state",
+            "ng-col-ip",
+            "ng-col-mac",
+            "ng-col-owner",
+            "ng-col-seen",
+        ] {
+            assert!(table.contains(class), "device-table.html lost {class}");
+        }
+        let events = include_str!("../../../templates/gather/netgrasp/event-table.html");
+        assert!(events.contains("ng-col-seen") && events.contains("ng-event-type"));
+    }
+
     /// The tab strip is styled, stays one line, and has a dark-mode rule.
     #[test]
     fn the_stylesheet_keeps_the_tabs_on_one_line_in_both_schemes() {
@@ -2151,16 +2514,25 @@ mod tests {
     fn the_owner_view_carries_every_column_the_record_type_maps() {
         let manifest = include_str!("../netgrasp.info.toml");
         let view = include_str!("../migrations/006_netgrasp_owner_names.sql");
+        let listed = include_str!("../migrations/012_netgrasp_device_tabs_search.sql");
 
-        // The record type's backing relation is the view, not the daemon's table.
+        // The record type's backing relation is a view over the owner view, not
+        // the daemon's table: 012's `ng_devices_listed`, which is every column
+        // of `ng_devices_with_owner` plus the search column.
         assert!(
-            manifest.contains("table = \"ng_devices_with_owner\""),
-            "ng_device_state is no longer declared over the owner view"
+            manifest.contains("table = \"ng_devices_listed\""),
+            "ng_device_state is no longer declared over the listed view"
         );
         assert!(
-            manifest.contains("\"ng_devices_with_owner\""),
-            "the view is not in db_tables, so the kernel will refuse the record type"
+            listed.contains("v.*,") && listed.contains("FROM ng_devices_with_owner v;"),
+            "ng_devices_listed is no longer the owner view plus a column"
         );
+        for relation in ["\"ng_devices_with_owner\"", "\"ng_devices_listed\""] {
+            assert!(
+                manifest.contains(relation),
+                "{relation} is not in db_tables, so the kernel will refuse the record type"
+            );
+        }
 
         // Every physical column on the right-hand side of the ng_device_state
         // field map: the block after its [record_types.fields] header, up to the
@@ -2186,13 +2558,15 @@ mod tests {
                 continue;
             }
             assert!(
-                view.contains(&format!("d.{column},")) || column == "owner_name",
+                view.contains(&format!("d.{column},"))
+                    || column == "owner_name"
+                    || (column == "search_text" && listed.contains("AS search_text")),
                 "the view does not select {column}, which ng_device_state maps"
             );
             checked += 1;
         }
         assert!(
-            checked >= 19,
+            checked >= 20,
             "only {checked} mapped columns were checked; the field map failed to parse"
         );
     }

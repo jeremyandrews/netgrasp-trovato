@@ -82,7 +82,7 @@
                     {%- if row.trovato_item_id %}</a>{% endif -%}
                 </td>
 
-                <td>
+                <td class="ng-col-state">
                     <span class="ng-state ng-state--{{ row.state | default(value='unknown') }}">
                         {{- row.state | default(value="unknown") -}}
                     </span>
@@ -91,13 +91,13 @@
                 {# The type facet is a route, not an exposed filter (see
                    002_netgrasp_gathers.sql), so this link is how a reader gets
                    to /devices/type without typing a query string. #}
-                <td>
+                <td class="ng-col-type">
                     {%- if row.device_type -%}
                     <a href="/devices/type?device_type={{ row.device_type | urlencode }}">{{ row.device_type }}</a>
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
                 </td>
 
-                <td class="ng-mono">
+                <td class="ng-mono ng-col-ip">
                     {%- if row.last_ip %}{{ row.last_ip }}{% else %}<span class="ng-muted">&mdash;</span>{% endif -%}
                 </td>
 
@@ -109,7 +109,7 @@
                     are placed shows a dash, which here does mean "not known".
                 #}
                 {% if ng_located %}
-                <td>
+                <td class="ng-col-where">
                     {%- if row.current_location -%}
                     <a href="/devices/location#loc-{{ row.current_location | slugify }}">{{ row.current_location }}</a>
                     {%- if row.current_ap %}<span class="ng-ap">{{ row.current_ap }}</span>{% endif -%}
@@ -119,7 +119,7 @@
                 </td>
                 {% endif %}
 
-                <td class="ng-mono">{{ row.mac }}</td>
+                <td class="ng-mono ng-col-mac">{{ row.mac }}</td>
 
                 {#
                     The owner's NAME, since 006_netgrasp_owner_names.sql: the
@@ -141,7 +141,7 @@
                     final group is the random one. The full id is in the title
                     either way.
                 #}
-                <td>
+                <td class="ng-col-owner">
                     {%- if row.owner_name -%}
                     <a href="/devices/owner?owner={{ row.owner_item_id }}"
                        title="Person {{ row.owner_item_id }}">{{ row.owner_name }}</a>
@@ -160,7 +160,7 @@
                     `date` renders UTC. `data-ng-epoch` is what the script in
                     page.html rewrites into the viewer's own timezone.
                 #}
-                <td class="ng-mono ng-nowrap" {% if row.last_seen_at_epoch %}data-ng-epoch="{{ row.last_seen_at_epoch }}"{% endif %}>
+                <td class="ng-mono ng-nowrap ng-col-seen" {% if row.last_seen_at_epoch %}data-ng-epoch="{{ row.last_seen_at_epoch }}"{% endif %}>
                     {%- if row.last_seen_at_epoch -%}
                     {{ row.last_seen_at_epoch | date(format="%Y-%m-%d %H:%M") }}
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}

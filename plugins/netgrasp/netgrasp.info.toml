@@ -80,6 +80,7 @@ files = [
     "migrations/009_netgrasp_locations.sql",
     "migrations/010_netgrasp_new_devices.sql",
     "migrations/011_netgrasp_navigation.sql",
+    "migrations/012_netgrasp_device_tabs_search.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -143,6 +144,12 @@ db_tables = [
     "ng_person_movements",
     "ng_devices_new",
     "ng_overview",
+    # The two device record types' relations since 012: each is the view above
+    # it plus one `search_text` column, which is what the Devices search box
+    # filters on. Views over views rather than a column added in place, because
+    # 006 and 007 must stay re-runnable (012 explains).
+    "ng_devices_listed",
+    "ng_devices_new_listed",
 ]
 
 # Lightweight record types (P11g / D-53).
@@ -174,9 +181,12 @@ db_tables = [
 # not otherwise reach a second table (006_netgrasp_owner_names.sql argues the
 # alternatives). Read-only either way — the record tier has no write surface, and
 # the plugin's own statements name ng_devices directly.
+#
+# Since 012 it is `ng_devices_listed`: that same owner view, ng_devices_with_owner,
+# plus the lower-cased `search_text` the Devices search box filters on.
 [[record_types]]
 name = "ng_device_state"
-table = "ng_devices_with_owner"
+table = "ng_devices_listed"
 id_column = "id"
 title_column = "mac"
 created_column = "first_seen_at_epoch"
@@ -205,6 +215,10 @@ owner_name = "owner_name"
 hidden = "hidden"
 notify = "notify"
 item_id = "trovato_item_id"
+# Every name, the MAC, the vendor, the address and the owner, lower-cased into
+# one string (012). Not shown anywhere: it is what the Devices search box's
+# exposed `contains` filter compares against.
+search = "search_text"
 
 # The event log. High-volume, never edited, deleted wholesale on a retention
 # timer — the case the record tier exists for (DESIGN.md Decision 2).
@@ -363,7 +377,7 @@ device_id = "device_id"
 # A device first seen in the last seven days.
 [[record_types]]
 name = "ng_device_new"
-table = "ng_devices_new"
+table = "ng_devices_new_listed"
 id_column = "id"
 title_column = "mac"
 created_column = "first_seen_at_epoch"
@@ -386,6 +400,7 @@ item_id = "trovato_item_id"
 first_seen = "first_seen_at_epoch"
 last_seen = "last_seen_at_epoch"
 period = "period"
+search = "search_text"
 
 # The overview's single row. Its columns are counts, which is the only way a
 # gather page gets a number that is not a pager total.
