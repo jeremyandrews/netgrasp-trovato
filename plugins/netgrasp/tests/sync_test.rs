@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use trovato_kernel::content::{ContentTypeRegistry, ItemService, RecordTypeRegistry};
 use trovato_kernel::gather::{
-    CategoryService, GatherExtensionRegistry, GatherService, QueryContext,
+    CategoryService, FilterValue, GatherExtensionRegistry, GatherService, QueryContext,
 };
 use trovato_kernel::models::{CreateItem, UpdateItem};
 use trovato_kernel::plugin::{PluginConfig, PluginRuntime};
@@ -406,6 +406,8 @@ fn every_ng_table_is_inside_the_plugins_effective_db_allowlist() {
             "ng_person_movements",
             "ng_devices_new",
             "ng_overview",
+            "ng_devices_listed",
+            "ng_devices_new_listed",
         ] {
             assert!(
                 policy.check_table(table).is_ok(),
@@ -1440,6 +1442,7 @@ fn every_overview_view_carries_every_column_its_record_type_maps() {
                 "ng_person_movement",
                 "ng_device_new",
                 "ng_overview",
+                "ng_device_state",
             ]
             .contains(&record_type.name.as_str())
             {
@@ -1470,7 +1473,10 @@ fn every_overview_view_carries_every_column_its_record_type_maps() {
             }
             checked += 1;
         }
-        assert_eq!(checked, 4, "not every overview record type was checked");
+        assert_eq!(
+            checked, 5,
+            "not every overview or device record type was checked"
+        );
     });
 }
 
@@ -2217,9 +2223,9 @@ async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {
 
 /// Execute a seeded gather by id and return its row count.
 ///
-/// No exposed filters are ever passed, because the plugin seeds none — every
-/// facet is a URL argument instead (`G-EXPOSED-FILTER-NO-MATCH-ALL`,
-/// `DESIGN.md` Decision 6).
+/// No exposed filters are passed. Every facet is a URL argument
+/// (`G-EXPOSED-FILTER-NO-MATCH-ALL`, `DESIGN.md` Decision 6); the one exposed
+/// filter the plugin has, the Devices search, is exercised through `searched`.
 async fn run_gather(
     gather: &GatherService,
     _pool: &PgPool,
@@ -4507,5 +4513,199 @@ fn activity_lists_the_notable_events_and_leaves_out_the_noise() {
         assert!(html.contains("ng-tabs__tab--active"), "{html}");
         assert!(html.contains("ng-row--security"), "{html}");
         assert!(html.contains("ng-menu__button"), "{html}");
+    });
+}
+
+/// The rows a device gather returns for one search, given the way the kernel's
+/// gather route gives it: as an exposed filter value keyed by the filter's
+/// field, `search`, which is also the query-string key the search box sends.
+async fn searched(
+    gather: &GatherService,
+    query_id: &str,
+    search: &str,
+    url_args: HashMap<String, String>,
+) -> Vec<String> {
+    let context = QueryContext {
+        url_args,
+        ..QueryContext::default()
+    };
+    let exposed = if search.is_empty() {
+        HashMap::new()
+    } else {
+        HashMap::from([(
+            "search".to_string(),
+            FilterValue::String(search.to_string()),
+        )])
+    };
+    let mut macs: Vec<String> = gather
+        .execute(
+            query_id,
+            1,
+            exposed,
+            Uuid::parse_str(LIVE_STAGE).unwrap(),
+            &context,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("gather {query_id} failed: {e:#}"))
+        .items
+        .iter()
+        .map(|r| r["mac"].as_str().unwrap_or_default().to_string())
+        .collect();
+    macs.sort();
+    macs
+}
+
+/// **Search, on every Devices tab, against the real gathers**: a word finds
+/// only the devices it is in, whichever column it is in and whatever its case;
+/// a blank search finds everything the tab would show anyway; and the tab's
+/// own filters still apply under a search.
+#[test]
+fn the_device_search_finds_only_matching_rows_on_every_tab_and_blank_finds_all() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let motivo = seed_device(&pool, "aa:bb:cc:00:00:41", Some("motivo"), "online").await;
+        let printer = seed_device(&pool, "aa:bb:cc:00:00:42", Some("printer"), "online").await;
+        let hidden = seed_device(&pool, "aa:bb:cc:00:00:43", Some("motivo-backup"), "online").await;
+        let offline = seed_device(&pool, "aa:bb:cc:00:00:44", Some("garage-pi"), "offline").await;
+        sqlx::query("UPDATE ng_devices SET hidden = true WHERE id = $1")
+            .bind(hidden)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ng_devices SET vendor = 'Raspberry Pi Trading', last_ip = '10.0.1.12' WHERE id IN ($1, $2)")
+            .bind(motivo)
+            .bind(offline)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ng_devices SET display_name = 'Office Printer' WHERE id = $1")
+            .bind(printer)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let gather = wire_gather(&pool).await;
+        let none = HashMap::new;
+
+        // A hostname, any case, on the Online tab and on All.
+        for query_id in ["ng_device_online", "ng_device_list", "ng_devices_todo"] {
+            assert_eq!(
+                searched(&gather, query_id, "MOTIVO", none()).await,
+                ["aa:bb:cc:00:00:41"],
+                "{query_id}: the hidden motivo-backup must stay hidden"
+            );
+        }
+        // Blank is everything the tab shows.
+        assert_eq!(
+            searched(&gather, "ng_device_list", "", none()).await,
+            [
+                "aa:bb:cc:00:00:41",
+                "aa:bb:cc:00:00:42",
+                "aa:bb:cc:00:00:44"
+            ]
+        );
+        assert_eq!(
+            searched(&gather, "ng_device_online", "", none()).await,
+            ["aa:bb:cc:00:00:41", "aa:bb:cc:00:00:42"]
+        );
+        // A vendor, a name a person gave, part of a MAC, and an address.
+        assert_eq!(
+            searched(&gather, "ng_device_list", "raspberry", none()).await,
+            ["aa:bb:cc:00:00:41", "aa:bb:cc:00:00:44"]
+        );
+        assert_eq!(
+            searched(&gather, "ng_device_list", "office printer", none()).await,
+            ["aa:bb:cc:00:00:42"]
+        );
+        assert_eq!(
+            searched(&gather, "ng_device_list", "00:44", none()).await,
+            ["aa:bb:cc:00:00:44"]
+        );
+        assert_eq!(
+            searched(&gather, "ng_device_list", "10.0.1.12", none()).await,
+            ["aa:bb:cc:00:00:41", "aa:bb:cc:00:00:44"]
+        );
+        assert!(
+            searched(&gather, "ng_device_list", "nothing-called-this", none())
+                .await
+                .is_empty()
+        );
+        // The Hidden tab searches the hidden ones, and only them.
+        assert_eq!(
+            searched(&gather, "ng_devices_hidden", "", none()).await,
+            ["aa:bb:cc:00:00:43"]
+        );
+        assert_eq!(
+            searched(&gather, "ng_devices_hidden", "motivo", none()).await,
+            ["aa:bb:cc:00:00:43"]
+        );
+        // New, By place and By type take the same search.
+        assert_eq!(
+            searched(&gather, "ng_devices_new", "motivo", none()).await,
+            ["aa:bb:cc:00:00:41"]
+        );
+        assert_eq!(
+            searched(&gather, "ng_devices_by_location", "garage", none()).await,
+            ["aa:bb:cc:00:00:44"]
+        );
+        assert_eq!(
+            searched(
+                &gather,
+                "ng_device_by_type",
+                "printer",
+                HashMap::from([("device_type".to_string(), "phone".to_string())]),
+            )
+            .await,
+            ["aa:bb:cc:00:00:42"],
+            "a search under a type facet keeps the facet"
+        );
+    });
+}
+
+/// By type with no type is every visible device, grouped by type in the
+/// order the template draws: by type, and the untyped last.
+#[test]
+fn by_type_with_no_type_lists_every_visible_device_typed_ones_first() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let a = seed_device(&pool, "aa:bb:cc:00:00:51", Some("a"), "online").await;
+        let b = seed_device(&pool, "aa:bb:cc:00:00:52", Some("b"), "online").await;
+        let c = seed_device(&pool, "aa:bb:cc:00:00:53", Some("c"), "online").await;
+        let d = seed_device(&pool, "aa:bb:cc:00:00:54", Some("d"), "online").await;
+        for (id, kind) in [(a, Some("tv")), (b, None), (c, Some("laptop"))] {
+            sqlx::query("UPDATE ng_devices SET device_type = $1 WHERE id = $2")
+                .bind(kind)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE ng_devices SET hidden = true WHERE id = $1")
+            .bind(d)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let gather = wire_gather(&pool).await;
+        let rows = gather_items(&gather, "ng_device_by_type", HashMap::new()).await;
+        let kinds: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| r["device_type"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            kinds,
+            [Some("laptop".to_string()), Some("tv".to_string()), None],
+            "{rows:?}"
+        );
+        let html = render_page(
+            "ng_device_by_type",
+            "Devices by type",
+            "/devices/type",
+            &rows,
+        );
+        assert!(html.contains("id=\"type-laptop\""), "{html}");
+        assert!(html.contains("Not yet identified"), "{html}");
     });
 }

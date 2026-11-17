@@ -94,7 +94,18 @@
     <p class="ng-page__description">{{ query.description }}</p>
     {% endif %}
 
-    {% if rows | length == 0 %}
+    {#
+        A search that matched nothing says so, in place of the tab's own empty
+        text: "No device matches" is the answer, and "Nothing hidden" under a
+        search for a name would be a different and wrong one. `filter_values`
+        holds only the keys a request gave, hence `is defined`.
+    #}
+    {% if rows | length == 0 and filter_values.search is defined and filter_values.search %}
+    <p class="ng-empty ng-empty--search">
+        No device matches &lsquo;{{ filter_values.search }}&rsquo;.
+        <span class="ng-empty__hint"><a href="{{ base_path }}">Show them all</a>.</span>
+    </p>
+    {% elif rows | length == 0 %}
     <p class="ng-empty">
         {{ query.display.empty_text | default(value="Nothing to show yet.") }}
         {% block empty %}{% endblock %}

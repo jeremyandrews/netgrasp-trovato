@@ -17,6 +17,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
 {% block summary %}
 {% set ng_places = rows | unique(attribute="current_location") %}
 <div class="ng-summary">

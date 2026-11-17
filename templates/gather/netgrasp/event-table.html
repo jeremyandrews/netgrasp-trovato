@@ -43,7 +43,7 @@
                 {# The epoch twin, for the reason given in the device table;
                    `data-ng-seconds` asks the page script to keep the seconds,
                    which matter when reading a burst of events. #}
-                <td class="ng-mono ng-nowrap" {% if row.timestamp_epoch %}data-ng-epoch="{{ row.timestamp_epoch }}" data-ng-seconds{% endif %}>
+                <td class="ng-mono ng-nowrap ng-col-seen" {% if row.timestamp_epoch %}data-ng-epoch="{{ row.timestamp_epoch }}" data-ng-seconds{% endif %}>
                     {%- if row.timestamp_epoch -%}
                     {{ row.timestamp_epoch | date(format="%Y-%m-%d %H:%M:%S") }}
                     {%- else -%}<span class="ng-muted">&mdash;</span>{%- endif -%}
@@ -59,7 +59,7 @@
                     join a name out of here. The id links to that device's own
                     event log, which is the route that exists for it.
                 #}
-                <td>
+                <td class="ng-col-device">
                     {%- if row.device_id -%}
                     <a class="ng-id-chip" href="/events/device?device={{ row.device_id }}"
                        title="All events for device {{ row.device_id }}">#{{ row.device_id }}</a>

@@ -1,0 +1,41 @@
+{#
+    The Devices search box, on every Devices tab.
+
+    A plain GET form back to this tab, so it needs no form token (a gather
+    template has none, G-GATHER-TEMPLATE-NO-CSRF) and works with scripting off.
+    The field is `search`, the name of the exposed `contains` filter
+    012_netgrasp_device_tabs_search.sql puts on every device gather, so the
+    kernel reads it straight off the query string. It matches any name, the
+    MAC, the vendor, the address or the owner. A blank box is dropped as an
+    unanswered filter, which matches everything.
+
+    `filter_values` is the query string the kernel kept (it holds only what was
+    given, so every key is tested with `is defined` first). The two facets that
+    ride in the query string, a type and an owner, travel with the search as
+    hidden fields, so searching one person's devices stays on that person.
+
+    The action is the tab's own path (`base_path`, the gather's canonical URL),
+    so a search from /devices stays on the Online tab. Escaped like any other
+    value: an href decodes `&#x2F;` back to a slash.
+#}
+{%- if filter_values.search is defined and filter_values.search -%}
+{%- set ng_search = filter_values.search -%}
+{%- else -%}
+{%- set ng_search = "" -%}
+{%- endif -%}
+<form class="ng-search" method="get" action="{{ base_path }}" role="search">
+    <label class="ng-visually-hidden" for="ng-search-input">Search devices</label>
+    <input class="ng-search__input" id="ng-search-input" type="search" name="search"
+           value="{{ ng_search }}" placeholder="Name, MAC, vendor, IP or owner"
+           autocomplete="off" spellcheck="false">
+    {%- if filter_values.device_type is defined and filter_values.device_type %}
+    <input type="hidden" name="device_type" value="{{ filter_values.device_type }}">
+    {%- endif %}
+    {%- if filter_values.owner is defined and filter_values.owner %}
+    <input type="hidden" name="owner" value="{{ filter_values.owner }}">
+    {%- endif %}
+    <button class="ng-search__button" type="submit">Search</button>
+    {%- if ng_search %}
+    <a class="ng-search__clear" href="{{ base_path }}{% if filter_values.device_type is defined and filter_values.device_type %}?device_type={{ filter_values.device_type | urlencode }}{% elif filter_values.owner is defined and filter_values.owner %}?owner={{ filter_values.owner | urlencode }}{% endif %}">Clear</a>
+    {%- endif %}
+</form>

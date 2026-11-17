@@ -12,6 +12,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
 {% block summary %}
 <div class="ng-summary">
     <span class="ng-summary__item ng-summary__item--idle">

@@ -74,7 +74,7 @@ echo "    the menu reads Home, Devices, People, Activity"
 
 # Every page a person can reach, old paths included, renders netgrasp's chrome.
 for path in /devices /devices/online /devices/all /devices/new /devices/todo \
-    /devices/type /devices/location /people /people/home /people/movements \
+    /devices/hidden /devices/type /devices/location /people /people/home /people/movements \
     /activity /events /events/security /events/new-devices; do
     code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE$path")"
     [ "$code" = "200" ] || fail "$path answered $code"
@@ -95,5 +95,21 @@ grep -q 'data-query-id="ng_device_online"' "$PAGE" || fail "/devices is not the 
 curl -s -o "$PAGE" "$BASE/devices/all"
 grep -q 'data-query-id="ng_device_list"' "$PAGE" || fail "/devices/all is not every device"
 echo "    /devices is what is online, /devices/all is everything"
+
+# The search box: "motivo" finds the seeded Raspberry Pi and nothing else, and a
+# blank search is the whole list. Counted by row, since each device row is one
+# `<tr data-id=`.
+rows() { grep -c '<tr data-id=' "$PAGE" || true; }
+curl -s -o "$PAGE" "$BASE/devices/all?search=motivo"
+[ "$(rows)" = "1" ] || fail "searching motivo found $(rows) rows, not 1"
+grep -q '02:00:5e:00:00:10' "$PAGE" || fail "searching motivo did not find motivo"
+curl -s -o "$PAGE" "$BASE/devices/all?search="
+blank="$(rows)"
+curl -s -o "$PAGE" "$BASE/devices/all"
+[ "$blank" = "$(rows)" ] || fail "a blank search found $blank rows, not every device"
+echo "    searching motivo finds motivo alone, and a blank search finds all $blank"
+curl -s -o "$PAGE" "$BASE/devices/hidden"
+[ "$(rows)" -gt 0 ] || fail "/devices/hidden has no rows"
+echo "    /devices/hidden lists the hidden devices"
 
 echo "==> the demo's front page is the overview"

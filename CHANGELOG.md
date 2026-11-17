@@ -35,6 +35,16 @@ draws itself. `/devices` opens on what is online, the full list moved to
 `/devices/all`, and `/who-is-home` is a 301 to `/people/home`; every other path
 answers as it did.
 
+**One Devices page, with tabs and a search box.** Online (`/devices`), All,
+New, To sort, Hidden (new, `/devices/hidden`), By place and By type, which now
+draws one section per type. Every tab takes the same search over every name,
+the MAC, the vendor, the IP and the owner: an exposed `contains` filter on a
+`search_text` column, which a blank box drops, so it matches everything. The
+column lives on two new views over the old ones (`012`), because
+`CREATE OR REPLACE VIEW` cannot drop a column and 006 and 007 must stay
+re-runnable. Below 640 px every table is a stack of cards with its row menu, so
+no page scrolls sideways on a phone.
+
 **Activity** (`/activity`): arrivals, departures, new devices, and the three
 security events a person can act on, newest first, with the rest of the event
 pages as its tabs. The whole log is 95% `ip_changed` on a real network, which is

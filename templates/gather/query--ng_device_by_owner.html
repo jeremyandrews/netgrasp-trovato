@@ -8,6 +8,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "devices" %}{% include "gather/netgrasp/tabs.html" %}{% include "gather/netgrasp/search.html" %}{% endblock %}
+
 {# An unresolved `url_arg` filter is dropped rather than matched as empty, so
    this route with no `owner` returns every device rather than none. #}
 {#

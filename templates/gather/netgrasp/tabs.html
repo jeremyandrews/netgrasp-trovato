@@ -1,5 +1,6 @@
 {#
-    The tabs under a section's heading: Activity's five views of the event log.
+    The tabs under a section's heading: Devices' seven lists of devices, and
+    Activity's five views of the event log.
 
     Why tabs and not a second menu level: the kernel never draws a child menu
     entry (docs/UI.md, "Why tabs on the page, not a second menu level"), and
@@ -12,8 +13,9 @@
         {% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}
 
     The active tab is the one whose gather is this page's (`query.query_id`).
-    A page that is in the section but is none of its tabs (one device's
-    events) draws the strip with nothing marked, which is still the way back.
+    A page that is in the section but is none of its tabs (one person's
+    devices, one device's events) draws the strip with nothing marked, which is
+    still the way back.
 
     The path is printed `safe` because it is a literal written above, never
     anything a request supplied, and escaped it would read `&#x2F;activity`.
@@ -25,7 +27,18 @@
     line and scrolls sideways inside itself (netgrasp.css, `.ng-tabs`); the
     page never does.
 #}
-{%- if ng_tabs == "activity" -%}
+{%- if ng_tabs == "devices" -%}
+{%- set ng_tab_list = [
+    "ng_device_online|/devices|Online",
+    "ng_device_list|/devices/all|All",
+    "ng_devices_new|/devices/new|New",
+    "ng_devices_todo|/devices/todo|To sort",
+    "ng_devices_hidden|/devices/hidden|Hidden",
+    "ng_devices_by_location|/devices/location|By place",
+    "ng_device_by_type|/devices/type|By type"
+] -%}
+{%- set ng_tab_label = "Devices" -%}
+{%- elif ng_tabs == "activity" -%}
 {%- set ng_tab_list = [
     "ng_activity|/activity|Notable",
     "ng_person_movements|/people/movements|Comings and goings",
