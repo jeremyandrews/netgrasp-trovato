@@ -162,13 +162,14 @@ form() {
     code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE$1")"
     [ "$code" = "200" ] || fail "$1 answered $code"
     grep -q 'name="_token"' "$PAGE" || [ "${3:-}" = "no-token" ] || fail "$1 carries no form token"
-    grep -q -- "$2" "$PAGE" || fail "$1 does not contain $2"
+    grep -Eq -- "$2" "$PAGE" || fail "$1 does not contain $2"
     echo "    $1 renders"
 }
 form /people/add 'Alert me when they get home'
 form /devices/assign 'name="device"'
 form "/netgrasp/device/owner?target=02:00:5e:00:00:0c" 'name="new_person"'
-form "/netgrasp/person/merge?target=$person" 'name="into"' no-token
+# The chooser, or, once only one person is left, the sentence saying so.
+form "/netgrasp/person/merge?target=$person" 'name="into"|the only person here' no-token
 form "/netgrasp/person/delete?target=$person" 'Delete '
 code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE/item/$person")"
 [ "$code" = "200" ] || fail "the person page answered $code"
