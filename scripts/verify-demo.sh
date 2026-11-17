@@ -151,4 +151,39 @@ curl -s -b "$JAR" -o "$PAGE" "$BASE/devices/hidden"
 [ "$(rows)" -gt 0 ] || fail "/devices/hidden has no rows"
 echo "    /devices/hidden lists the hidden devices"
 
+# The People forms (U2). Read-only checks: each page renders signed in, carries
+# the kernel's token, and asks what docs/UI.md says it asks. Nothing is posted,
+# so the demo's rows are left as the seed wrote them.
+person="$(curl -s -b "$JAR" "$BASE/people" \
+    | grep -o '/netgrasp/person/merge?back=[^"]*target=[0-9a-f-]*' | head -n 1 \
+    | sed 's/.*target=//')"
+[ -n "$person" ] || fail "/people offers no Merge into... entry"
+form() {
+    code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE$1")"
+    [ "$code" = "200" ] || fail "$1 answered $code"
+    grep -q 'name="_token"' "$PAGE" || [ "${3:-}" = "no-token" ] || fail "$1 carries no form token"
+    grep -q -- "$2" "$PAGE" || fail "$1 does not contain $2"
+    echo "    $1 renders"
+}
+form /people/add 'Alert me when they get home'
+form /devices/assign 'name="device"'
+form "/netgrasp/device/owner?target=02:00:5e:00:00:0c" 'name="new_person"'
+form "/netgrasp/person/merge?target=$person" 'name="into"' no-token
+form "/netgrasp/person/delete?target=$person" 'Delete '
+code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE/item/$person")"
+[ "$code" = "200" ] || fail "the person page answered $code"
+grep -q 'ng-person-page' "$PAGE" || fail "the person page has no netgrasp section"
+echo "    the person page renders"
+# Anonymous: refused by the kernel's route gate before the plugin runs, which
+# answers 401 to a visitor with no session (a signed-in user without the
+# permission gets 403, from the kernel or from the plugin's own check).
+for path in /people/add /devices/assign "/netgrasp/person/delete?target=$person"; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE$path")"
+    case "$code" in
+        401|403) ;;
+        *) fail "$path answered $code to an anonymous visitor" ;;
+    esac
+done
+echo "    an anonymous visitor is refused the People forms ($code)"
+
 echo "==> the demo's front page is the overview"

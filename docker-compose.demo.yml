@@ -213,6 +213,39 @@ services:
         condition: service_completed_successfully
 
   # ---------------------------------------------------------------------------
+  # The demo's administrator may change Netgrasp.
+  # ---------------------------------------------------------------------------
+  # Every netgrasp form checks `administer netgrasp` literally, through the
+  # host, which has no `administer site` bypass (G-USER-API-NO-ADMIN-BYPASS).
+  # The installer makes the admin a site administrator and nothing more, so
+  # without this every Rename, Assign owner, Add person, merge and delete on the
+  # demo answered 403 to the one account the demo has. 003 created the
+  # network_admin role that holds the permission; this gives it to the admin.
+  # Idempotent, so a second `up` changes nothing.
+  admin-role:
+    image: pgvector/pgvector:pg17
+    environment:
+      PGPASSWORD: trovato
+    command:
+      - psql
+      - -h
+      - postgres
+      - -U
+      - trovato
+      - -d
+      - netgrasp
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - >-
+        INSERT INTO user_roles (user_id, role_id)
+        SELECT u.id, r.id FROM users u JOIN roles r ON r.name = 'network_admin'
+        WHERE u.name = 'admin' ON CONFLICT DO NOTHING
+    depends_on:
+      installer:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
   # The clock.
   # ---------------------------------------------------------------------------
   # The kernel runs no internal scheduler: tap_cron fires only when something

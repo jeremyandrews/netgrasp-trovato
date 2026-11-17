@@ -39,6 +39,8 @@ mod db;
 mod device_view;
 mod forms;
 mod item_host;
+mod people_forms;
+mod person_view;
 mod sync_host;
 
 /// Permission to manage devices, people and plugin configuration.
@@ -541,6 +543,9 @@ pub fn tap_assistant_tool(call: AssistantToolCall) -> AssistantToolResult {
 /// device with no linked row renders an explanation.
 #[plugin_tap]
 pub fn tap_item_view(input: serde_json::Value) -> String {
+    if item_type_of(&input) == PERSON_TYPE {
+        return person_page(&input);
+    }
     if item_type_of(&input) != DEVICE_TYPE {
         return String::new();
     }
@@ -578,6 +583,64 @@ pub fn tap_item_view(input: serde_json::Value) -> String {
         .and_then(|id| sync_host::load_owner_name(&id).ok().flatten());
 
     device_view::render(state.as_ref(), &history, owner_name.as_deref(), now)
+}
+
+/// Render the person page fragment (U2): where they are, their devices, their
+/// comings and goings, their alerts, and the forms that change them.
+///
+/// Best-effort like the device page: each read that fails is logged and the
+/// page renders without it. Device data, so it is shown only to a viewer who
+/// may see device data — the same gate `tap_field_access` applies to the
+/// listings (013).
+fn person_page(input: &serde_json::Value) -> String {
+    let Some(item_id) = input.get("id").and_then(serde_json::Value::as_str) else {
+        return String::new();
+    };
+    if !host::current_user_has_permission(PERM_VIEW_DEVICES) {
+        return String::new();
+    }
+    let now = db::now().unwrap_or_default();
+    let log = |what: &str, e: &str| {
+        host::log(
+            "warning",
+            "netgrasp",
+            &format!("tap_item_view: {what} for person {item_id}: {e}"),
+        );
+    };
+    let person = match assist_host::load_person(item_id) {
+        Ok(person) => person,
+        Err(e) => {
+            log("mirror row", &e);
+            // No mirror row: the page still says who it is and how to fix it.
+            netgrasp_core::assist::PersonFacts {
+                item_id: item_id.to_string(),
+                name: input
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                ..Default::default()
+            }
+        }
+    };
+    let presence: person_view::Presence = db::query_rows(
+        netgrasp_core::queries::SELECT_PERSON_PRESENCE,
+        &[serde_json::json!(item_id)],
+    )
+    .map_err(|e| log("presence", &e.to_string()))
+    .ok()
+    .and_then(|rows| rows.into_iter().next())
+    .unwrap_or_default();
+    let devices = assist_host::load_devices_of(item_id).unwrap_or_else(|e| {
+        log("devices", &e);
+        Vec::new()
+    });
+    let movements = assist_host::person_movements(item_id, person_view::MOVEMENT_ROWS)
+        .unwrap_or_else(|e| {
+            log("movements", &e);
+            Vec::new()
+        });
+    person_view::render(&person, &presence, &devices, &movements, now)
 }
 
 /// An empty history, for the degraded paths.
@@ -1197,7 +1260,28 @@ mod tests {
             .map(|m| m.path)
             .collect();
 
+        // Two of the forms are pages of their own rather than row actions: Add
+        // person, linked from the People list, and the bulk form, linked from
+        // the To sort tab. Each must still be linked from somewhere a reader
+        // can click.
+        let pages = [
+            (
+                "/people/add",
+                include_str!("../../../templates/gather/query--ng_person_list.html"),
+            ),
+            (
+                "/devices/assign",
+                include_str!("../../../templates/gather/query--ng_devices_todo.html"),
+            ),
+        ];
         for path in &served {
+            if let Some((_, page)) = pages.iter().find(|(p, _)| p == path) {
+                assert!(
+                    page.contains(&format!("href=\"{path}\"")),
+                    "{path} is served and its page does not link to it"
+                );
+                continue;
+            }
             assert!(
                 partial.contains(&format!("href=\"{path}?")),
                 "{path} is served and nothing in the menu links to it"
@@ -1652,7 +1736,7 @@ mod tests {
             "2 ARP spoofing warnings today",
             "1 rogue DHCP server seen today",
             "7 more devices have no owner.",
-            "href=\"/devices/todo\">Sort them</a>",
+            "href=\"/devices/assign\">Sort them</a>",
             "7</strong> devices online",
             "/people/movements?day=2025-09-04",
         ] {
@@ -2837,10 +2921,22 @@ mod tests {
 
     #[test]
     fn the_view_tap_renders_nothing_for_a_type_that_is_not_a_device() {
-        for other in ["ng_person", "blog_post", ""] {
+        for other in ["blog_post", ""] {
             let input = serde_json::json!({"type": other, "id": PERSON_ID});
             assert_eq!(__inner_tap_item_view(input), "");
         }
+    }
+
+    /// A person has a page too since U2, with the forms that change them.
+    #[test]
+    fn the_view_tap_renders_the_person_page_for_a_person() {
+        let input = serde_json::json!({"type": "ng_person", "id": PERSON_ID, "title": "Jamie"});
+        let html = __inner_tap_item_view(input);
+        assert!(html.contains("ng-person-page"), "{html}");
+        assert!(
+            html.contains(&format!("/netgrasp/person/merge?target={PERSON_ID}")),
+            "{html}"
+        );
     }
 
     #[test]

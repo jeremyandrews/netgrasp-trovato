@@ -13,13 +13,16 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "people" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
 {% block summary %}
 <div class="ng-summary">
     <span class="ng-summary__item">
         <span class="ng-summary__count">{{ total }}</span>
         <span class="ng-summary__label">{{ total | pluralize(singular="person", plural="people") }}</span>
     </span>
-    <span class="ng-summary__scope"><a href="/people/home">Home now</a></span>
+    <span class="ng-summary__scope"><a class="button" href="/people/add">Add person</a>
+        &middot; <a href="/devices/assign">Sort devices</a></span>
 </div>
 {% endblock %}
 
@@ -101,7 +104,7 @@
 
 {% block empty %}
 <span class="ng-empty__hint">
-    A person is an Item, created like any other content. Add one, then set it as
-    a device's owner to see them on <a href="/people/home">Home now</a>.
+    No people yet. A person is home when any device they own is online.
+    <a href="/people/add">Add person</a>.
 </span>
 {% endblock %}

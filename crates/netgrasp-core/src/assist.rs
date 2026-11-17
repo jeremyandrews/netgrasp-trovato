@@ -185,7 +185,7 @@ pub fn resolve_person(
         PersonRef::Name(name) => {
             let matches: Vec<&PersonCandidate> = candidates
                 .iter()
-                .filter(|c| c.name.trim().eq_ignore_ascii_case(name.trim()))
+                .filter(|c| same_name(&c.name, name))
                 .collect();
             match matches.len() {
                 1 => Ok(matches[0].clone()),
@@ -204,6 +204,47 @@ pub fn resolve_person(
             }
         }
     }
+}
+
+/// A person's name as it is compared: surrounding space dropped, and case
+/// folded.
+///
+/// One definition for every place that asks "is this somebody who already
+/// exists": the owner form's new-person field, Add person, the bulk form, and
+/// the assistant's `create_person`. Folding is Unicode lower-casing rather than
+/// ASCII, so "ÉLODIE" and "élodie" are one person, as they are to a reader.
+/// Inner spaces are left alone: "Mary Ann" and "Maryann" are two names.
+#[must_use]
+pub fn name_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// Whether two names name the same person, by [`name_key`].
+#[must_use]
+pub fn same_name(a: &str, b: &str) -> bool {
+    name_key(a) == name_key(b)
+}
+
+/// The owner a possessive mDNS name announces: "Jeremy's Mac Studio" gives
+/// "Jeremy".
+///
+/// Apple devices advertise their owner this way, and a good share of a
+/// household's devices do it (22 of 166 on the live site, `docs/UI.md`). It is
+/// a **suggestion** only, for the bulk form to offer: one of the live names is
+/// "Me", so the plugin never assigns from it without a person choosing.
+///
+/// Accepts the straight and the typographic apostrophe, because macOS writes
+/// the second. Returns `None` for a name with no possessive, for a possessive
+/// with nothing before it, and for an owner longer than a name plausibly is.
+#[must_use]
+pub fn possessive_owner(mdns_name: &str) -> Option<String> {
+    let name = mdns_name.trim();
+    let at = name.find("'s ").or_else(|| name.find("\u{2019}s "))?;
+    let owner = name[..at].trim();
+    if owner.is_empty() || owner.chars().count() > 40 {
+        return None;
+    }
+    Some(owner.to_string())
 }
 
 // =============================================================================
@@ -3137,5 +3178,36 @@ mod tests {
             render_new_devices(&[], now),
             "No device was first seen in the last seven days.\n"
         );
+    }
+
+    /// "jamie " is Jamie: the rule the owner form, Add person, the bulk form
+    /// and the assistant all ask through.
+    #[test]
+    fn a_name_differing_only_in_case_or_surrounding_space_is_the_same_person() {
+        assert!(same_name("Jamie", "jamie "));
+        assert!(same_name("  JAMIE", "Jamie"));
+        assert!(same_name("Élodie", "élodie"));
+        assert!(!same_name("Jamie", "Jaime"));
+        assert!(!same_name("Mary Ann", "Maryann"));
+        assert_eq!(name_key("  Jamie\t"), "jamie");
+    }
+
+    #[test]
+    fn a_possessive_mdns_name_suggests_its_owner_and_nothing_else_does() {
+        assert_eq!(
+            possessive_owner("Jeremy's Mac Studio").as_deref(),
+            Some("Jeremy")
+        );
+        assert_eq!(
+            possessive_owner("JAMIE\u{2019}s iPhone").as_deref(),
+            Some("JAMIE")
+        );
+        assert_eq!(
+            possessive_owner("Me's MacBook Pro (4)").as_deref(),
+            Some("Me")
+        );
+        assert_eq!(possessive_owner("HP-LaserJet"), None);
+        assert_eq!(possessive_owner("'s iPad"), None);
+        assert_eq!(possessive_owner("Jeremys Mac"), None);
     }
 }

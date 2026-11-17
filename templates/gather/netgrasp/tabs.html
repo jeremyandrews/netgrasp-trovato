@@ -1,6 +1,7 @@
 {#
-    The tabs under a section's heading: Devices' seven lists of devices, and
-    Activity's five views of the event log.
+    The tabs under a section's heading: Devices' seven lists of devices,
+    People's three, and Activity's five views of the event log. Comings and
+    goings is a tab of both People and Activity; its own page draws Activity's.
 
     Why tabs and not a second menu level: the kernel never draws a child menu
     entry (docs/UI.md, "Why tabs on the page, not a second menu level"), and
@@ -47,6 +48,13 @@
     "ng_event_log|/events|Everything"
 ] -%}
 {%- set ng_tab_label = "Activity" -%}
+{%- elif ng_tabs == "people" -%}
+{%- set ng_tab_list = [
+    "ng_person_list|/people|Everyone",
+    "ng_people_home|/people/home|Home now",
+    "ng_person_movements|/people/movements|Comings and goings"
+] -%}
+{%- set ng_tab_label = "People" -%}
 {%- else -%}
 {%- set ng_tab_list = [] -%}
 {%- set ng_tab_label = "" -%}

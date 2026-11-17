@@ -310,6 +310,359 @@ pub(crate) fn apply_person_save(payload: &Value) -> Result<Value, String> {
     Ok(saved)
 }
 
+// ===========================================================================
+// People: create, move devices, merge, remove
+// ===========================================================================
+//
+// Every person write a form or a tool makes goes through one of these, so the
+// owner form's "new person", Add person, the bulk form and the assistant's
+// `create_person` cannot disagree about what "already exists" means, and a
+// merge from the People page and a delete from a conversation remove a person
+// the same way.
+//
+// # What "one transaction" can mean here
+//
+// A person is two stores: the kernel's `item` table, reached only through the
+// `item-api` host, and the daemon-facing rows, reached through the `db` host.
+// The `db` host runs each call in a transaction of its own and offers no way to
+// hold one open across calls, and `item-api` is a separate host altogether. So
+// no write that touches both can be one database transaction.
+//
+// What each one does instead:
+//
+// - every change that is only rows, and must happen together, is **one
+//   statement** (`MERGE_PERSON_RECORD`), which Postgres commits or rolls back
+//   whole;
+// - every step that can be undone is done first, and the one that cannot —
+//   deleting an Item — is done last;
+// - when a step fails, the steps already done are **undone, newest first**,
+//   through the same write functions that did them, and the caller is told
+//   nothing changed.
+//
+// The one thing an undo does not take back is a device Item the first step
+// minted: a device with no Item gets one on its first edit, the cron sync would
+// have minted the same one, and it changes no column anybody reads.
+
+/// The longest name a person may have, matching the Item title it lands in.
+pub(crate) const MAX_PERSON_NAME: usize = 255;
+
+/// The person a name names, if anyone: [`assist::same_name`] against everyone
+/// who exists.
+pub(crate) fn find_person_named(name: &str) -> Result<Option<PersonFacts>, String> {
+    Ok(load_people()?
+        .into_iter()
+        .find(|p| assist::same_name(&p.name, name)))
+}
+
+/// What [`find_or_create_person`] did.
+pub(crate) enum PersonFound {
+    /// Somebody already had that name, ignoring case and surrounding space.
+    Existing(PersonFacts),
+    /// Nobody did, so they were created.
+    Created(PersonFacts),
+}
+
+/// The person called `name`, created if nobody is.
+///
+/// "jamie " is Jamie: a name differing from an existing person's only in case
+/// or surrounding space is that person, and nobody new is created. A new person
+/// gets the trimmed name, no notes, departure alerts off, and arrival alerts as
+/// asked — off, unless the form's "Alert me when they get home" was ticked.
+pub(crate) fn find_or_create_person(name: &str, arrive: bool) -> Result<PersonFound, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("A person needs a name.".to_string());
+    }
+    if name.chars().count() > MAX_PERSON_NAME {
+        return Err(format!(
+            "That name is longer than {MAX_PERSON_NAME} characters."
+        ));
+    }
+    if let Some(existing) = find_person_named(name)? {
+        return Ok(PersonFound::Existing(existing));
+    }
+
+    let payload = json!({
+        "type": PERSON_TYPE,
+        "title": name,
+        "status": 1,
+        "fields": {
+            "field_notes": "",
+            "field_notify_arrive": arrive,
+            "field_notify_depart": false,
+        }
+    });
+    let saved = apply_person_save(&payload)?;
+    let item_id = saved
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the new person came back with no id".to_string())?;
+    Ok(PersonFound::Created(load_person(item_id)?))
+}
+
+/// Give each device a new owner (or none), all of them or none of them.
+///
+/// One [`apply_device_edit`] per device, the write the row form and the
+/// assistant make, naming `owner_item_id` and nothing else. If one fails, every
+/// device already moved — and the one that failed, whose Item may have been
+/// saved before its row refused — is put back to the owner it had, and the
+/// error names the device that failed.
+pub(crate) fn move_devices(devices: &[DeviceFacts], to: Option<&str>) -> Result<(), String> {
+    let edit = DeviceEdit {
+        owner_item_id: Some(to.map(str::to_string)),
+        ..DeviceEdit::default()
+    };
+    for (done, facts) in devices.iter().enumerate() {
+        if let Err(e) = apply_device_edit(facts, &edit) {
+            restore_owners(&devices[..=done]);
+            return Err(format!("could not move {}: {e}", facts.phrase()));
+        }
+    }
+    Ok(())
+}
+
+/// Put each device back to the owner it had, newest first.
+///
+/// Re-read before each write, because the forward write may have minted the
+/// device's Item, and an edit addressed through stale facts would mint a
+/// second. A device whose restore fails is logged by MAC and the rest carry on:
+/// stopping would leave every later device moved as well.
+fn restore_owners(devices: &[DeviceFacts]) -> Vec<String> {
+    let mut stuck = Vec::new();
+    for original in devices.iter().rev() {
+        let edit = DeviceEdit {
+            owner_item_id: Some(original.owner_item_id.clone()),
+            ..DeviceEdit::default()
+        };
+        let restored = load_device(&DeviceRef::Id(original.id))
+            .and_then(|current| apply_device_edit(&current, &edit));
+        if let Err(e) = restored {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not put {} back to its owner: {e}", original.mac),
+            );
+            stuck.push(original.mac.clone());
+        }
+    }
+    stuck
+}
+
+/// Every device a person owns, all of them, or a refusal.
+fn every_owned_device(person: &PersonFacts) -> Result<Vec<DeviceFacts>, String> {
+    let devices = load_owned_devices(&person.item_id)?;
+    if (devices.len() as i64) < owned_device_count(&person.item_id)? {
+        return Err(format!(
+            "{} owns more than {LIST_LIMIT} devices, which is more than one change \
+             here can move. Move some of them first.",
+            person.name
+        ));
+    }
+    Ok(devices)
+}
+
+/// The alert settings a merge leaves on the person kept.
+///
+/// The kept person's settings win. With `keep_merged` ticked, an alert the
+/// merged person had is kept as well, so a merge never quietly turns an alert
+/// off (`docs/UI.md`, People model). The form ticks it whenever the merged
+/// person had an alert the kept one does not.
+#[must_use]
+pub(crate) fn merged_alerts(
+    kept: &PersonFacts,
+    merged: &PersonFacts,
+    keep_merged: bool,
+) -> (bool, bool) {
+    if keep_merged {
+        (
+            kept.notify_arrive || merged.notify_arrive,
+            kept.notify_depart || merged.notify_depart,
+        )
+    } else {
+        (kept.notify_arrive, kept.notify_depart)
+    }
+}
+
+/// Merge one person into another: every device of `from` becomes `into`'s,
+/// `from`'s past comings and goings are attributed to `into`, and `from` is
+/// removed. Returns the devices that moved.
+///
+/// In order, each step undone if a later one fails:
+///
+/// 1. `into`'s alerts, if the merge changes them ([`merged_alerts`]).
+/// 2. `from`'s devices, through [`move_devices`].
+/// 3. One statement: the merge recorded in `ng_person_merge`, earlier merges
+///    into `from` re-pointed at `into`, and `from`'s mirror row dropped.
+/// 4. `from`'s Item deleted. Last, because it is the one step with no undo.
+///
+/// The daemon's events are not touched: `ng_events` is the daemon's, and
+/// `ng_person_movements` reads the merge record instead.
+pub(crate) fn merge_people(
+    from: &PersonFacts,
+    into: &PersonFacts,
+    keep_merged_alerts: bool,
+) -> Result<Vec<DeviceFacts>, String> {
+    if from.item_id == into.item_id {
+        return Err("A person cannot be merged into themselves.".to_string());
+    }
+    let from_item = load_person_item(&from.item_id)?;
+    let into_item = load_person_item(&into.item_id)?;
+    let devices = every_owned_device(from)?;
+
+    // 1. The kept person's alerts.
+    let alerts = merged_alerts(into, from, keep_merged_alerts);
+    let alerts_change = alerts != (into.notify_arrive, into.notify_depart);
+    if alerts_change {
+        apply_person_save(&person_payload(
+            &into.item_id,
+            &into_item,
+            None,
+            None,
+            Some(alerts),
+        ))?;
+    }
+    let undo_alerts = || {
+        if alerts_change
+            && let Err(e) =
+                apply_person_save(&person_payload(&into.item_id, &into_item, None, None, None))
+        {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not put {}'s alerts back: {e}", into.name),
+            );
+        }
+    };
+
+    // 2. The devices.
+    if let Err(e) = move_devices(&devices, Some(&into.item_id)) {
+        undo_alerts();
+        return Err(e);
+    }
+
+    // 3. The record, in one statement.
+    #[derive(serde::Deserialize)]
+    struct Recorded {
+        repointed: String,
+    }
+    let recorded: Result<Vec<Recorded>, String> = query_rows(
+        queries::MERGE_PERSON_RECORD,
+        &[json!(from.item_id), json!(into.item_id), json!(from.name)],
+    )
+    .map_err(|e| format!("could not record the merge: {e}"));
+    let repointed = match recorded {
+        Ok(rows) => rows
+            .into_iter()
+            .next()
+            .map_or_else(|| "[]".to_string(), |r| r.repointed),
+        Err(e) => {
+            restore_owners(&devices);
+            undo_alerts();
+            return Err(e);
+        }
+    };
+
+    // 4. The merged person's Item.
+    if let Err(code) = item_host::delete_item(&from.item_id) {
+        if let Err(e) = crate::db::exec(
+            queries::UNDO_PERSON_MERGE,
+            &[json!(from.item_id), json!(into.item_id), json!(repointed)],
+        ) {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not take back the merge record: {e}"),
+            );
+        }
+        if let Err(e) = sync_host::mirror_person(&from_item) {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not restore {}'s mirror row: {e}", from.name),
+            );
+        }
+        restore_owners(&devices);
+        undo_alerts();
+        return Err(format!(
+            "could not delete {} (host error {code})",
+            from.name
+        ));
+    }
+
+    Ok(devices)
+}
+
+/// Remove a person: their devices become nobody's, their mirror row goes, and
+/// their Item is deleted. Returns the devices that were unassigned.
+///
+/// The devices are unassigned, never deleted: they are still on the network.
+/// Their past comings and goings keep the name in `details`, as 007 has always
+/// done for a deleted person.
+///
+/// In order, each step undone if a later one fails: the devices
+/// ([`move_devices`]), then `retire_person` (the mirror row), then the Item —
+/// last, because it is the one step with no undo. `delete-item` fires no
+/// `tap_item_delete`, which is why the retire is called here.
+pub(crate) fn remove_person(person: &PersonFacts) -> Result<Vec<DeviceFacts>, String> {
+    let item = load_person_item(&person.item_id)?;
+    let devices = every_owned_device(person)?;
+
+    move_devices(&devices, None)?;
+
+    if let Err(e) = sync_host::retire_person(&person.item_id) {
+        restore_owners(&devices);
+        return Err(format!("could not retire {}: {e}", person.name));
+    }
+
+    if let Err(code) = item_host::delete_item(&person.item_id) {
+        if let Err(e) = sync_host::mirror_person(&item) {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not restore {}'s mirror row: {e}", person.name),
+            );
+        }
+        restore_owners(&devices);
+        return Err(format!(
+            "could not delete {} (host error {code})",
+            person.name
+        ));
+    }
+
+    Ok(devices)
+}
+
+/// Devices nobody has named or given an owner, for the bulk form.
+pub(crate) fn load_devices_to_sort() -> Result<Vec<DeviceFacts>, String> {
+    query_rows(queries::SELECT_DEVICES_TO_SORT, &[json!(LIST_LIMIT)])
+        .map_err(|e| format!("could not read the devices: {e}"))
+}
+
+/// How many comings and goings are one person's, merged ones included.
+pub(crate) fn person_movement_count(item_id: &str) -> Result<i64, String> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        movements: i64,
+    }
+    let rows: Vec<CountRow> = query_rows(queries::SELECT_PERSON_MOVEMENT_COUNT, &[json!(item_id)])
+        .map_err(|e| format!("could not count the comings and goings: {e}"))?;
+    Ok(rows.first().map_or(0, |r| r.movements))
+}
+
+/// One person's last comings and goings, newest first.
+pub(crate) fn person_movements(item_id: &str, limit: i64) -> Result<Vec<MovementFacts>, String> {
+    query_rows(
+        queries::SELECT_PERSON_MOVEMENTS,
+        &[json!(item_id), json!(limit)],
+    )
+    .map_err(|e| format!("could not read the comings and goings: {e}"))
+}
+
+/// Devices belonging to one person, for the forms.
+pub(crate) fn load_devices_of(item_id: &str) -> Result<Vec<DeviceFacts>, String> {
+    load_owned_devices(item_id)
+}
+
 /// A field of an Item as a string.
 fn field_str(item: &Value, name: &str) -> Option<String> {
     netgrasp_core::writeback::field_str(item, name)
@@ -1478,11 +1831,7 @@ fn create_person(arguments: &Value, describing: bool) -> Result<AssistantToolRes
         // Refused at describe as well as at execute, because a card saying
         // "Create person 'Jamie'" when Jamie already exists is a card somebody
         // applies without thinking.
-        let people = load_people()?;
-        if let Some(existing) = people
-            .iter()
-            .find(|p| p.name.trim().eq_ignore_ascii_case(name.trim()))
-        {
+        if let Some(existing) = find_person_named(&name)? {
             return Err(format!(
                 "'{}' already exists ({}). Use them instead of creating a second one.",
                 existing.name, existing.item_id
@@ -1494,22 +1843,18 @@ fn create_person(arguments: &Value, describing: bool) -> Result<AssistantToolRes
         ));
     }
 
-    let payload = json!({
-        "type": PERSON_TYPE,
-        "title": name,
-        "status": 1,
-        "fields": {
-            "field_notes": "",
-            "field_notify_arrive": false,
-            "field_notify_depart": false,
+    // The same function the owner form and Add person create through. It finds
+    // rather than creates when the name is taken, which at Execute is refused
+    // just as at Describe: time passes between the two.
+    let item_id = match find_or_create_person(&name, false)? {
+        PersonFound::Created(person) => person.item_id,
+        PersonFound::Existing(existing) => {
+            return Err(format!(
+                "'{}' already exists ({}). Use them instead of creating a second one.",
+                existing.name, existing.item_id
+            ));
         }
-    });
-    let saved = apply_person_save(&payload)?;
-    let item_id = saved
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    };
 
     Ok(AssistantToolResult::ok(
         format!("{description}. Their uuid is {item_id}."),
@@ -1548,12 +1893,9 @@ fn delete_person(item_id: &str, describing: bool) -> Result<AssistantToolResult,
         ));
     }
 
-    // retire_person, then delete_item: `delete-item` calls `Item::delete`
-    // directly and fires no `tap_item_delete`, so the mirror row and the owner
-    // columns would otherwise be left behind.
-    sync_host::retire_person(item_id).map_err(|e| format!("could not retire the person: {e}"))?;
-    item_host::delete_item(item_id)
-        .map_err(|code| format!("could not delete the person (host error {code})"))?;
+    // The same removal the People page's Delete makes. With no devices left it
+    // is the retire and the Item delete, undone if the delete fails.
+    remove_person(&person)?;
 
     Ok(AssistantToolResult::ok(
         format!("Deleted {}.", person.name),

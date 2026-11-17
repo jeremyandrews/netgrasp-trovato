@@ -181,6 +181,28 @@ jobs:
               || { echo "::error::$t did not pass"; exit 1; }
           done
 
+      # The People forms (U2): creating on the spot, the case-insensitive
+      # duplicate rule, merge and delete, the permission, and the two halves of
+      # "a write that fails part way leaves nothing behind". Named for the same
+      # reason as the form suite above.
+      - name: The People suite proved create, merge, delete, the rollbacks and the permission
+        run: |
+          for t in \
+            a_new_person_named_on_the_owner_form_is_created_and_owns_the_device \
+            a_name_differing_only_in_case_or_space_is_the_existing_person \
+            the_bulk_form_assigns_every_ticked_device_to_one_new_person \
+            a_bulk_assign_that_fails_part_way_changes_nothing_and_creates_nobody \
+            merge_moves_the_devices_keeps_the_history_and_removes_the_merged_person \
+            a_merge_that_fails_moving_a_device_changes_nothing \
+            a_merge_whose_item_delete_fails_is_undone_completely \
+            delete_lists_then_unassigns_the_devices_and_removes_the_person \
+            a_delete_that_fails_changes_nothing \
+            the_people_forms_refuse_a_caller_without_the_permission_and_anonymous
+          do
+            grep -q "$t ... ok" test.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
       # The listing templates are rendered rather than grepped by this one, and
       # it is the only thing anywhere that would notice a Tera error before a
       # reader did — a template that raises falls back to the kernel's dump of
@@ -272,6 +294,16 @@ jobs:
           code=$(docker inspect -f '{{.State.ExitCode}}' \
             "$(docker compose -f docker-compose.demo.yml ps -aq installer)")
           echo "installer exited $code"
+          test "$code" = "0"
+
+      # The admin's network_admin role is granted by a one-shot after the
+      # installer; the People checks in verify-demo sign in and need it.
+      - name: Wait for the admin's role
+        run: |
+          docker compose -f docker-compose.demo.yml wait admin-role || true
+          code=$(docker inspect -f '{{.State.ExitCode}}' \
+            "$(docker compose -f docker-compose.demo.yml ps -aq admin-role)")
+          echo "admin-role exited $code"
           test "$code" = "0"
 
       - name: verify-demo

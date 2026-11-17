@@ -380,6 +380,99 @@ pub const SELECT_NEW_DEVICES: &str = "SELECT id, mac, display_name, resolved_nam
      FROM ng_devices_new WHERE NOT hidden \
      ORDER BY first_seen_at_epoch DESC LIMIT $1::bigint";
 
+// ---------------------------------------------------------------------------
+// People: the person page, the bulk form, merge (U2)
+// ---------------------------------------------------------------------------
+
+/// The devices the bulk form offers: nobody named them and nobody owns them,
+/// hidden ones left out, online ones first. `$1` is the row limit.
+///
+/// The same definition as the To sort tab (`ng_devices_todo`, 010): no
+/// `display_name`, no owner, not hidden. Online first because the device a
+/// person is holding is the one they can identify.
+pub const SELECT_DEVICES_TO_SORT: &str = device_read!(
+    "WHERE d.display_name IS NULL AND d.owner_item_id IS NULL AND d.hidden = FALSE \
+     ORDER BY (d.state = 'online') DESC, d.last_seen_at DESC NULLS LAST LIMIT $1::bigint"
+);
+
+/// One person's presence, for their page. `$1` is their Item id.
+///
+/// Read from the overview's view rather than from `ng_people`, because the view
+/// carries the epoch twins of the two arrival times the mirror stores only as
+/// `timestamptz`, which the `db` host decodes as null.
+pub const SELECT_PERSON_PRESENCE: &str = "SELECT state, current_location, \
+     last_arrived_at_epoch AS arrived, last_departed_at_epoch AS departed, devices_online \
+     FROM ng_people_presence WHERE item_id = $1::uuid";
+
+/// One person's comings and goings, newest first. `$1` is their Item id, `$2`
+/// the row limit.
+///
+/// Through `ng_person_movements`, which since 014 attributes a merged person's
+/// old rows to the person they were merged into, so the page of the person who
+/// was kept shows both histories.
+pub const SELECT_PERSON_MOVEMENTS: &str = "SELECT event_type, timestamp_epoch AS ts, day, \
+     person_item_id, person_name, location, via, device_mac, \
+     device_display_name, device_resolved_name, device_hostname \
+     FROM ng_person_movements WHERE $1::uuid::text = person_item_id \
+     ORDER BY timestamp_epoch DESC LIMIT $2::bigint";
+
+/// How many comings and goings are one person's. `$1` is their Item id.
+///
+/// For the merge page, which says how much history moves with the merge.
+pub const SELECT_PERSON_MOVEMENT_COUNT: &str = "SELECT count(*) AS movements \
+     FROM ng_person_movements WHERE $1::uuid::text = person_item_id";
+
+/// Record a merge, in one statement. `$1` is the person merged away, `$2` the
+/// person kept, `$3` the merged person's name.
+///
+/// Three changes that must happen together or not at all, which is why they are
+/// one statement: the `db` host runs each call in a transaction of its own, so
+/// this is the only way three writes share one. Every data-modifying `WITH`
+/// clause of a statement commits or rolls back with it.
+///
+/// - Earlier merges into the person going away are re-pointed at the person
+///   kept, so the record stays one hop deep and the movements view needs one
+///   join, however many merges came before.
+/// - The merge itself is recorded, with the name the person had: the daemon's
+///   events carry the old id, and this row is what attributes them.
+/// - The merged person's mirror row is dropped, so the daemon stops counting
+///   them on its next reconcile.
+///
+/// It returns the people whose earlier merges were re-pointed, as JSON text, so
+/// a merge that fails later can put them back ([`UNDO_PERSON_MERGE`]).
+///
+/// `ng_events` is not in it. The daemon owns that table and its `details`
+/// (`docs/UI.md`, People model), so a past arrival keeps the id and name it was
+/// recorded with, and the view does the attributing.
+pub const MERGE_PERSON_RECORD: &str = "WITH repointed AS (\
+       UPDATE ng_person_merge SET into_item_id = $2::uuid \
+       WHERE into_item_id = $1::uuid RETURNING from_item_id), \
+     recorded AS (\
+       INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name, merged_at) \
+       VALUES ($1::uuid, $2::uuid, $3::text, now()) \
+       ON CONFLICT (from_item_id) DO UPDATE SET into_item_id = EXCLUDED.into_item_id, \
+         from_name = EXCLUDED.from_name, merged_at = EXCLUDED.merged_at \
+       RETURNING from_item_id), \
+     retired AS (DELETE FROM ng_people WHERE item_id = $1::uuid RETURNING item_id) \
+     SELECT COALESCE((SELECT json_agg(from_item_id::text) FROM repointed), '[]'::json)::text \
+       AS repointed, \
+       (SELECT count(*) FROM recorded) AS recorded, \
+       (SELECT count(*) FROM retired) AS retired";
+
+/// Take a merge record back, in one statement. `$1` is the person who was
+/// merged away, `$2` the person kept, `$3` the JSON list
+/// [`MERGE_PERSON_RECORD`] returned.
+///
+/// Only for a merge whose last step failed: the earlier merges it re-pointed go
+/// back to the person they named, and its own row goes. The mirror row it
+/// dropped is written again by the person mirror, from the Item that still
+/// exists, because that is the one statement that writes a mirror row.
+pub const UNDO_PERSON_MERGE: &str = "WITH restored AS (\
+       UPDATE ng_person_merge SET into_item_id = $1::uuid \
+       WHERE from_item_id::text IN (SELECT jsonb_array_elements_text($3::text::jsonb)) \
+       RETURNING from_item_id) \
+     DELETE FROM ng_person_merge WHERE from_item_id = $1::uuid AND into_item_id = $2::uuid";
+
 /// Every statement above, for the tests that check them as a set.
 pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DIRTY_DEVICES", SELECT_DIRTY_DEVICES),
@@ -418,6 +511,13 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_MOVEMENTS_ON_DAY", SELECT_MOVEMENTS_ON_DAY),
     ("SELECT_PEOPLE_HOME", SELECT_PEOPLE_HOME),
     ("SELECT_NEW_DEVICES", SELECT_NEW_DEVICES),
+    // People (U2).
+    ("SELECT_DEVICES_TO_SORT", SELECT_DEVICES_TO_SORT),
+    ("SELECT_PERSON_PRESENCE", SELECT_PERSON_PRESENCE),
+    ("SELECT_PERSON_MOVEMENTS", SELECT_PERSON_MOVEMENTS),
+    ("SELECT_PERSON_MOVEMENT_COUNT", SELECT_PERSON_MOVEMENT_COUNT),
+    ("MERGE_PERSON_RECORD", MERGE_PERSON_RECORD),
+    ("UNDO_PERSON_MERGE", UNDO_PERSON_MERGE),
 ];
 
 #[cfg(test)]
@@ -608,6 +708,7 @@ mod tests {
             ("SELECT_DEVICES_BY_STATE", SELECT_DEVICES_BY_STATE),
             ("SELECT_DEVICES_HIDDEN", SELECT_DEVICES_HIDDEN),
             ("SELECT_DEVICES_BY_NAME", SELECT_DEVICES_BY_NAME),
+            ("SELECT_DEVICES_TO_SORT", SELECT_DEVICES_TO_SORT),
         ];
         let projection_of = |sql: &str| -> String {
             sql.split(" FROM ng_devices d")
