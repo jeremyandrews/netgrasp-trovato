@@ -2,7 +2,11 @@
 //!
 //! Four things a person does to a device and two they do to a person, each one
 //! a page with a single field on it, served by `tap_api` and posted back with no
-//! JavaScript anywhere in the path.
+//! JavaScript anywhere in the path. The owner form has a second field, "or a
+//! new person named", and a search box over its select that a small script
+//! shows; with scripting off the box stays hidden and the form posts the same
+//! fields. The People pages' own forms (Add person, the bulk form, merge and
+//! delete) are in `people_forms.rs` and share this shell.
 //!
 //! # Why these are pages and not fields in the menu
 //!
@@ -63,7 +67,7 @@ use netgrasp_core::assist::{self, DeviceFacts, PersonFacts};
 use netgrasp_core::model::DeviceEdit;
 use trovato_sdk::types::{ApiRequest, ApiResponse, MenuRoute};
 
-use crate::{PERM_ADMINISTER, assist_host};
+use crate::{PERM_ADMINISTER, assist_host, people_forms};
 
 /// Where each form lives. One path per action, two methods each.
 const DEVICE_RENAME: &str = "/netgrasp/device/rename";
@@ -73,21 +77,25 @@ const DEVICE_NOTIFY: &str = "/netgrasp/device/notify";
 const PERSON_RENAME: &str = "/netgrasp/person/rename";
 const PERSON_NOTIFY: &str = "/netgrasp/person/notify";
 
+/// The script that makes the owner select searchable. Progressive: every form
+/// it touches posts the same fields with scripting off, and the filter box it
+/// shows is `hidden` until it runs.
+pub(crate) const FORMS_SCRIPT: &str =
+    "\n<script src=\"/static/js/netgrasp-forms.js\" defer></script>";
+
 /// The listing a form returns to when it was reached without one, or with one
 /// that is not a local path.
 const DEFAULT_BACK: &str = "/devices";
 
 /// Longest name accepted, matching the Item title column the value lands in.
-const MAX_NAME: usize = 255;
+const MAX_NAME: usize = assist_host::MAX_PERSON_NAME;
 
 /// How many people the owner form will draw as a select.
 ///
-/// Above this the page says so and sends the reader to the assistant instead,
-/// which can be told "give this to Jamie" and resolve the name — a select of
-/// two hundred people is not a control anybody can use, and a long page of
-/// radio buttons is not better. The menu entry itself cannot make this call:
-/// it is drawn by a gather template, which has no people list in its context to
-/// count (`G-GATHER-TEMPLATE-NO-CSRF`, same context, second consequence).
+/// Above this the select is left out and the page says so: the name field
+/// takes anybody, existing or new, and the assistant can be told "give this to
+/// Jamie" too. A select of two hundred people is not a control anybody can use,
+/// even with a filter box, and a long page of radio buttons is not better.
 const OWNER_SELECT_LIMIT: usize = 25;
 
 /// The routes, for `tap_menu` to return alongside the navigation.
@@ -105,6 +113,10 @@ pub fn routes() -> Vec<MenuRoute> {
         (DEVICE_NOTIFY, "device_notify"),
         (PERSON_RENAME, "person_rename"),
         (PERSON_NOTIFY, "person_notify"),
+        (people_forms::PERSON_ADD, "person_add"),
+        (people_forms::DEVICES_ASSIGN, "devices_assign"),
+        (people_forms::PERSON_MERGE, "person_merge"),
+        (people_forms::PERSON_DELETE, "person_delete"),
     ] {
         routes
             .push(MenuRoute::api("GET", path, format!("{stem}_form")).permission(PERM_ADMINISTER));
@@ -139,6 +151,14 @@ pub fn serve(request: &ApiRequest) -> ApiResponse {
         "person_rename_save" => person_rename_save(request),
         "person_notify_form" => person_notify_form(request),
         "person_notify_save" => person_notify_save(request),
+        "person_add_form" => people_forms::person_add_form(request),
+        "person_add_save" => people_forms::person_add_save(request),
+        "devices_assign_form" => people_forms::devices_assign_form(request),
+        "devices_assign_save" => people_forms::devices_assign_save(request),
+        "person_merge_form" => people_forms::person_merge_form(request),
+        "person_merge_save" => people_forms::person_merge_save(request),
+        "person_delete_form" => people_forms::person_delete_form(request),
+        "person_delete_save" => people_forms::person_delete_save(request),
         other => refuse(404, &format!("no such form: {other}")),
     }
 }
@@ -299,47 +319,30 @@ fn device_owner_form(request: &ApiRequest) -> ApiResponse {
         Err(message) => return problem(&back, &message),
     };
     let people = match assist_host::load_people() {
-        Ok(people) => people,
+        Ok(people) => sorted_people(people),
         Err(message) => return problem(&back, &message),
     };
 
-    // Too many to choose from. The assistant can be told a name; a select of
-    // hundreds cannot be read.
-    if people.len() > OWNER_SELECT_LIMIT {
-        let body = format!(
-            "<p>{subject}</p>\
-             <p>There are {count} people on this network, which is more than this \
-             page can usefully list. Ask the assistant to assign it instead — it \
-             takes a name.</p>\
-             <p><a class=\"button\" href=\"{assistant}\">Ask the assistant</a> \
-             <a href=\"{back}\">Back</a></p>",
-            subject = device_subject(&facts),
+    let field = owner_fields(&people, facts.owner_item_id.as_deref(), "value");
+
+    // Too many to draw as a select. The name field still takes anybody — an
+    // existing person's name is that person — and the assistant can be told a
+    // name too. The menu entry itself cannot make this call: it is drawn by a
+    // gather template, which has no people list in its context to count
+    // (`G-GATHER-TEMPLATE-NO-CSRF`, same context, second consequence).
+    let field = if people.len() > OWNER_SELECT_LIMIT {
+        format!(
+            "<p>There are {count} people on this network, which is more than this page \
+             lists. Type the owner's name below, or \
+             <a href=\"{assistant}\">ask the assistant</a>, which takes a name too.</p>{field}",
             count = people.len(),
             assistant = escape_html(&assistant_href(&facts)),
-            back = escape_html(&back),
-        );
-        return themed("Assign owner", &body);
-    }
+        )
+    } else {
+        field
+    };
 
-    let mut options = String::from(r#"<option value="">nobody</option>"#);
-    for person in &people {
-        let selected = facts
-            .owner_item_id
-            .as_deref()
-            .is_some_and(|id| id == person.item_id);
-        options.push_str(&format!(
-            r#"<option value="{id}"{sel}>{name}</option>"#,
-            id = escape_html(&person.item_id),
-            sel = if selected { " selected" } else { "" },
-            name = escape_html(&person.name),
-        ));
-    }
-
-    let field = format!(
-        r#"<p><label for="ng-value">Owner</label>
-<select id="ng-value" name="value">{options}</select></p>"#
-    );
-    form_page(
+    let mut page = form_page(
         request,
         DEVICE_OWNER,
         &target,
@@ -348,7 +351,133 @@ fn device_owner_form(request: &ApiRequest) -> ApiResponse {
         &device_subject(&facts),
         &field,
         "Assign",
-    )
+    );
+    page.body.push_str(FORMS_SCRIPT);
+    page
+}
+
+/// The owner fields: a select of everybody (sorted, filterable when scripting
+/// is on), then "or a new person named".
+///
+/// Shared by the device owner form and the bulk form, so the two ask the same
+/// question the same way. `select_name` is the select's form name; the new
+/// person's name always posts as `new_person`. Past [`OWNER_SELECT_LIMIT`]
+/// people the select is left out and the name field does the work alone.
+pub(crate) fn owner_fields(
+    people: &[PersonFacts],
+    current: Option<&str>,
+    select_name: &str,
+) -> String {
+    let mut out = String::new();
+    if people.len() <= OWNER_SELECT_LIMIT {
+        let mut options = String::from(r#"<option value="">nobody</option>"#);
+        for person in people {
+            let selected = current.is_some_and(|id| id == person.item_id);
+            options.push_str(&format!(
+                r#"<option value="{id}"{sel}>{name}</option>"#,
+                id = escape_html(&person.item_id),
+                sel = if selected { " selected" } else { "" },
+                name = escape_html(&person.name),
+            ));
+        }
+        // The filter box is `hidden` until netgrasp-forms.js finds it, so with
+        // scripting off there is no box that does nothing.
+        out.push_str(&format!(
+            r#"<p><label for="ng-value">Owner</label>
+<input type="search" class="ng-form__filter" data-ng-filter="ng-value" placeholder="Search people" aria-label="Search people" hidden>
+<select id="ng-value" name="{select}">{options}</select></p>
+"#,
+            select = escape_html(select_name),
+        ));
+    }
+    let mut names = String::new();
+    for person in people {
+        names.push_str(&format!(
+            r#"<option value="{name}">"#,
+            name = escape_html(&person.name)
+        ));
+    }
+    let label = if people.len() <= OWNER_SELECT_LIMIT {
+        "or a new person named"
+    } else {
+        "Owner's name"
+    };
+    out.push_str(&format!(
+        r#"<p><label for="ng-new-person">{label}</label>
+<input type="text" id="ng-new-person" name="new_person" maxlength="{MAX_NAME}" autocomplete="off" list="ng-people-names">
+<datalist id="ng-people-names">{names}</datalist></p>
+<p class="ng-form__hint">A name somebody already has, in any case, is that person: nobody new is created.</p>"#
+    ));
+    out
+}
+
+/// Everybody, in the order a person scans a list: by name, ignoring case.
+pub(crate) fn sorted_people(mut people: Vec<PersonFacts>) -> Vec<PersonFacts> {
+    people.sort_by_key(|p| assist::name_key(&p.name));
+    people
+}
+
+/// Who the owner fields named: `Ok(None)` for nobody, or the person, with
+/// whether they were created by this request.
+///
+/// The new-person field wins over the select when it is filled in. A name
+/// somebody already has is that person ([`assist_host::find_or_create_person`]).
+/// A select value is resolved against the people who exist rather than trusted:
+/// it came off a form, `owner_item_id` is a uuid column, and an id that matches
+/// nobody would either fail the write with a cast error or store a dangling
+/// reference.
+pub(crate) fn chosen_owner(
+    body: &str,
+    select_name: &str,
+) -> Result<Option<(PersonFacts, bool)>, String> {
+    let new_name = field(body, "new_person");
+    if !new_name.trim().is_empty() {
+        return match assist_host::find_or_create_person(&new_name, false)? {
+            assist_host::PersonFound::Created(p) => Ok(Some((p, true))),
+            assist_host::PersonFound::Existing(p) => Ok(Some((p, false))),
+        };
+    }
+    let chosen = field(body, select_name);
+    let chosen = chosen.trim();
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    let people = assist_host::load_people()?;
+    people
+        .into_iter()
+        .find(|p| p.item_id == chosen)
+        .map(|p| Some((p, false)))
+        .ok_or_else(|| "That person no longer exists.".to_string())
+}
+
+/// Take back a person this request created, because the write they were
+/// created for failed. Logged rather than reported if even that fails: the
+/// caller is already reporting the failure that matters.
+pub(crate) fn forget_created(person: &PersonFacts) {
+    if let Err(e) = assist_host::remove_person(person) {
+        trovato_sdk::host::log(
+            "error",
+            "netgrasp",
+            &format!("could not take back the new person {}: {e}", person.name),
+        );
+    }
+}
+
+/// The sentence naming who a device went to, saying so when the name typed
+/// was somebody who already existed or somebody new.
+pub(crate) fn owner_words(owner: Option<&(PersonFacts, bool)>, typed: &str) -> String {
+    match owner {
+        None => "<strong>nobody</strong>".to_string(),
+        Some((person, true)) => format!(
+            "<strong>{}</strong>, who is new here",
+            escape_html(&person.name)
+        ),
+        Some((person, false)) if !typed.trim().is_empty() => format!(
+            "the existing <strong>{}</strong>",
+            escape_html(&person.name)
+        ),
+        Some((person, false)) => format!("<strong>{}</strong>", escape_html(&person.name)),
+    }
 }
 
 fn device_owner_save(request: &ApiRequest) -> ApiResponse {
@@ -357,45 +486,36 @@ fn device_owner_save(request: &ApiRequest) -> ApiResponse {
         Ok(facts) => facts,
         Err(message) => return problem(&back, &message),
     };
-    let chosen = field(&request.body, "value");
-    let chosen = chosen.trim();
 
-    // An empty value is "nobody", which is a real instruction and not a missing
-    // one — `Some(None)` unassigns, the outer `None` would leave the column
-    // alone. The two are different statements and this is where they part.
-    let (owner, named) = if chosen.is_empty() {
-        (None, "nobody".to_string())
-    } else {
-        let people = match assist_host::load_people() {
-            Ok(people) => people,
-            Err(message) => return problem(&back, &message),
-        };
-        // Resolved against the people who exist rather than trusted: the value
-        // came off a form, `owner_item_id` is a uuid column, and an id that
-        // matches nobody would either fail the write with a cast error or store
-        // a dangling reference the device tables would have to render as a chip.
-        match people.iter().find(|p| p.item_id == chosen) {
-            Some(person) => (Some(person.item_id.clone()), person.name.clone()),
-            None => {
-                return problem(&back, "That person no longer exists. Nothing was changed.");
-            }
-        }
+    // An empty select and an empty name is "nobody", which is a real
+    // instruction and not a missing one — `Some(None)` unassigns, the outer
+    // `None` would leave the column alone.
+    let owner = match chosen_owner(&request.body, "value") {
+        Ok(owner) => owner,
+        Err(message) => return problem(&back, &format!("{message} Nothing was changed.")),
     };
 
     let edit = DeviceEdit {
-        owner_item_id: Some(owner),
+        owner_item_id: Some(owner.as_ref().map(|(p, _)| p.item_id.clone())),
         ..DeviceEdit::default()
     };
     match assist_host::apply_device_edit(&facts, &edit) {
         Ok(_) => done(
             &back,
             &format!(
-                "{subject} now belongs to <strong>{named}</strong>.",
+                "{subject} now belongs to {named}.",
                 subject = escape_html(&facts.phrase()),
-                named = escape_html(&named),
+                named = owner_words(owner.as_ref(), &field(&request.body, "new_person")),
             ),
         ),
-        Err(message) => problem(&back, &message),
+        Err(message) => {
+            // The person was created for this device. Without it, they are a
+            // half-done change: take them back.
+            if let Some((person, true)) = &owner {
+                forget_created(person);
+            }
+            problem(&back, &message)
+        }
     }
 }
 
@@ -560,7 +680,7 @@ fn person_notify_save(request: &ApiRequest) -> ApiResponse {
     }
 }
 
-fn alerts_sentence(arrive: bool, depart: bool) -> String {
+pub(crate) fn alerts_sentence(arrive: bool, depart: bool) -> String {
     match (arrive, depart) {
         (true, true) => "They will be announced when they arrive and when they leave.".into(),
         (true, false) => "They will be announced when they arrive.".into(),
@@ -579,18 +699,18 @@ fn alerts_sentence(arrive: bool, depart: bool) -> String {
 /// assistant's tools parse theirs with — which is what lets an event row, whose
 /// only handle on a device is `device_id`, reach the same forms a device row
 /// does.
-fn resolve_device(target: &str) -> Result<DeviceFacts, String> {
+pub(crate) fn resolve_device(target: &str) -> Result<DeviceFacts, String> {
     let reference = assist::parse_device_ref(target)?;
     assist_host::load_device(&reference)
 }
 
 /// The device named the way the assistant's proposal cards name one: the label
 /// somebody reads plus the MAC that identifies it.
-fn device_subject(facts: &DeviceFacts) -> String {
+pub(crate) fn device_subject(facts: &DeviceFacts) -> String {
     escape_html(&facts.descriptive())
 }
 
-fn person_subject(person: &PersonFacts) -> String {
+pub(crate) fn person_subject(person: &PersonFacts) -> String {
     escape_html(&person.name)
 }
 
@@ -604,7 +724,7 @@ fn assistant_href(facts: &DeviceFacts) -> String {
 }
 
 /// The `target` and `back` of a `GET`, out of the query string.
-fn target_and_back(request: &ApiRequest) -> (String, String) {
+pub(crate) fn target_and_back(request: &ApiRequest) -> (String, String) {
     (
         request.query.get("target").cloned().unwrap_or_default(),
         safe_back(request.query.get("back").map(String::as_str)),
@@ -617,7 +737,7 @@ fn target_and_back(request: &ApiRequest) -> (String, String) {
 /// because the form's `action` is the bare path: a value that has been through
 /// a text field and back is the one the browser sends, and there is then one
 /// place a handler reads them from.
-fn posted_target_and_back(request: &ApiRequest) -> (String, String) {
+pub(crate) fn posted_target_and_back(request: &ApiRequest) -> (String, String) {
     let body = &request.body;
     (
         field(body, "target"),
@@ -633,7 +753,7 @@ fn posted_target_and_back(request: &ApiRequest) -> (String, String) {
 /// second, which rules out `//evil.example` (a protocol-relative URL a browser
 /// reads as another origin) — and anything else falls back to the device list
 /// rather than being repaired.
-fn safe_back(raw: Option<&str>) -> String {
+pub(crate) fn safe_back(raw: Option<&str>) -> String {
     let candidate = raw.unwrap_or("").trim();
     let plausible = candidate.starts_with('/')
         && !candidate.starts_with("//")
@@ -658,11 +778,11 @@ fn safe_back(raw: Option<&str>) -> String {
 /// Without it these pages arrive with the site's chrome and none of netgrasp's
 /// own styles, because `netgrasp.css` is loaded by the gather chrome and a
 /// plugin-served page is not a gather.
-fn themed(title: &str, body: &str) -> ApiResponse {
+pub(crate) fn themed(title: &str, body: &str) -> ApiResponse {
     ApiResponse::themed(title, with_stylesheet(body))
 }
 
-fn themed_with_status(status: u16, title: &str, body: &str) -> ApiResponse {
+pub(crate) fn themed_with_status(status: u16, title: &str, body: &str) -> ApiResponse {
     ApiResponse::themed_with_status(status, title, with_stylesheet(body))
 }
 
@@ -681,7 +801,7 @@ fn with_stylesheet(body: &str) -> String {
 /// submitted twice is refused the second time, which is the behaviour every
 /// kernel form has.
 #[allow(clippy::too_many_arguments)] // One page; each argument is a distinct part of it.
-fn form_page(
+pub(crate) fn form_page(
     request: &ApiRequest,
     action: &str,
     target: &str,
@@ -716,7 +836,7 @@ fn form_page(
 /// not expressible; two seconds is long enough to read one sentence and short
 /// enough not to feel stuck, and the link beside it works whether or not the
 /// browser honours the meta. `FRICTION.md`, `G-API-RESPONSE-NO-HEADERS`.
-fn done(back: &str, message: &str) -> ApiResponse {
+pub(crate) fn done(back: &str, message: &str) -> ApiResponse {
     let body = format!(
         r#"<meta http-equiv="refresh" content="2; url={back}">
 <p class="ng-form__done">{message}</p>
@@ -731,7 +851,7 @@ fn done(back: &str, message: &str) -> ApiResponse {
 /// 422 rather than 200: the request was understood and not acted on. No meta
 /// refresh — a page that reports a failure and then leaves on its own is a page
 /// nobody gets to read.
-fn problem(back: &str, message: &str) -> ApiResponse {
+pub(crate) fn problem(back: &str, message: &str) -> ApiResponse {
     let body = format!(
         r#"<p class="ng-form__problem">{message}</p>
 <p><a href="{back}">Back to the list</a></p>"#,
@@ -751,7 +871,7 @@ fn refuse(status: u16, message: &str) -> ApiResponse {
 /// Hand-rolled because the SDK ships no form decoding, the same way it ships no
 /// HTML escaping (`G-SDK-NO-ESCAPE`). This is the third copy of this function in
 /// the tree, after `trovato_contact` and `argus`.
-fn field(body: &str, name: &str) -> String {
+pub(crate) fn field(body: &str, name: &str) -> String {
     body.split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(key, _)| *key == name)
@@ -785,7 +905,7 @@ fn percent_decode(raw: &str) -> String {
 /// view tap has — so the plugin does. Both quote forms are covered because these
 /// values land in attributes as well as in text, and a device's name is a string
 /// the daemon read off the network.
-fn escape_html(raw: &str) -> String {
+pub(crate) fn escape_html(raw: &str) -> String {
     raw.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -801,7 +921,7 @@ mod tests {
     #[test]
     fn every_route_is_gated_on_the_administer_permission() {
         let routes = routes();
-        assert_eq!(routes.len(), 12, "six forms, two methods each");
+        assert_eq!(routes.len(), 20, "ten forms, two methods each");
         for route in &routes {
             assert_eq!(
                 route.permission, PERM_ADMINISTER,
@@ -835,6 +955,10 @@ mod tests {
             DEVICE_NOTIFY,
             PERSON_RENAME,
             PERSON_NOTIFY,
+            people_forms::PERSON_ADD,
+            people_forms::DEVICES_ASSIGN,
+            people_forms::PERSON_MERGE,
+            people_forms::PERSON_DELETE,
         ] {
             let mine: Vec<_> = routes.iter().filter(|r| r.path == path).collect();
             assert_eq!(mine.len(), 2, "{path} is not served twice");

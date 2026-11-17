@@ -38,8 +38,8 @@
 <section class="ng-section ng-section--start" aria-labelledby="ng-section-start">
     <h2 class="ng-section__title" id="ng-section-start">Home now</h2>
     <p class="ng-empty">Netgrasp doesn't know whose devices are whose yet.
-        <span class="ng-empty__hint"><a href="/item/add/ng_person">Add the people in your home</a>
-        or <a href="/devices/todo">sort the devices</a>.</span>
+        <span class="ng-empty__hint"><a href="/people/add">Add the people in your home</a>
+        or <a href="/devices/assign">assign devices in bulk</a>.</span>
     </p>
 </section>
 {% else %}
@@ -127,7 +127,7 @@
     {% if ng_more > 0 %}
     <p class="ng-more">
         {{ ng_more }} {% if ng_shown > 0 %}more {% endif %}device{{ ng_more | pluralize }} {{ ng_more | pluralize(singular="has", plural="have") }} no owner.
-        <a href="/devices/todo">Sort them</a>
+        <a href="/devices/assign">Sort them</a>
     </p>
     {% endif %}
     {% if ng_alerts == 0 and ng_attention | length == 0 and ng_more <= 0 %}

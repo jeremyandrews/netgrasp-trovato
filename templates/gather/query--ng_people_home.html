@@ -10,6 +10,8 @@
 #}
 {% extends "gather/netgrasp/page.html" %}
 
+{% block tabs %}{% set ng_tabs = "people" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
+
 {% block results %}
 {% set ng_people = rows %}
 {% include "gather/netgrasp/people-home.html" %}

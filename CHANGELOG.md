@@ -23,6 +23,50 @@ Compatibility section has the table.
 
 ### Added
 
+**Give a device an owner who does not exist yet.** The owner form lists
+everybody by name, with a search box when scripting is on, and under it "or a
+new person named". A name nobody has creates that person and assigns the
+device in one POST; a name that differs from an existing person's only in case
+or surrounding spaces is that person ("jamie " is Jamie), and the page says
+"the existing Jamie". The same rule, `assist::same_name`, now decides it for the
+assistant's `create_person` too, which also refuses a duplicate at Execute and
+not only at Describe. Before this, the form's only choice on a fresh install
+was "nobody".
+
+**Add person, and sort several devices at once.** `/people/add` (a name, and
+"Alert me when they get home"), linked from People and from Home's empty state.
+`/devices/assign` lists every device with no name and no owner, online first,
+one checkbox each, with one owner field; above the list, one line per owner a
+possessive mDNS name announces ("2 devices are named 'Jeremy's ...': select
+them"), which ticks those rows and changes nothing until Assign is pressed.
+
+**Merge two people who are the same, and delete one.** "Merge into..." and
+"Delete..." on every person, each a confirmation page that lists what will
+change before anything does. A merge moves every device of the merged person to
+the kept one on both tiers, keeps the kept person's alert settings (and the
+merged person's alerts too when the pre-ticked box is left ticked, so a merge
+never silently turns an alert off), and removes the merged person. Their past
+comings and goings are attributed to the kept person through a plugin-owned
+`ng_person_merge` table that `ng_person_movements` now joins
+(`014_netgrasp_people.sql`); the daemon's `ng_events` rows are not rewritten. A
+delete unassigns the person's devices, never deletes them.
+
+**A person page.** `/item/<uuid>` for a person now says whether they are home
+and since when, lists their devices and their last 20 comings and goings, says
+their alerts in words, and links Rename, Alerts, Merge into..., Delete... and Add
+a device. People and Home now have tabs: Everyone, Home now, Comings and goings.
+
+### Fixed
+
+**A person write that fails part way leaves nothing behind.** Creating,
+assigning in bulk, merging and deleting each touch two stores the plugin cannot
+hold in one transaction (the kernel's `item` table through `item-api`, and the
+daemon-facing rows through `db`, which commits each call on its own). So the
+rows that must change together are one statement, the Item delete that cannot
+be undone is always last, and a failure undoes the steps before it through the
+same write functions. Tested by making the database refuse a step part way
+through each one.
+
 **Four entries in the site menu instead of fifteen.** Home, Devices, People and
 Activity, written as `menu_link` rows by `011_netgrasp_navigation.sql`. The
 kernel draws `menu_link` rows in place of every plugin's `tap_menu` entries

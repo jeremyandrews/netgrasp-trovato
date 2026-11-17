@@ -86,6 +86,7 @@ files = [
     "migrations/011_netgrasp_navigation.sql",
     "migrations/012_netgrasp_device_tabs_search.sql",
     "migrations/013_netgrasp_home.sql",
+    "migrations/014_netgrasp_people.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -159,6 +160,10 @@ db_tables = [
     # overview did not (who is away, how many are unsorted, the three
     # actionable security events over the last day).
     "ng_home",
+    # Who was merged into whom (014). The plugin's own table: the movements
+    # view joins it so a merged person's past arrivals belong to the person
+    # kept, without rewriting the daemon's events.
+    "ng_person_merge",
 ]
 
 # Lightweight record types (P11g / D-53).

@@ -211,12 +211,17 @@ async fn fresh_pool() -> PgPool {
 
 async fn reset(pool: &PgPool) {
     for stmt in [
+        // The people tests inject failures with triggers. Disarmed first, so a
+        // test that panicked cannot make this reset, or the next test, fail.
+        "DROP TRIGGER IF EXISTS u2_fail_device ON ng_devices",
+        "DROP TRIGGER IF EXISTS u2_fail_item ON item",
         "DELETE FROM item WHERE type IN ('ng_device', 'ng_person')",
         // One statement, because the timeline and event tables carry foreign
         // keys onto ng_devices now: truncating it alone is refused.
         "TRUNCATE ng_devices, ng_presence, ng_location_history, ng_ip_history, ng_events CASCADE",
         "TRUNCATE ng_people",
         "TRUNCATE ng_state",
+        "TRUNCATE ng_person_merge",
     ] {
         sqlx::query(stmt).execute(pool).await.unwrap();
     }
@@ -4866,4 +4871,1148 @@ fn an_anonymous_viewer_gets_rows_with_nothing_in_them_and_a_sign_in() {
         .unwrap();
         assert_eq!(anonymous, 0);
     });
+}
+
+// ===========================================================================
+// People (U2): assign with create, Add person, bulk, merge, delete
+// ===========================================================================
+//
+// Every form below writes through `assist_host`, the assistant's own path, so
+// what these prove is the forms' half: the right people are found or created,
+// the right devices move on both tiers, and a write that fails part way leaves
+// nothing changed. Failures are injected with triggers, because the plugin's
+// writes are real kernel and database calls and there is no seam to fake one.
+
+const FORM_PERSON_ADD: &str = "/people/add";
+const FORM_ASSIGN: &str = "/devices/assign";
+const FORM_MERGE: &str = "/netgrasp/person/merge";
+const FORM_DELETE: &str = "/netgrasp/person/delete";
+
+/// An Item field as text, whichever of the two shapes the kernel stored it in,
+/// and `None` for absent or blank.
+fn field_text(value: &serde_json::Value) -> Option<String> {
+    let raw = value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.get("value")?.as_str().map(str::to_string))?;
+    if raw.is_empty() { None } else { Some(raw) }
+}
+
+/// A device's owner on both tiers: the daemon row and its Item.
+async fn owner_on_both_tiers(pool: &PgPool, device: i64) -> (Option<Uuid>, Option<String>) {
+    let (owner, item_id, _, _) = device_state(pool, device).await;
+    let field = match item_id {
+        Some(item_id) => field_text(&item_title_and_field(pool, item_id, "field_owner").await.1),
+        None => None,
+    };
+    (owner, field)
+}
+
+/// How many people are called this, by the case-insensitive rule, as Items and
+/// as mirror rows.
+async fn people_named(pool: &PgPool, name: &str) -> (i64, i64) {
+    let items: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item WHERE type = 'ng_person' AND lower(trim(title)) = lower(trim($1))",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let mirrors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ng_people WHERE lower(trim(name)) = lower(trim($1))",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (items, mirrors)
+}
+
+/// The one person called this, as the mirror row has them.
+async fn person_id_named(pool: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT item_id FROM ng_people WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn person_exists(pool: &PgPool, id: Uuid) -> (bool, bool) {
+    let item: i64 = sqlx::query_scalar("SELECT count(*) FROM item WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let mirror: i64 = sqlx::query_scalar("SELECT count(*) FROM ng_people WHERE item_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (item == 1, mirror == 1)
+}
+
+/// Set a person's two alert flags on the Item and the mirror, as the notify
+/// form would have.
+async fn set_alerts(pool: &PgPool, id: Uuid, arrive: bool, depart: bool) {
+    sqlx::query(
+        "UPDATE item SET fields = fields || jsonb_build_object(\
+             'field_notify_arrive', $2::boolean, 'field_notify_depart', $3::boolean) \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(arrive)
+    .bind(depart)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ng_people SET notify_arrive = $2, notify_depart = $3 WHERE item_id = $1")
+        .bind(id)
+        .bind(arrive)
+        .bind(depart)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn alerts_of(pool: &PgPool, id: Uuid) -> (bool, bool) {
+    let row = sqlx::query("SELECT notify_arrive, notify_depart FROM ng_people WHERE item_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+/// A person arrival the daemon recorded, carrying the person's id and name in
+/// `details` the way the daemon writes them.
+async fn seed_arrival(pool: &PgPool, device: i64, person: Uuid, name: &str) {
+    sqlx::query(
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+         VALUES ($1, 'person_arrived', now() - interval '1 hour', \
+                 jsonb_build_object('person_item_id', $2::text, 'person', $3::text, 'location', 'Kitchen'))",
+    )
+    .bind(device)
+    .bind(person.to_string())
+    .bind(name)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Make the daemon row of `mac` refuse to change owner to `to`.
+///
+/// Raised only on that change, so putting the owner back is still allowed —
+/// which is the undo the forms are meant to perform.
+async fn fail_owner_change(pool: &PgPool, mac: &str, to: Uuid) {
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION u2_fail_device() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.mac = '{mac}' AND NEW.owner_item_id IS NOT DISTINCT FROM '{to}'::uuid \
+              AND OLD.owner_item_id IS DISTINCT FROM NEW.owner_item_id THEN \
+             RAISE EXCEPTION 'injected failure moving {mac}'; \
+           END IF; \
+           RETURN NEW; \
+         END $$ LANGUAGE plpgsql; \
+         DROP TRIGGER IF EXISTS u2_fail_device ON ng_devices; \
+         CREATE TRIGGER u2_fail_device BEFORE UPDATE ON ng_devices \
+           FOR EACH ROW EXECUTE FUNCTION u2_fail_device();"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Make the kernel refuse to delete one Item: the last step of a merge and of
+/// a delete, and the one with no undo of its own.
+async fn fail_item_delete(pool: &PgPool, id: Uuid) {
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION u2_fail_item() RETURNS trigger AS $$ \
+         BEGIN \
+           IF OLD.id = '{id}'::uuid THEN RAISE EXCEPTION 'injected failure deleting {id}'; END IF; \
+           RETURN OLD; \
+         END $$ LANGUAGE plpgsql; \
+         DROP TRIGGER IF EXISTS u2_fail_item ON item; \
+         CREATE TRIGGER u2_fail_item BEFORE DELETE ON item \
+           FOR EACH ROW EXECUTE FUNCTION u2_fail_item();"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A device with an owner on both tiers, through the owner form, so its Item
+/// carries the owner the way a real one would.
+async fn owned_device(pool: &PgPool, admin: &UserContext, mac: &str, owner: Uuid) -> i64 {
+    let device = seed_clean_device(pool, mac, None, "online").await;
+    let response = call_form(
+        pool,
+        admin,
+        "device_owner_save",
+        "POST",
+        FORM_OWNER,
+        serde_json::json!({}),
+        &format!("target={mac}&back=%2Fdevices&value={owner}"),
+    )
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(
+        owner_on_both_tiers(pool, device).await,
+        (Some(owner), Some(owner.to_string()))
+    );
+    device
+}
+
+/// **Render**: the owner form lists everybody by name, ignoring case, offers a
+/// "new person" field, and carries the filter box hidden for the script.
+#[test]
+fn the_owner_form_lists_people_sorted_and_offers_a_new_person_field() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        seed_person_item(&pool, "bob").await;
+        seed_person_item(&pool, "Alice").await;
+        seed_clean_device(&pool, "02:00:5e:00:01:01", None, "online").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_owner_form",
+            "GET",
+            FORM_OWNER,
+            serde_json::json!({"target": "02:00:5e:00:01:01", "back": "/devices"}),
+            "",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(body.contains(r#"name="new_person""#), "{body}");
+        assert!(body.contains("or a new person named"), "{body}");
+        assert!(
+            body.contains(r#"name="_token" value="minted-by-the-kernel""#),
+            "{body}"
+        );
+        let alice = body.find(">Alice<").expect("Alice listed");
+        let bob = body.find(">bob<").expect("bob listed");
+        assert!(alice < bob, "people are not sorted by name: {body}");
+        assert!(body.contains("data-ng-filter=\"ng-value\""), "{body}");
+        assert!(
+            body.contains("Search people\" hidden>"),
+            "the filter box is visible without the script: {body}"
+        );
+        assert!(body.contains("/static/js/netgrasp-forms.js"), "{body}");
+    });
+}
+
+/// **Save, create**: a name nobody has creates the person through the
+/// assistant's function, and the device is theirs on both tiers.
+#[test]
+fn a_new_person_named_on_the_owner_form_is_created_and_owns_the_device() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:01:02", None, "online").await;
+        let (_, notify_before) = device_flags(&pool, device).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_owner_save",
+            "POST",
+            FORM_OWNER,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A01%3A02&back=%2Fdevices&value=&new_person=Jamie",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("who is new here"),
+            "{response}"
+        );
+
+        assert_eq!(people_named(&pool, "Jamie").await, (1, 1));
+        let jamie = person_id_named(&pool, "Jamie").await;
+        assert_eq!(
+            owner_on_both_tiers(&pool, device).await,
+            (Some(jamie), Some(jamie.to_string()))
+        );
+        assert_eq!(device_flags(&pool, device).await.1, notify_before);
+        // Created the way the assistant creates: alerts off.
+        assert_eq!(alerts_of(&pool, jamie).await, (false, false));
+    });
+}
+
+/// **The duplicate rule**: "jamie " is Jamie. The owner form assigns to the
+/// existing person and says so; Add person refuses and links to them; nobody
+/// second is created by either.
+#[test]
+fn a_name_differing_only_in_case_or_space_is_the_existing_person() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let device = seed_clean_device(&pool, "02:00:5e:00:01:03", None, "online").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "device_owner_save",
+            "POST",
+            FORM_OWNER,
+            serde_json::json!({}),
+            "target=02%3A00%3A5e%3A00%3A01%3A03&back=%2Fdevices&value=&new_person=jamie+",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains("the existing <strong>Jamie</strong>"),
+            "{body}"
+        );
+        assert_eq!(people_named(&pool, "Jamie").await, (1, 1), "a second Jamie");
+        assert_eq!(
+            owner_on_both_tiers(&pool, device).await,
+            (Some(jamie), Some(jamie.to_string()))
+        );
+
+        for typed in ["JAMIE", "%20%20jamie%20"] {
+            let response = call_form(
+                &pool,
+                &admin,
+                "person_add_save",
+                "POST",
+                FORM_PERSON_ADD,
+                serde_json::json!({}),
+                &format!("back=%2Fpeople&name={typed}"),
+            )
+            .await;
+            assert_eq!(response["status"], 422, "{typed}: {response}");
+            let body = response["body"].as_str().unwrap_or_default();
+            assert!(body.contains(&format!("/item/{jamie}")), "{body}");
+            assert_eq!(people_named(&pool, "Jamie").await, (1, 1), "{typed}");
+        }
+    });
+}
+
+/// **Add person**: renders with the token and the arrival tick, and creates
+/// one person with arrival alerts as ticked.
+#[test]
+fn add_person_renders_and_creates_one_person_with_alerts_as_ticked() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let form = call_form(
+            &pool,
+            &admin,
+            "person_add_form",
+            "GET",
+            FORM_PERSON_ADD,
+            serde_json::json!({}),
+            "",
+        )
+        .await;
+        assert_eq!(form["status"], 200, "{form}");
+        let body = form["body"].as_str().unwrap_or_default();
+        assert!(body.contains(r#"name="name""#), "{body}");
+        assert!(body.contains("Alert me when they get home"), "{body}");
+        assert!(
+            body.contains(r#"name="_token" value="minted-by-the-kernel""#),
+            "{body}"
+        );
+
+        let saved = call_form(
+            &pool,
+            &admin,
+            "person_add_save",
+            "POST",
+            FORM_PERSON_ADD,
+            serde_json::json!({}),
+            "back=%2Fpeople&name=++Wren++&arrive=1",
+        )
+        .await;
+        assert_eq!(saved["status"], 200, "{saved}");
+        let wren = person_id_named(&pool, "Wren").await;
+        assert_eq!(alerts_of(&pool, wren).await, (true, false));
+        assert_eq!(people_named(&pool, "Wren").await, (1, 1));
+        let (title, _) = item_title_and_field(&pool, wren, "field_notes").await;
+        assert_eq!(title, "Wren", "the name was stored untrimmed");
+
+        let blank = call_form(
+            &pool,
+            &admin,
+            "person_add_save",
+            "POST",
+            FORM_PERSON_ADD,
+            serde_json::json!({}),
+            "back=%2Fpeople&name=+++",
+        )
+        .await;
+        assert_eq!(blank["status"], 422, "{blank}");
+    });
+}
+
+/// Give a seeded device an mDNS name, as the daemon does.
+async fn set_mdns(pool: &PgPool, device: i64, name: &str) {
+    sqlx::query("UPDATE ng_devices SET mdns_name = $2 WHERE id = $1")
+        .bind(device)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// **Bulk, render**: the devices nobody named or owns, with a checkbox each,
+/// and a suggestion line per possessive mDNS owner that pre-ticks theirs.
+#[test]
+fn the_bulk_form_lists_the_devices_to_sort_and_suggests_owners_from_mdns() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let mac1 = seed_clean_device(&pool, "02:00:5e:00:02:01", None, "online").await;
+        let mac2 = seed_clean_device(&pool, "02:00:5e:00:02:02", None, "offline").await;
+        let other = seed_clean_device(&pool, "02:00:5e:00:02:03", None, "online").await;
+        seed_clean_device(&pool, "02:00:5e:00:02:04", Some(jamie), "online").await;
+        set_mdns(&pool, mac1, "Jeremy's Mac Studio").await;
+        set_mdns(&pool, mac2, "jeremy\u{2019}s iPad").await;
+        set_mdns(&pool, other, "JAMIE's iPhone").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_form",
+            "GET",
+            FORM_ASSIGN,
+            serde_json::json!({"suggest": "jeremy"}),
+            "",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains("3 devices with no name and no owner"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("02:00:5e:00:02:04"),
+            "an owned device is listed: {body}"
+        );
+        assert!(
+            body.contains("2 devices are named &ldquo;Jeremy&rsquo;s"),
+            "{body}"
+        );
+        assert!(body.contains("/devices/assign?suggest=jamie"), "{body}");
+        assert!(
+            body.contains(r#"value="02:00:5e:00:02:01" checked"#)
+                && body.contains(r#"value="02:00:5e:00:02:02" checked"#),
+            "the suggestion did not tick Jeremy's devices: {body}"
+        );
+        assert!(
+            !body.contains(r#"value="02:00:5e:00:02:03" checked"#),
+            "the suggestion ticked somebody else's device: {body}"
+        );
+        // Nobody is called Jeremy yet, so the suggestion fills in the name.
+        assert!(
+            body.contains(r#"name="new_person" value="Jeremy""#),
+            "{body}"
+        );
+
+        // Jamie exists, so suggesting Jamie selects her rather than typing.
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_form",
+            "GET",
+            FORM_ASSIGN,
+            serde_json::json!({"suggest": "jamie"}),
+            "",
+        )
+        .await;
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains(&format!(r#"value="{jamie}" selected"#)),
+            "{body}"
+        );
+    });
+}
+
+/// **Bulk, save**: every ticked device goes to one person, created on the spot,
+/// on both tiers; the unticked one does not move.
+#[test]
+fn the_bulk_form_assigns_every_ticked_device_to_one_new_person() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let a = seed_clean_device(&pool, "02:00:5e:00:03:01", None, "online").await;
+        let b = seed_clean_device(&pool, "02:00:5e:00:03:02", None, "online").await;
+        let c = seed_clean_device(&pool, "02:00:5e:00:03:03", None, "online").await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_save",
+            "POST",
+            FORM_ASSIGN,
+            serde_json::json!({}),
+            "_token=t&back=%2Fdevices%2Ftodo&device=02%3A00%3A5e%3A00%3A03%3A01\
+             &device=02%3A00%3A5e%3A00%3A03%3A02&owner=&new_person=Jeremy",
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("2 devices now belong"),
+            "{response}"
+        );
+        let jeremy = person_id_named(&pool, "Jeremy").await;
+        for device in [a, b] {
+            assert_eq!(
+                owner_on_both_tiers(&pool, device).await,
+                (Some(jeremy), Some(jeremy.to_string()))
+            );
+        }
+        assert_eq!(owner_on_both_tiers(&pool, c).await.0, None);
+
+        // Nobody ticked, or nobody named: refused, nothing changes.
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_save",
+            "POST",
+            FORM_ASSIGN,
+            serde_json::json!({}),
+            "back=%2Fdevices%2Ftodo&device=02%3A00%3A5e%3A00%3A03%3A03&owner=&new_person=",
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        assert_eq!(owner_on_both_tiers(&pool, c).await.0, None);
+    });
+}
+
+/// **Bulk, failure**: the second device refuses, so the first is put back and
+/// the person created for them is taken back too. Nothing half done.
+#[test]
+fn a_bulk_assign_that_fails_part_way_changes_nothing_and_creates_nobody() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let wren = seed_person_item(&pool, "Wren").await;
+        let a = seed_clean_device(&pool, "02:00:5e:00:04:01", None, "online").await;
+        let b = seed_clean_device(&pool, "02:00:5e:00:04:02", None, "online").await;
+        fail_owner_change(&pool, "02:00:5e:00:04:02", wren).await;
+
+        // To an existing person: the first device is put back.
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_save",
+            "POST",
+            FORM_ASSIGN,
+            serde_json::json!({}),
+            &format!(
+                "back=%2Fdevices%2Ftodo&device=02%3A00%3A5e%3A00%3A04%3A01\
+                 &device=02%3A00%3A5e%3A00%3A04%3A02&owner={wren}"
+            ),
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        for device in [a, b] {
+            assert_eq!(owner_on_both_tiers(&pool, device).await, (None, None));
+        }
+        assert_eq!(people_named(&pool, "Wren").await, (1, 1));
+
+        // Make every owner change on the second device fail, then name a new
+        // person: they are created, the move fails, and they are taken back.
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION u2_fail_device() RETURNS trigger AS $$ \
+             BEGIN \
+               IF NEW.mac = '02:00:5e:00:04:02' AND NEW.owner_item_id IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected'; \
+               END IF; \
+               RETURN NEW; \
+             END $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let response = call_form(
+            &pool,
+            &admin,
+            "devices_assign_save",
+            "POST",
+            FORM_ASSIGN,
+            serde_json::json!({}),
+            "back=%2Fdevices%2Ftodo&device=02%3A00%3A5e%3A00%3A04%3A01\
+             &device=02%3A00%3A5e%3A00%3A04%3A02&owner=&new_person=Arlo",
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        assert_eq!(
+            people_named(&pool, "Arlo").await,
+            (0, 0),
+            "Arlo was left behind"
+        );
+        for device in [a, b] {
+            assert_eq!(owner_on_both_tiers(&pool, device).await, (None, None));
+        }
+    });
+}
+
+/// Two people who are the same, the first with two devices, an arrival on
+/// record and arrival alerts on; the second with no alerts.
+async fn two_jamies(pool: &PgPool, admin: &UserContext) -> (Uuid, Uuid, i64, i64) {
+    let from = seed_person_item(pool, "Jamie (2)").await;
+    let into = seed_person_item(pool, "Jamie").await;
+    let d1 = owned_device(pool, admin, "02:00:5e:00:05:01", from).await;
+    let d2 = owned_device(pool, admin, "02:00:5e:00:05:02", from).await;
+    seed_arrival(pool, d1, from, "Jamie (2)").await;
+    set_alerts(pool, from, true, false).await;
+    (from, into, d1, d2)
+}
+
+/// **Merge, render**: the confirmation names both people, every device that
+/// moves, the history, and which alerts win, with the keep box ticked because
+/// the merged person had an alert the kept one does not. The chooser before
+/// it lists everybody but the person being merged.
+#[test]
+fn the_merge_page_shows_exactly_what_will_move_before_anything_changes() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let (from, into, d1, _) = two_jamies(&pool, &admin).await;
+
+        let chooser = call_form(
+            &pool,
+            &admin,
+            "person_merge_form",
+            "GET",
+            FORM_MERGE,
+            serde_json::json!({"target": from.to_string()}),
+            "",
+        )
+        .await;
+        assert_eq!(chooser["status"], 200, "{chooser}");
+        let body = chooser["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains(&format!(r#"<option value="{into}">Jamie</option>"#)),
+            "{body}"
+        );
+        assert!(
+            !body.contains(&format!(r#"<option value="{from}">"#)),
+            "{body}"
+        );
+
+        let confirm = call_form(
+            &pool,
+            &admin,
+            "person_merge_form",
+            "GET",
+            FORM_MERGE,
+            serde_json::json!({"target": from.to_string(), "into": into.to_string()}),
+            "",
+        )
+        .await;
+        assert_eq!(confirm["status"], 200, "{confirm}");
+        let body = confirm["body"].as_str().unwrap_or_default();
+        for expected in [
+            "Merge Jamie (2) into Jamie",
+            "2 devices move from Jamie (2) to Jamie",
+            "02:00:5e:00:05:01",
+            "02:00:5e:00:05:02",
+            "1 past coming or going is shown as",
+            "Jamie's settings win",
+            r#"name="keep" value="1" checked"#,
+            "had arrival alerts on",
+            r#"name="_token" value="minted-by-the-kernel""#,
+        ] {
+            assert!(body.contains(expected), "missing {expected:?}: {body}");
+        }
+        // Rendering it changed nothing.
+        assert_eq!(owner_on_both_tiers(&pool, d1).await.0, Some(from));
+        assert_eq!(person_exists(&pool, from).await, (true, true));
+
+        // A person cannot be merged into themselves.
+        let same = call_form(
+            &pool,
+            &admin,
+            "person_merge_form",
+            "GET",
+            FORM_MERGE,
+            serde_json::json!({"target": from.to_string(), "into": from.to_string()}),
+            "",
+        )
+        .await;
+        assert_eq!(same["status"], 422, "{same}");
+    });
+}
+
+/// **Merge, save**: every device moves on both tiers, the kept person keeps
+/// the merged one's arrival alert (the box was ticked), the merged person's
+/// Item and mirror row are gone, and their past arrival is now the kept
+/// person's, under the kept name, with the daemon's event row untouched.
+#[test]
+fn merge_moves_the_devices_keeps_the_history_and_removes_the_merged_person() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let (from, into, d1, d2) = two_jamies(&pool, &admin).await;
+        let details_before: serde_json::Value =
+            sqlx::query_scalar("SELECT details FROM ng_events WHERE event_type = 'person_arrived'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_merge_save",
+            "POST",
+            FORM_MERGE,
+            serde_json::json!({}),
+            &format!("target={from}&into={into}&keep=1&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let body = response["body"].as_str().unwrap_or_default();
+        assert!(body.contains("2 devices moved"), "{body}");
+
+        for device in [d1, d2] {
+            assert_eq!(
+                owner_on_both_tiers(&pool, device).await,
+                (Some(into), Some(into.to_string()))
+            );
+        }
+        assert_eq!(alerts_of(&pool, into).await, (true, false));
+        assert_eq!(person_exists(&pool, from).await, (false, false));
+
+        let row = sqlx::query("SELECT person_item_id, person_name FROM ng_person_movements")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (who, name): (Option<String>, Option<String>) = (row.get(0), row.get(1));
+        assert_eq!(who, Some(into.to_string()));
+        assert_eq!(name.as_deref(), Some("Jamie"));
+        let details_after: serde_json::Value =
+            sqlx::query_scalar("SELECT details FROM ng_events WHERE event_type = 'person_arrived'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            details_before, details_after,
+            "the daemon's event was rewritten"
+        );
+
+        // A second merge keeps the record one hop deep: Jamie into Jem, and
+        // Jamie (2)'s old arrival is Jem's.
+        let jem = seed_person_item(&pool, "Jem").await;
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_merge_save",
+            "POST",
+            FORM_MERGE,
+            serde_json::json!({}),
+            &format!("target={into}&into={jem}&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        let (who, name): (Option<String>, Option<String>) = {
+            let row = sqlx::query("SELECT person_item_id, person_name FROM ng_person_movements")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            (row.get(0), row.get(1))
+        };
+        assert_eq!(who, Some(jem.to_string()));
+        assert_eq!(name.as_deref(), Some("Jem"));
+        // Unticked this time: Jem's settings (off) win.
+        assert_eq!(alerts_of(&pool, jem).await, (false, false));
+        assert_eq!(owner_on_both_tiers(&pool, d1).await.0, Some(jem));
+    });
+}
+
+/// Everything a merge or delete may change, for a before-and-after compare.
+async fn people_state(
+    pool: &PgPool,
+    people: &[Uuid],
+    devices: &[i64],
+) -> (
+    Vec<(bool, bool)>,
+    Vec<(bool, bool)>,
+    Vec<(Option<Uuid>, Option<String>)>,
+    i64,
+) {
+    let mut exists = Vec::new();
+    let mut alerts = Vec::new();
+    for person in people {
+        let e = person_exists(pool, *person).await;
+        exists.push(e);
+        if e.1 {
+            alerts.push(alerts_of(pool, *person).await);
+        }
+    }
+    let mut owners = Vec::new();
+    for device in devices {
+        owners.push(owner_on_both_tiers(pool, *device).await);
+    }
+    let merges: i64 = sqlx::query_scalar("SELECT count(*) FROM ng_person_merge")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (exists, alerts, owners, merges)
+}
+
+/// **Merge, failure part way**: the second device refuses to move, so the
+/// first is put back, the kept person's alerts are put back, and nothing is
+/// recorded or removed.
+#[test]
+fn a_merge_that_fails_moving_a_device_changes_nothing() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let (from, into, d1, d2) = two_jamies(&pool, &admin).await;
+        let before = people_state(&pool, &[from, into], &[d1, d2]).await;
+        fail_owner_change(&pool, "02:00:5e:00:05:02", into).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_merge_save",
+            "POST",
+            FORM_MERGE,
+            serde_json::json!({}),
+            &format!("target={from}&into={into}&keep=1&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Nothing was changed"),
+            "{response}"
+        );
+        assert_eq!(people_state(&pool, &[from, into], &[d1, d2]).await, before);
+        let item_alert = field_text(
+            &item_title_and_field(&pool, into, "field_notify_arrive")
+                .await
+                .1,
+        );
+        assert_ne!(
+            item_alert.as_deref(),
+            Some("true"),
+            "the kept person's Item kept the alert"
+        );
+    });
+}
+
+/// **Merge, failure at the last step**: the merged person's Item will not
+/// delete, so the record is taken back, their mirror row is written again,
+/// the devices go back and the alerts go back.
+#[test]
+fn a_merge_whose_item_delete_fails_is_undone_completely() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let (from, into, d1, d2) = two_jamies(&pool, &admin).await;
+        // An earlier merge into the person going away, which the record
+        // statement re-points and the undo must point back.
+        let earlier = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name) VALUES ($1, $2, 'J')",
+        )
+        .bind(earlier)
+        .bind(from)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = people_state(&pool, &[from, into], &[d1, d2]).await;
+        fail_item_delete(&pool, from).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_merge_save",
+            "POST",
+            FORM_MERGE,
+            serde_json::json!({}),
+            &format!("target={from}&into={into}&keep=1&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        assert_eq!(people_state(&pool, &[from, into], &[d1, d2]).await, before);
+        let pointed: Uuid =
+            sqlx::query_scalar("SELECT into_item_id FROM ng_person_merge WHERE from_item_id = $1")
+                .bind(earlier)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointed, from, "the earlier merge was not pointed back");
+    });
+}
+
+/// **Delete, render and save**: the confirmation lists the devices that lose
+/// their owner; the POST unassigns them on both tiers, keeps them, and
+/// removes the person.
+#[test]
+fn delete_lists_then_unassigns_the_devices_and_removes_the_person() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let d1 = owned_device(&pool, &admin, "02:00:5e:00:06:01", arlo).await;
+        let d2 = owned_device(&pool, &admin, "02:00:5e:00:06:02", arlo).await;
+
+        let confirm = call_form(
+            &pool,
+            &admin,
+            "person_delete_form",
+            "GET",
+            FORM_DELETE,
+            serde_json::json!({"target": arlo.to_string()}),
+            "",
+        )
+        .await;
+        assert_eq!(confirm["status"], 200, "{confirm}");
+        let body = confirm["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains("These 2 devices will have no owner"),
+            "{body}"
+        );
+        assert!(
+            body.contains("02:00:5e:00:06:01") && body.contains("02:00:5e:00:06:02"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"name="_token" value="minted-by-the-kernel""#),
+            "{body}"
+        );
+        assert_eq!(
+            person_exists(&pool, arlo).await,
+            (true, true),
+            "rendering deleted"
+        );
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_delete_save",
+            "POST",
+            FORM_DELETE,
+            serde_json::json!({}),
+            &format!("target={arlo}&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(person_exists(&pool, arlo).await, (false, false));
+        for device in [d1, d2] {
+            assert_eq!(owner_on_both_tiers(&pool, device).await, (None, None));
+            let still_there: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM ng_devices WHERE id = $1")
+                    .bind(device)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(still_there, 1, "a device was deleted with its owner");
+        }
+    });
+}
+
+/// **Delete, failure**: the Item will not delete, so the mirror row comes back
+/// and the devices are theirs again on both tiers.
+#[test]
+fn a_delete_that_fails_changes_nothing() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let d1 = owned_device(&pool, &admin, "02:00:5e:00:07:01", arlo).await;
+        let before = people_state(&pool, &[arlo], &[d1]).await;
+        fail_item_delete(&pool, arlo).await;
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_delete_save",
+            "POST",
+            FORM_DELETE,
+            serde_json::json!({}),
+            &format!("target={arlo}&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 422, "{response}");
+        assert_eq!(people_state(&pool, &[arlo], &[d1]).await, before);
+    });
+}
+
+/// **Permissions**: every new form, read or write, answers 403 to a caller
+/// without `administer netgrasp` and to an anonymous one, and changes nothing.
+#[test]
+fn the_people_forms_refuse_a_caller_without_the_permission_and_anonymous() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let arlo = seed_person_item(&pool, "Arlo").await;
+        let jamie = seed_person_item(&pool, "Jamie").await;
+        let d1 = owned_device(&pool, &admin, "02:00:5e:00:08:01", arlo).await;
+        let loose = seed_clean_device(&pool, "02:00:5e:00:08:02", None, "online").await;
+        let before = people_state(&pool, &[arlo, jamie], &[d1, loose]).await;
+
+        let nobody = ng_nobody(&pool).await;
+        let calls = [
+            ("device_owner_form", "GET", FORM_OWNER, String::new()),
+            (
+                "device_owner_save",
+                "POST",
+                FORM_OWNER,
+                "target=02%3A00%3A5e%3A00%3A08%3A02&value=&new_person=Mallory".to_string(),
+            ),
+            ("person_add_form", "GET", FORM_PERSON_ADD, String::new()),
+            (
+                "person_add_save",
+                "POST",
+                FORM_PERSON_ADD,
+                "name=Mallory".to_string(),
+            ),
+            ("devices_assign_form", "GET", FORM_ASSIGN, String::new()),
+            (
+                "devices_assign_save",
+                "POST",
+                FORM_ASSIGN,
+                format!("device=02%3A00%3A5e%3A00%3A08%3A02&owner={jamie}"),
+            ),
+            ("person_merge_form", "GET", FORM_MERGE, String::new()),
+            (
+                "person_merge_save",
+                "POST",
+                FORM_MERGE,
+                format!("target={arlo}&into={jamie}"),
+            ),
+            ("person_delete_form", "GET", FORM_DELETE, String::new()),
+            (
+                "person_delete_save",
+                "POST",
+                FORM_DELETE,
+                format!("target={arlo}"),
+            ),
+        ];
+        for user in [nobody, UserContext::anonymous()] {
+            for (callback, method, path, body) in &calls {
+                let response = call_form(
+                    &pool,
+                    &user,
+                    callback,
+                    method,
+                    path,
+                    serde_json::json!({"target": arlo.to_string()}),
+                    body,
+                )
+                .await;
+                assert_eq!(response["status"], 403, "{callback}: {response}");
+            }
+        }
+        assert_eq!(
+            people_state(&pool, &[arlo, jamie], &[d1, loose]).await,
+            before
+        );
+        assert_eq!(people_named(&pool, "Mallory").await, (0, 0));
+    });
+}
+
+/// **The person page**, through the real `tap_item_view`: where they are,
+/// their devices, their comings and goings (a merged person's included), and
+/// the four actions.
+#[test]
+fn the_person_page_shows_devices_movements_alerts_and_the_actions() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let (from, into, _, _) = two_jamies(&pool, &admin).await;
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_merge_save",
+            "POST",
+            FORM_MERGE,
+            serde_json::json!({}),
+            &format!("target={from}&into={into}&keep=1&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+
+        let item = item_json(&pool, into).await;
+        let results =
+            dispatch_as_raw(&pool, &admin_viewer(&pool).await, "tap_item_view", &item).await;
+        let html = serde_json::from_str::<String>(&results).unwrap();
+        for expected in [
+            "ng-person-page",
+            "02:00:5e:00:05:01",
+            "Arrived",
+            "at Kitchen",
+            "you are told when Jamie gets home",
+            "/netgrasp/person/rename?target=",
+            "/netgrasp/person/notify?target=",
+            "/netgrasp/person/merge?target=",
+            "/netgrasp/person/delete?target=",
+            "/devices/assign?person=",
+        ] {
+            assert!(html.contains(expected), "missing {expected:?}: {html}");
+        }
+
+        // Device data: nothing for a viewer without the permission.
+        let item = item_json(&pool, into).await;
+        let results =
+            dispatch_as_raw(&pool, &UserContext::anonymous(), "tap_item_view", &item).await;
+        let html = serde_json::from_str::<String>(&results).unwrap();
+        assert!(!html.contains("02:00:5e"), "{html}");
+    });
+}
+
+/// A viewer holding the device-data permission and the admin one.
+async fn admin_viewer(pool: &PgPool) -> UserContext {
+    UserContext::authenticated(
+        any_user(pool).await,
+        vec![
+            PERM_ADMINISTER.to_string(),
+            "view netgrasp devices".to_string(),
+        ],
+    )
+}
+
+/// Dispatch a tap as a user and return its raw output.
+async fn dispatch_as_raw(
+    pool: &PgPool,
+    user: &UserContext,
+    tap: &str,
+    payload: &serde_json::Value,
+) -> String {
+    let disp = dispatcher();
+    let state = RequestState::new(
+        user.clone(),
+        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
+            .with_plugin_runtime(disp.runtime().clone()),
+    );
+    let results = disp.dispatch(tap, &payload.to_string(), state).await;
+    assert_eq!(results.len(), 1, "expected exactly one {tap} result");
+    results[0].output.clone()
 }

@@ -1260,3 +1260,145 @@
         color: #fecaca;
     }
 }
+
+/* --------------------------------------------------------------------------
+ * People (U2): the owner fields, the bulk form, merge and delete, the person
+ * page
+ * ------------------------------------------------------------------------ */
+
+.ng-form input[type="search"] {
+    width: 100%;
+    margin-bottom: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--gray-300);
+    border-radius: 0.375rem;
+    background: var(--ng-surface);
+    color: var(--ng-text);
+    font: inherit;
+}
+
+.ng-form__hint {
+    margin-top: -0.25rem;
+    font-size: 0.85rem;
+    color: var(--gray-600);
+}
+
+/* The bulk form is a list of devices, so it may be wider than one field. */
+.ng-page--form:has(.ng-form--bulk) {
+    max-width: 48rem;
+}
+
+.ng-form__devices {
+    margin: 0 0 1rem 0;
+    padding: 0;
+    border: 0;
+}
+
+.ng-form__devices legend {
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+}
+
+.ng-checklist {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-height: 28rem;
+    overflow-y: auto;
+    border: 1px solid var(--ng-border);
+    border-radius: 0.375rem;
+}
+
+.ng-checklist li {
+    border-bottom: 1px solid var(--ng-border);
+}
+
+.ng-checklist li:last-child {
+    border-bottom: 0;
+}
+
+/* The whole row is the label, so the tap target is the row, not the box. */
+.ng-form .ng-checklist label {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 0.5rem;
+    min-height: 44px;
+    margin: 0;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.95rem;
+    color: var(--ng-text);
+    cursor: pointer;
+}
+
+.ng-checklist__name {
+    font-weight: 600;
+}
+
+.ng-checklist__meta,
+.ng-person-page__meta {
+    font-size: 0.8rem;
+    color: var(--gray-600);
+    overflow-wrap: anywhere;
+}
+
+.ng-form__suggestions {
+    margin: 0 0 1rem 0;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--ng-border);
+    border-radius: 0.5rem;
+    background: var(--ng-surface);
+}
+
+.ng-form__suggestions p,
+.ng-form__suggestions ul {
+    margin: 0.25rem 0;
+}
+
+.ng-form__list {
+    margin: 0 0 1rem 0;
+    padding-inline-start: 1.25rem;
+    overflow-wrap: anywhere;
+}
+
+.ng-form--confirm button {
+    background: var(--danger, #b91c1c);
+}
+
+.ng-person-page__state {
+    font-size: 1.1rem;
+}
+
+.ng-person-page__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.ng-person-page__actions .button {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 0.9rem;
+    border: 1px solid var(--ng-border);
+    border-radius: 0.375rem;
+    text-decoration: none;
+}
+
+.ng-person-page__devices,
+.ng-person-page__movements {
+    padding-inline-start: 1.25rem;
+}
+
+.ng-person-page__devices li,
+.ng-person-page__movements li {
+    margin-bottom: 0.4rem;
+}
+
+@media (max-width: 640px) {
+    .ng-form button {
+        width: 100%;
+        min-height: 44px;
+        margin-bottom: 0.5rem;
+    }
+}

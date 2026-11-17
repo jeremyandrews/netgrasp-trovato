@@ -119,6 +119,12 @@
             {%- else %}
             <li><a href="/netgrasp/person/rename?back={{ ng_back }}&amp;target={{ ng_target }}">Rename&hellip;</a></li>
             <li><a href="/netgrasp/person/notify?back={{ ng_back }}&amp;target={{ ng_target }}">Arrival alerts&hellip;</a></li>
+            {#
+                Merge and delete open a page that says what will change; the
+                page's button is the change. Neither is ever one click.
+            #}
+            <li><a href="/netgrasp/person/merge?back={{ ng_back }}&amp;target={{ ng_target }}">Merge into&hellip;</a></li>
+            <li><a href="/netgrasp/person/delete?back={{ ng_back }}&amp;target={{ ng_target }}">Delete&hellip;</a></li>
             {%- endif %}
             {#
                 The assistant entry, and the scope it can honestly open.
