@@ -84,8 +84,8 @@ feature here ever seems to require one, that is a bug in the feature.
 
 ## Status
 
-Version 1.0.0, the first release, paired with
-[netgraspd 1.0.0](https://github.com/jeremyandrews/netgraspd/releases/tag/v1.0.0);
+Version 1.1.0, paired with
+[netgraspd 1.1.0](https://github.com/jeremyandrews/netgraspd/releases/tag/v1.1.0);
 see [Compatibility](#compatibility). `CHANGELOG.md` has the history and the
 versioning rule: from 1.0.0 the plugin's version is its own, and the Trovato it
 is built against is recorded beside it rather than being it.
@@ -184,7 +184,7 @@ tables.
 | netgrasp-trovato | netgraspd | `ng_` schema | Trovato kernel |
 |---|---|---|---|
 | 1.0.0 | 1.0.0 | version 3 (`V3__enrichment_location_people.sql` in netgraspd) | 0.102.0 or a later 0.x |
-| unreleased (`main`) | unreleased (`main`) | version 4 (`V4__notify_status_and_requests.sql` in netgraspd) | 0.102.0 or a later 0.x |
+| 1.1.0 | 1.1.0 | version 5 (`V5__people_epochs_event_person_daemon_status.sql` in netgraspd); reads version 4's notify tables and none of version 5's yet | 0.102.0 or a later 0.x |
 
 **The rule.** A plugin and a daemon pair when they are built for the same `ng_`
 schema version, which is the highest migration in the daemon's `migrations/`.
@@ -233,7 +233,7 @@ with its manifest and migrations, the templates and the static files, laid out
 as the three directories Trovato's search paths take. No Rust needed.
 
 ```bash
-v=1.0.0
+v=1.1.0
 base=https://github.com/jeremyandrews/netgrasp-trovato/releases/download/v$v
 curl -fLO "$base/netgrasp-trovato-$v.tar.gz"
 curl -fLO "$base/netgrasp-trovato-$v.tar.gz.sha256"
