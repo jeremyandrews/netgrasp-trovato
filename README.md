@@ -303,6 +303,8 @@ section does the copying, and the variables are the same.
   GRANT DELETE ON ng_events TO trovato;
   -- Send test on /alerts
   GRANT INSERT (requested_by) ON ng_notify_requests TO trovato;
+  -- one person per name (plugin migration 018 creates this only as the owner)
+  CREATE UNIQUE INDEX IF NOT EXISTS ng_people_name_key ON ng_people (lower(btrim(name)));
   ```
 
   The plugin's migrations are written for this: wherever they touch a daemon

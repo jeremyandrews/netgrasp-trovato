@@ -1920,7 +1920,7 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
         .unwrap();
 
     let applied = sqlx::raw_sql(&format!(
-        "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}"
+        "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}\n{ONE_PERSON_PER_NAME}"
     ))
     .execute(&mut conn)
     .await;
@@ -1928,6 +1928,7 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
     conn.execute("RESET ROLE").await.unwrap();
     let presence = unique_indexes_on(&mut conn, test, "ng_presence").await;
     let location = unique_indexes_on(&mut conn, test, "ng_location_history").await;
+    let people = unique_indexes_on(&mut conn, test, "ng_people").await;
     conn.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
         .await
         .unwrap();
@@ -1935,7 +1936,147 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
         .await
         .unwrap();
 
-    applied.expect("001, 015 and 017 apply as a role that owns no daemon table");
+    applied.expect("001, 015, 017 and 018 apply as a role that owns no daemon table");
     assert_eq!(presence, ["ng_presence_open_idx"]);
     assert_eq!(location, ["ng_location_history_open_idx"]);
+    assert!(
+        people.is_empty(),
+        "018 created an index on a table this role does not own: {people:?}"
+    );
+}
+
+// ===========================================================================
+// 018: one person per name
+// ===========================================================================
+
+/// The plugin's 018: a unique index on `ng_people` over `lower(btrim(name))`.
+const ONE_PERSON_PER_NAME: &str =
+    include_str!("../../../plugins/netgrasp/migrations/018_netgrasp_one_person_per_name.sql");
+
+/// Mirror one person the way the plugin does, through the real upsert.
+async fn mirror(conn: &mut PgConnection, item_id: &str, name: &str) -> Result<u64, sqlx::Error> {
+    let Statement { sql, params, .. } = build_person_upsert(&json!({
+        "id": item_id,
+        "title": name,
+        "fields": {},
+    }))
+    .unwrap();
+    bind_json(&params, sqlx::query(&sql))
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+}
+
+/// On the daemon's schema, as the table's owner: 018 builds the index, a rerun
+/// is a no-op, a second mirror row for "jamie " is refused while "Jaime" and
+/// "Mary Ann" beside "Maryann" are not, and the plugin's own lookup finds the
+/// person holding the name by the index's key.
+#[tokio::test]
+async fn one_person_per_name_is_enforced_by_the_index() {
+    let test = "name_key";
+    let mut conn = daemon_db(test).await;
+    for _ in 0..2 {
+        sqlx::raw_sql(ONE_PERSON_PER_NAME)
+            .execute(&mut conn)
+            .await
+            .expect("018 applies");
+    }
+    assert_eq!(
+        unique_indexes_on(&mut conn, test, "ng_people").await,
+        ["ng_people_name_key"]
+    );
+
+    mirror(&mut conn, ITEM_A, "Jamie")
+        .await
+        .expect("the first Jamie");
+    let refused = mirror(&mut conn, ITEM_B, "jamie ")
+        .await
+        .expect_err("a second Jamie was mirrored");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|e| e.constraint())
+            .map(str::to_string),
+        Some("ng_people_name_key".to_string()),
+        "{refused}"
+    );
+    // The same person renamed in place is not a second person.
+    mirror(&mut conn, ITEM_A, "JAMIE")
+        .await
+        .expect("Jamie, renamed");
+    mirror(&mut conn, ITEM_B, "Jaime")
+        .await
+        .expect("Jaime is somebody else");
+    mirror(&mut conn, PERSON, "Mary Ann")
+        .await
+        .expect("Mary Ann");
+    mirror(&mut conn, "44444444-4444-4444-8444-444444444444", "Maryann")
+        .await
+        .expect("inner spaces are part of a name");
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        item_id: String,
+    }
+    let holder: Vec<Holder> = query_rows(
+        &mut conn,
+        queries::SELECT_PERSON_HOLDING_NAME,
+        &[json!(" jamie "), json!(ITEM_B)],
+    )
+    .await;
+    assert_eq!(holder.len(), 1);
+    assert_eq!(holder[0].item_id, ITEM_A);
+    let nobody: Vec<Holder> = query_rows(
+        &mut conn,
+        queries::SELECT_PERSON_HOLDING_NAME,
+        &[json!("Jamie"), json!(ITEM_A)],
+    )
+    .await;
+    assert!(
+        nobody.is_empty(),
+        "a person was found holding their own name"
+    );
+}
+
+/// People who already share a name stop 018, which names every one of them and
+/// changes nothing: no row deleted or renamed, and no index.
+#[tokio::test]
+async fn an_existing_duplicate_stops_the_migration_and_is_named() {
+    let test = "name_dup";
+    let mut conn = daemon_db(test).await;
+    for (id, name) in [(ITEM_A, "Jamie"), (ITEM_B, " jamie"), (PERSON, "Wren")] {
+        sqlx::query("INSERT INTO ng_people (item_id, name) VALUES ($1::uuid, $2)")
+            .bind(id)
+            .bind(name)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    let failed = sqlx::raw_sql(ONE_PERSON_PER_NAME)
+        .execute(&mut conn)
+        .await
+        .expect_err("018 applied over two Jamies");
+    let message = failed.to_string();
+    assert!(message.contains("share a name"), "{message}");
+    assert!(
+        message.contains(&format!("'Jamie' ({ITEM_A})")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("' jamie' ({ITEM_B})")),
+        "{message}"
+    );
+    assert!(!message.contains("Wren"), "{message}");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ng_people")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rows, 3, "the migration removed a person");
+    assert!(
+        unique_indexes_on(&mut conn, test, "ng_people")
+            .await
+            .is_empty()
+    );
 }

@@ -368,6 +368,13 @@ pub(crate) enum PersonFound {
 /// or surrounding space is that person, and nobody new is created. A new person
 /// gets the trimmed name, no notes, departure alerts off, and arrival alerts as
 /// asked — off, unless the form's "Alert me when they get home" was ticked.
+///
+/// The check below is the plugin's, so two creates of "Jamie" arriving together
+/// can both pass it. The database settles that: `ng_people_name_key` (migration
+/// 018) refuses the second mirror row, and the create that lost takes back the
+/// Item it just made, through the same undo the forms use, and returns the
+/// person who won. One path and no retry: by the time the mirror write fails
+/// the winner's row is committed, so the lookup finds them.
 pub(crate) fn find_or_create_person(name: &str, arrive: bool) -> Result<PersonFound, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -392,12 +399,41 @@ pub(crate) fn find_or_create_person(name: &str, arrive: bool) -> Result<PersonFo
             "field_notify_depart": false,
         }
     });
-    let saved = apply_person_save(&payload)?;
+    let saved = item_host::save_item(&payload)
+        .map_err(|code| format!("could not save the person (host error {code})"))?;
     let item_id = saved
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| "the new person came back with no id".to_string())?;
+    if let Err(e) = sync_host::mirror_person(&saved) {
+        // The `db` host reports every failure as one code, so whether this was
+        // the name index is asked of the database, by the index's own key.
+        let Some(holder) = person_holding_name(name, item_id)? else {
+            return Err(format!("could not mirror the person for the daemon: {e}"));
+        };
+        crate::forms::forget_created(&PersonFacts {
+            item_id: item_id.to_string(),
+            name: name.to_string(),
+            ..PersonFacts::default()
+        });
+        return Ok(PersonFound::Existing(load_person(&holder)?));
+    }
     Ok(PersonFound::Created(load_person(item_id)?))
+}
+
+/// The Item id of the person other than `item_id` who holds `name` by the key of
+/// `ng_people_name_key`, if anyone does.
+fn person_holding_name(name: &str, item_id: &str) -> Result<Option<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        item_id: String,
+    }
+    let rows: Vec<Holder> = query_rows(
+        queries::SELECT_PERSON_HOLDING_NAME,
+        &[json!(name), json!(item_id)],
+    )
+    .map_err(|e| format!("could not look the name up: {e}"))?;
+    Ok(rows.into_iter().next().map(|h| h.item_id))
 }
 
 /// Give each device a new owner (or none), all of them or none of them.

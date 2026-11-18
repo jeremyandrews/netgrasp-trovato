@@ -3344,6 +3344,15 @@ fn an_ambiguous_person_name_names_the_candidates_rather_than_guessing() {
         reset(&pool).await;
         let admin = ng_admin(&pool).await;
 
+        // Two people sharing a name by `same_name` cannot both have a mirror
+        // row while 018's index is there. They can where it is not: a kernel
+        // whose role does not own ng_people cannot create it, and leaves it to
+        // the owner. That install is the one modelled here, so the resolver
+        // still has to name both rather than pick.
+        sqlx::query("DROP INDEX IF EXISTS ng_people_name_key")
+            .execute(&pool)
+            .await
+            .unwrap();
         let first = seed_person_item(&pool, "Sam").await;
         let second = seed_person_item(&pool, "sam").await;
         let device = seed_clean_device(&pool, "02:00:5e:00:00:07", None, "online").await;
@@ -3358,11 +3367,6 @@ fn an_ambiguous_person_name_names_the_candidates_rather_than_guessing() {
             "describe",
         )
         .await;
-        assert_eq!(refused["ok"], false, "{refused}");
-        let message = refused["content"].as_str().unwrap_or_default();
-        assert!(message.contains("matches 2 people"), "{message}");
-        assert!(message.contains(&first.to_string()), "{message}");
-        assert!(message.contains(&second.to_string()), "{message}");
 
         // A uuid resolves it, which is what the message tells the model to do.
         let described = call_tool(
@@ -3375,6 +3379,26 @@ fn an_ambiguous_person_name_names_the_candidates_rather_than_guessing() {
             "describe",
         )
         .await;
+
+        // Put the index back before asserting, so a failure here cannot leave
+        // two Sams behind for the next test's migrations to refuse.
+        sqlx::query("DELETE FROM ng_people WHERE item_id = $1")
+            .bind(second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/018_netgrasp_one_person_per_name.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("018 applies once the second Sam is gone");
+
+        assert_eq!(refused["ok"], false, "{refused}");
+        let message = refused["content"].as_str().unwrap_or_default();
+        assert!(message.contains("matches 2 people"), "{message}");
+        assert!(message.contains(&first.to_string()), "{message}");
+        assert!(message.contains(&second.to_string()), "{message}");
         assert_eq!(described["ok"], true, "{described}");
         let _ = device;
     });
@@ -5197,6 +5221,110 @@ fn a_name_differing_only_in_case_or_space_is_the_existing_person() {
             assert!(body.contains(&format!("/item/{jamie}")), "{body}");
             assert_eq!(people_named(&pool, "Jamie").await, (1, 1), "{typed}");
         }
+    });
+}
+
+/// **Two creates at once**: "Jamie" and "jamie " posted together leave one
+/// person Item and one mirror row, and both callers are given that person.
+///
+/// The race is made certain rather than hoped for. A transaction holds
+/// `ng_people` in SHARE mode, which lets both requests read it (so both pass
+/// the plugin's own name check, finding nobody) and stops both at the mirror
+/// insert. Once both are waiting the lock is released: one insert lands, and
+/// 018's index refuses the other, whose request must take back the Item it
+/// made and answer with the winner.
+#[test]
+fn two_simultaneous_creates_of_one_name_leave_one_person() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE ng_people IN SHARE MODE")
+            .execute(&mut *gate)
+            .await
+            .unwrap();
+
+        let post = |typed: &'static str| {
+            let pool = pool.clone();
+            let admin = admin.clone();
+            tokio::spawn(async move {
+                call_form(
+                    &pool,
+                    &admin,
+                    "person_add_save",
+                    "POST",
+                    FORM_PERSON_ADD,
+                    serde_json::json!({}),
+                    &format!("back=%2Fpeople&name={typed}"),
+                )
+                .await
+            })
+        };
+        let one = post("Jamie");
+        let two = post("jamie%20");
+
+        // Both are past the name check, have made their Item, and are queued
+        // on the mirror insert. Polled well inside the db host's 5 s
+        // statement timeout, which the wait counts against.
+        let mut waiting = 0;
+        for _ in 0..200 {
+            waiting = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_locks WHERE relation = 'ng_people'::regclass \
+                 AND NOT granted",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(waiting, 2, "both creates should be waiting on the mirror");
+        assert_eq!(
+            people_named(&pool, "Jamie").await.0,
+            2,
+            "both creates should have made an Item before the mirror write"
+        );
+        gate.commit().await.unwrap();
+
+        let one = one.await.unwrap();
+        let two = two.await.unwrap();
+
+        assert_eq!(
+            people_named(&pool, "Jamie").await,
+            (1, 1),
+            "a second Jamie survived: {one} {two}"
+        );
+        // Whichever post won, so "Jamie" or "jamie": the one mirror row.
+        let jamie: Uuid = sqlx::query_scalar("SELECT item_id FROM ng_people")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let items: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM item WHERE type = 'ng_person'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(items, [jamie], "the Item left is not the mirrored one");
+
+        // One was created and one found, and both name the same person.
+        let mut statuses = [one["status"].as_i64(), two["status"].as_i64()];
+        statuses.sort_unstable();
+        assert_eq!(statuses, [Some(200), Some(422)], "{one} {two}");
+        for response in [&one, &two] {
+            let body = response["body"].as_str().unwrap_or_default();
+            assert!(body.contains(&format!("/item/{jamie}")), "{body}");
+        }
+        let lost = if one["status"] == 422 { &one } else { &two };
+        assert!(
+            lost["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already exists"),
+            "{lost}"
+        );
     });
 }
 

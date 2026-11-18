@@ -278,6 +278,16 @@ pub const SELECT_PERSON_WITH_COUNT: &str = "SELECT p.item_id::text AS item_id, p
      GROUP BY p.item_id, p.name, p.notes, p.notify_arrive, p.notify_depart, p.state, \
               p.current_location";
 
+/// The person, other than `$2`, whose name is `$1` by the key of
+/// `ng_people_name_key` (migration 018): `lower(btrim(name))`.
+///
+/// Asked when a new person's mirror row is refused. The same expression as the
+/// index rather than [`crate::assist::same_name`], so the person found is the
+/// one the database says holds the name, wherever Postgres's `lower` and Rust's
+/// `to_lowercase` would disagree.
+pub const SELECT_PERSON_HOLDING_NAME: &str = "SELECT item_id::text AS item_id FROM ng_people \
+     WHERE lower(btrim(name)) = lower(btrim($1::text)) AND item_id <> $2::uuid LIMIT 1";
+
 /// How many devices name this person as their owner. `$1` is their Item id.
 ///
 /// Its own statement rather than a filter on the listing, because it is asked at
@@ -595,6 +605,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DEVICES_BY_NAME", SELECT_DEVICES_BY_NAME),
     ("SELECT_PEOPLE_WITH_COUNTS", SELECT_PEOPLE_WITH_COUNTS),
     ("SELECT_PERSON_WITH_COUNT", SELECT_PERSON_WITH_COUNT),
+    ("SELECT_PERSON_HOLDING_NAME", SELECT_PERSON_HOLDING_NAME),
     ("SELECT_OWNED_DEVICE_COUNT", SELECT_OWNED_DEVICE_COUNT),
     ("SELECT_DEVICE_EVENTS", SELECT_DEVICE_EVENTS),
     ("SELECT_SECURITY_EVENTS", SELECT_SECURITY_EVENTS),
