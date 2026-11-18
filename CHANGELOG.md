@@ -21,6 +21,29 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+### Fixed
+
+**Two people whose names differ only in case or surrounding spaces can no
+longer both exist, even when the two creates race.** The rule that "jamie " is
+Jamie (`assist::same_name`) was enforced only in the plugin:
+`find_or_create_person` read every person, found nobody by that name, and then
+created one. Two creates arriving together could both pass the read before
+either had written its `ng_people` mirror row, so both people were made, and
+nothing underneath said otherwise: `ng_people` had no uniqueness on the name.
+Migration 018 adds a unique index, `ng_people_name_key`, over
+`lower(btrim(name))`, the SQL spelling of the same rule. When the mirror write of
+a new person is refused, `find_or_create_person` takes back the Item it just
+created through the forms' existing undo and returns the person who won, so
+both callers are given the same person. A test holds the table locked until
+both creates are past the plugin's check, then releases it, so the race is
+exercised rather than hoped for.
+
+018 builds nothing over people who already share a name: it fails and names
+each of them (name and Item id), and changes nothing, so somebody can merge or
+rename them and run it again. Like 015's index it is guarded on ownership: a
+kernel role that does not own `ng_people` skips it, and the README's role
+section now has the statement for the table's owner to run.
+
 ## [1.1.0] - 2026-11-18
 
 The web interface: a site menu of Home, Devices, People, Alerts and Activity,
