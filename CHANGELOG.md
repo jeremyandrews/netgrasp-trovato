@@ -21,6 +21,25 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-18
+
+The web interface: a site menu of Home, Devices, People, Alerts and Activity,
+a Home that says who is home and what needs attention, one Devices
+page, People you can create, merge and delete, and an Alerts page with a Send
+test. Device data now needs a sign-in (see Changed). Every old path still
+answers.
+
+| | |
+|---|---|
+| Pairs with | netgraspd 1.1.0, `ng_` schema version 5 (reads version 4's notify tables, none of version 5's yet) |
+| Built against | Trovato 0.102.0, `trovato-sdk` revision `ca76a96`, `KERNEL_API_VERSION` (0, 102) |
+| Manifest | `version = "1.1.0"`, `api_version = "0.102"` |
+| Runs on | Trovato 0.102.0 or a later 0.x; tested on the `0.102.0` image, and installed on `0.104.0` |
+
+Upgrade the daemon to 1.1.0 and run its `migrate` first. An older daemon writes
+no delivery status and never answers a Send test, so the Alerts page has
+nothing to show for either.
+
 ### Added
 
 **One Alerts page, `/alerts`, in the site menu between People and Activity.**
