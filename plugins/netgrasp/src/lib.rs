@@ -234,6 +234,9 @@ pub fn tap_api(request: ApiRequest) -> ApiResponse {
 pub const RECORD_TYPES: &[&str] = &[
     "ng_device_state",
     "ng_event",
+    "ng_event_recent",
+    "ng_device_event",
+    "ng_security_event",
     "ng_presence",
     "ng_location",
     "ng_ip_history",
@@ -1241,6 +1244,64 @@ mod tests {
         }
     }
 
+    /// Since 020 the security list that /events/security reads and the
+    /// overview counts is one view, `ng_security_events`, and 021 takes the
+    /// gather's own filter away so the page's total is a count of that view and
+    /// nothing else.
+    #[test]
+    fn the_security_view_lists_exactly_the_declared_security_event_types() {
+        let views = include_str!("../migrations/020_netgrasp_event_views.sql");
+        let (_, view) = views
+            .split_once("CREATE OR REPLACE VIEW ng_security_events AS")
+            .unwrap_or_default();
+        let (view, overview) = view.split_once(';').unwrap_or_default();
+        for t in netgrasp_core::model::SECURITY_EVENT_TYPES {
+            assert!(
+                view.contains(&format!("'{t}'")),
+                "security event type {t} is missing from ng_security_events"
+            );
+        }
+        assert_eq!(
+            view.matches('\'').count(),
+            2 * netgrasp_core::model::SECURITY_EVENT_TYPES.len(),
+            "ng_security_events lists a type SECURITY_EVENT_TYPES does not: {view}"
+        );
+        // The overview's two security counts read the view, not their own list.
+        assert!(
+            overview.contains("(SELECT count(*) FROM ng_security_events)     AS security_events"),
+            "the overview's security total is not a count of the view: {overview}"
+        );
+        assert_eq!(overview.matches("FROM ng_security_events").count(), 2);
+        assert!(!overview.contains("'arp_scan'"), "{overview}");
+
+        let gathers = include_str!("../migrations/021_netgrasp_event_gathers_read_the_views.sql");
+        assert!(gathers.contains("'\"ng_security_event\"'"));
+        assert!(gathers.contains("'{filters}', '[]'::jsonb"));
+    }
+
+    /// /events and /events/device count at most 10000 rows, and say so. The
+    /// bound is the views' `LIMIT` in 020 and the number the two templates
+    /// print, which must be the same number or a page would say "10000+" of a
+    /// list that stops somewhere else.
+    #[test]
+    fn the_event_pages_print_the_bound_their_views_count_to() {
+        let views = include_str!("../migrations/020_netgrasp_event_views.sql");
+        let limits: Vec<&str> = views
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("LIMIT "))
+            .map(|l| l.trim_end_matches(';'))
+            .collect();
+        assert_eq!(limits, ["10000", "10000"], "{limits:?}");
+        for template in [
+            include_str!("../../../templates/gather/query--ng_event_log.html"),
+            include_str!("../../../templates/gather/query--ng_event_by_device.html"),
+        ] {
+            assert!(template.contains("total >= 10000"));
+            assert!(template.contains(">10000+</span>"));
+            assert!(template.contains("of the newest 10000"));
+        }
+    }
+
     /// The overview counts security events itself, in SQL, so the list is
     /// written there too and the count on the overview must be the pager total
     /// of the page it links to.
@@ -2056,6 +2117,74 @@ mod tests {
         );
         assert!(events.contains("href=\"/devices/todo\""), "{events}");
         assert!(events.contains("ng-menu__button"), "{events}");
+    }
+
+    /// **A bounded total says it is bounded.** /events and /events/device
+    /// count at most 10000 rows (020). Under the bound the count is exact and
+    /// reads as it always did; at the bound it reads "10000+" and the scope
+    /// says the list is the newest 10000, so no page prints a total it did not
+    /// count.
+    #[test]
+    fn the_event_log_and_a_device_say_when_their_count_stopped_at_the_bound() {
+        let tera = match tera::Tera::new("../../templates/**/*.html") {
+            Ok(t) => t,
+            Err(e) => panic!("the templates do not parse: {e}"),
+        };
+        let rows = serde_json::json!([
+            {"id": 2, "device_id": 7, "event_type": "ip_changed",
+             "timestamp_epoch": 1_757_000_100, "details": {"interface": "eth0"}}
+        ]);
+        let render = |template: &str, query_id: &str, total: u64, device: Option<&str>| {
+            let mut context = tera::Context::new();
+            context.insert("rows", &rows);
+            context.insert("total", &total);
+            context.insert("page", &1);
+            context.insert("total_pages", &total.div_ceil(100));
+            context.insert("base_path", "/events");
+            context.insert(
+                "query",
+                &serde_json::json!({"query_id": query_id, "label": "Events"}),
+            );
+            context.insert(
+                "filter_values",
+                &device.map_or_else(
+                    || serde_json::json!({}),
+                    |d| serde_json::json!({"device": d}),
+                ),
+            );
+            tera.render(template, &context)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#?}"))
+        };
+        for (template, query_id, device) in [
+            ("gather/query--ng_event_log.html", "ng_event_log", None),
+            (
+                "gather/query--ng_event_by_device.html",
+                "ng_event_by_device",
+                Some("7"),
+            ),
+        ] {
+            let under = render(template, query_id, 4321, device);
+            assert!(under.contains(">4321</span>"), "{under}");
+            assert!(!under.contains("10000+"), "{under}");
+            assert!(!under.contains("of the newest"), "{under}");
+
+            let at = render(template, query_id, 10_000, device);
+            assert!(at.contains(">10000+</span>"), "{at}");
+            assert!(
+                at.contains("showing 1 of the newest 10000, page 1 of 100"),
+                "{at}"
+            );
+            assert!(!at.contains(">10000</span>"), "{at}");
+        }
+        // Without a device the page lists every device's newest, and says so.
+        let all = render(
+            "gather/query--ng_event_by_device.html",
+            "ng_event_by_device",
+            12_345,
+            None,
+        );
+        assert!(all.contains(">12345</span>"), "{all}");
+        assert!(all.contains("every device's newest 10000"), "{all}");
     }
 
     /// **Activity renders**, with rows and without, and its tab strip marks

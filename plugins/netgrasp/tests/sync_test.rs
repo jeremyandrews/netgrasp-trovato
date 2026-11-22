@@ -6749,3 +6749,245 @@ fn the_alerts_pages_refuse_a_caller_without_the_permission_and_anonymous() {
         assert_eq!(device_flags(&pool, device).await, (false, true));
     });
 }
+
+// ===========================================================================
+// The event pages' SQL, as the kernel builds it, reads the daemon's indexes
+// ===========================================================================
+
+/// The daemon's indexes on `ng_events` the event pages rely on, in its own
+/// words (netgraspd V1 and V2). The plugin's 001 copy of the table carries
+/// none of them, and the plugin never creates one; the test does, as the
+/// daemon would have.
+const DAEMON_EVENT_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS ng_events_time_idx ON ng_events (\"timestamp\" DESC)",
+    "CREATE INDEX IF NOT EXISTS ng_events_device_idx ON ng_events (device_id, \"timestamp\" DESC)",
+    "CREATE INDEX IF NOT EXISTS ng_events_security_idx ON ng_events (event_type, \"timestamp\" DESC) \
+     WHERE event_type IN ('arp_scan', 'arp_spoof', 'rogue_dhcp', 'identity_change', \
+     'ip_conflict', 'gratuitous_arp')",
+];
+
+/// The two statements the kernel runs for page one of a record gather: the
+/// rows and the pager's `COUNT(*)`.
+///
+/// Built by the kernel's own `GatherQueryBuilder` from the gather as the
+/// migrations leave it, after the rewrite `GatherService` applies to a record
+/// gather (`resolve_record_context`, which is private, so its three steps are
+/// repeated here: the record type's relation becomes the base table, and each
+/// filter and sort field is mapped through the record type's field map). A
+/// `url_arg` filter gets its argument, as `resolve_contextual_values` gives it.
+async fn kernel_gather_sql(
+    pool: &PgPool,
+    query_id: &str,
+    url_args: &[(&str, &str)],
+) -> (String, String) {
+    use trovato_kernel::gather::types::ContextualValue;
+
+    let gather = wire_gather(pool).await;
+    let query = gather
+        .get_query(query_id)
+        .unwrap_or_else(|| panic!("{query_id} is not seeded"));
+    let disp = dispatcher();
+    let compiled = disp.runtime().get_plugin(PLUGIN).expect("plugin loaded");
+    let content_names: HashSet<String> = [DEVICE_TYPE.to_string(), PERSON_TYPE.to_string()].into();
+    let (registry, errors) = RecordTypeRegistry::build(
+        [(
+            PLUGIN,
+            compiled.db_policy().as_ref(),
+            compiled.info.record_types.as_slice(),
+        )],
+        &content_names,
+    );
+    assert!(errors.is_empty(), "record types rejected: {errors:?}");
+
+    let mut definition = query.definition.clone();
+    let record_type = definition
+        .record_type
+        .clone()
+        .unwrap_or_else(|| panic!("{query_id} is not a record gather"));
+    let record = registry
+        .get(&record_type)
+        .unwrap_or_else(|| panic!("{record_type} is not admitted"));
+    definition.base_table = record.table.clone();
+    definition.item_type = None;
+    definition.stage_aware = false;
+    for filter in &mut definition.filters {
+        if let Some(target) = record.resolve_field(&filter.field) {
+            filter.field = target.to_string();
+        }
+        if let FilterValue::Contextual(ContextualValue::UrlArg(name)) = &filter.value {
+            let value = url_args
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| (*v).to_string())
+                .unwrap_or_else(|| panic!("{query_id} needs ?{name}="));
+            filter.value = FilterValue::String(value);
+        }
+    }
+    for sort in &mut definition.sorts {
+        if let Some(target) = record.resolve_field(&sort.field) {
+            sort.field = target.to_string();
+        }
+    }
+    let per_page = query.display.items_per_page;
+    let builder = trovato_kernel::gather::GatherQueryBuilder::new(
+        definition,
+        Uuid::parse_str(LIVE_STAGE).unwrap(),
+    );
+    (
+        format!(
+            "SELECT row_to_json(t) FROM ({}) t",
+            builder.build(1, per_page)
+        ),
+        builder.build_count(),
+    )
+}
+
+/// The plan of `sql` with sequential scans and explicit sorts priced out. The
+/// test tables hold a handful of rows and have no statistics, so the planner
+/// would otherwise scan or sort them whatever their indexes; pricing both out
+/// leaves it an index and its order wherever one serves the statement, and a
+/// statement that sorts on the unindexed epoch twin still plans that sort.
+async fn plan_with_indexes_preferred(pool: &PgPool, sql: &str) -> String {
+    let mut tx = pool.begin().await.unwrap();
+    for set in [
+        "SET LOCAL enable_seqscan = off",
+        "SET LOCAL enable_sort = off",
+    ] {
+        sqlx::query(set).execute(&mut *tx).await.unwrap();
+    }
+    let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_else(|e| panic!("EXPLAIN {sql}: {e}"));
+    tx.rollback().await.unwrap();
+    lines.join("\n")
+}
+
+/// **The event pages read the daemon's indexes.** For /events, one device's
+/// /events/device and /events/security, both statements a page runs, the
+/// rows and the pager's total, exactly as the kernel builds them from the
+/// gathers and record types the plugin ships, plan onto the daemon's time,
+/// device and security indexes, and neither sorts nor compares the unindexed
+/// `timestamp_epoch`. The two totals that could count the whole log stop at a
+/// bound. Against the gathers as they were before 020 and 021 every one of
+/// these statements sorted or counted all of `ng_events`.
+///
+/// The security page's total is the overview's `security_events`: the same
+/// statement over the same view, so the same number.
+#[test]
+fn the_event_pages_as_the_kernel_runs_them_read_the_daemons_indexes() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        for ddl in DAEMON_EVENT_INDEXES {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        let device = seed_device(&pool, "aa:bb:cc:00:24:01", None, "online").await;
+        for (event_type, ago) in [
+            ("ip_changed", 10),
+            ("arp_scan", 20),
+            ("arp_spoof", 30),
+            ("name_updated", 40),
+            ("identity_change", 90_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+                 VALUES ($1, $2, to_timestamp($3))",
+            )
+            .bind(device)
+            .bind(event_type)
+            .bind((now() - ago) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let device_arg = device.to_string();
+
+        for (query_id, args, index, rows_in_index_order, bounded_count) in [
+            ("ng_event_log", vec![], "ng_events_time_idx", true, true),
+            (
+                "ng_event_by_device",
+                vec![("device", device_arg.as_str())],
+                "ng_events_device_idx",
+                false,
+                true,
+            ),
+            ("ng_event_security", vec![], "ng_events_", true, false),
+        ] {
+            let (rows_sql, count_sql) = kernel_gather_sql(&pool, query_id, &args).await;
+            for (what, sql) in [("rows", &rows_sql), ("count", &count_sql)] {
+                let plan = plan_with_indexes_preferred(&pool, sql).await;
+                assert!(plan.contains(index), "{query_id} {what}: {sql}\n{plan}");
+                assert!(
+                    !plan.contains("Seq Scan on ng_events"),
+                    "{query_id} {what}: {sql}\n{plan}"
+                );
+                assert!(
+                    !plan.contains("timestamp_epoch"),
+                    "{query_id} {what} sorts or compares the unindexed twin: {sql}\n{plan}"
+                );
+            }
+            if rows_in_index_order {
+                let plan = plan_with_indexes_preferred(&pool, &rows_sql).await;
+                assert!(
+                    !plan.contains("Sort"),
+                    "{query_id}: the index gives the order: {rows_sql}\n{plan}"
+                );
+            }
+            if bounded_count {
+                let plan = plan_with_indexes_preferred(&pool, &count_sql).await;
+                assert!(
+                    plan.contains("Limit"),
+                    "{query_id}'s total is not bounded: {count_sql}\n{plan}"
+                );
+            }
+        }
+
+        // One statement for the security total, on the page and the overview.
+        let (_, security_count) = kernel_gather_sql(&pool, "ng_event_security", &[]).await;
+        assert_eq!(
+            security_count,
+            "SELECT COUNT(*) FROM \"ng_security_events\""
+        );
+        let plan = plan_with_indexes_preferred(&pool, &security_count).await;
+        assert!(plan.contains("ng_events_security_idx"), "{plan}");
+        let overview: String = sqlx::query_scalar("SELECT pg_get_viewdef('ng_overview'::regclass)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            overview.contains("FROM ng_security_events) AS security_events"),
+            "{overview}"
+        );
+
+        let gather = wire_gather(&pool).await;
+        let context = QueryContext {
+            viewer: Some(network_viewer()),
+            ..QueryContext::default()
+        };
+        let page = gather
+            .execute(
+                "ng_event_security",
+                1,
+                HashMap::new(),
+                Uuid::parse_str(LIVE_STAGE).unwrap(),
+                &context,
+            )
+            .await
+            .unwrap();
+        let on_overview: i64 = sqlx::query_scalar("SELECT security_events FROM ng_home")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.total, on_overview as u64);
+
+        for ddl in [
+            "DROP INDEX IF EXISTS ng_events_time_idx",
+            "DROP INDEX IF EXISTS ng_events_device_idx",
+            "DROP INDEX IF EXISTS ng_events_security_idx",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+    });
+}

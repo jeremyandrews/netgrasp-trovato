@@ -11,21 +11,28 @@
 
 {# An unresolved `url_arg` filter is dropped rather than matched as empty, so
    this route with no `device` returns the whole event log rather than none. #}
+{# The total is bounded: the gather reads each device's newest 10000 events
+   (ng_device_events, 020_netgrasp_event_views.sql), so a device with more
+   shows "10000+" and the scope says the list is its newest 10000. #}
 {% block summary %}
 <div class="ng-summary">
     <span class="ng-summary__item">
+        {%- if filter_values.device and total >= 10000 %}
+        <span class="ng-summary__count" title="At least 10000: the count stops there">10000+</span>
+        {%- else %}
         <span class="ng-summary__count">{{ total }}</span>
+        {%- endif %}
         <span class="ng-summary__label">
             {%- if filter_values.device -%}
             event{{ total | pluralize }} for device
             <span class="ng-id-chip">#{{ filter_values.device }}</span>
             {%- else -%}
-            events — no device given, so this is the whole log
+            events — no device given, so this is every device's newest 10000
             {%- endif -%}
         </span>
     </span>
     <span class="ng-summary__scope">
-        showing {{ rows | length }}, page {{ page }} of {{ total_pages }}
+        showing {{ rows | length }}{% if filter_values.device and total >= 10000 %} of the newest 10000{% endif %}, page {{ page }} of {{ total_pages }}
         &middot; <a href="/events">full event log</a>
     </span>
 </div>

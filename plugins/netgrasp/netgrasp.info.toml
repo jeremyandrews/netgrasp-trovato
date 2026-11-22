@@ -92,6 +92,8 @@ files = [
     "migrations/017_netgrasp_drop_duplicate_open_indexes.sql",
     "migrations/018_netgrasp_one_person_per_name.sql",
     "migrations/019_netgrasp_movements_by_person_index.sql",
+    "migrations/020_netgrasp_event_views.sql",
+    "migrations/021_netgrasp_event_gathers_read_the_views.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -175,6 +177,12 @@ db_tables = [
     # answer. Neither holds the topic or the token.
     "ng_notify_status",
     "ng_notify_requests",
+    # The event pages' three views (020): the newest 10,000 events, each
+    # device's newest 10,000, and the security events. Declared for the same
+    # reason as the overview's views: each backs a record type below.
+    "ng_events_recent",
+    "ng_device_events",
+    "ng_security_events",
 ]
 
 # Lightweight record types (P11g / D-53).
@@ -191,7 +199,9 @@ db_tables = [
 # the structured `db` host decodes a fixed type list and falls through to a
 # string decode, which a `timestamptz` fails, so it arrives as null; the gather
 # path wraps the query in Postgres' `row_to_json`, so it arrives as an ISO 8601
-# string. The epoch twin is the same integer on both.
+# string. The epoch twin is the same integer on both. (Three event record types
+# map a `timestamp` field to `"timestamp"` itself, to sort on it; it is never
+# what a page prints. They say why where they are declared.)
 #
 # `id_column`, `created_column` and `changed_column` are declared on every record
 # type below rather than defaulted. Their defaults are `id`, `created` and
@@ -247,18 +257,87 @@ search = "search_text"
 
 # The event log. High-volume, never edited, deleted wholesale on a retention
 # timer — the case the record tier exists for (DESIGN.md Decision 2).
+#
+# `created_column` and `changed_column` name `"timestamp"`, the column the
+# daemon indexes (ng_events_time_idx): the record admin's listing is `ORDER BY
+# {changed_column} DESC LIMIT n`, which over the unindexed `timestamp_epoch`
+# sorted the whole table to show its first rows. The listing prints only the id
+# and the title, so the `timestamptz` is never decoded.
+#
+# The `timestamp` field still maps to `timestamp_epoch` here, because this
+# record type now backs only /activity and /events/new-devices, whose filters
+# name `new_device` and no daemon index serves. A sort on `"timestamp"` makes
+# the planner walk the time index looking for rare rows, which is slower than
+# the scan it replaces (021 says more). The three event pages an index can
+# answer read the record types below.
 [[record_types]]
 name = "ng_event"
 table = "ng_events"
 id_column = "id"
 title_column = "event_type"
-created_column = "timestamp_epoch"
-changed_column = "timestamp_epoch"
+created_column = "timestamp"
+changed_column = "timestamp"
 
 [record_types.fields]
 device_id = "device_id"
 event_type = "event_type"
 timestamp = "timestamp_epoch"
+details = "details"
+notified = "notified"
+
+# The event pages that read a daemon index (020, 021). Each is an `ng_event`
+# over a view, with one difference that is the point: the `timestamp` field
+# maps to `"timestamp"`, so a gather's sort on it is `ORDER BY "timestamp"` and
+# the daemon's time index (or its device index, a device's events by time)
+# serves it. Nothing filters on that field: a filter would compare a
+# `timestamptz`, which a number or a date string from a gather cannot match.
+# The rows still carry `timestamp_epoch`, which is what every template prints.
+#
+# /events: the newest 10,000 events.
+[[record_types]]
+name = "ng_event_recent"
+table = "ng_events_recent"
+id_column = "id"
+title_column = "event_type"
+created_column = "timestamp"
+changed_column = "timestamp"
+
+[record_types.fields]
+device_id = "device_id"
+event_type = "event_type"
+timestamp = "timestamp"
+details = "details"
+notified = "notified"
+
+# /events/device: one device's newest 10,000 events.
+[[record_types]]
+name = "ng_device_event"
+table = "ng_device_events"
+id_column = "id"
+title_column = "event_type"
+created_column = "timestamp"
+changed_column = "timestamp"
+
+[record_types.fields]
+device_id = "device_id"
+event_type = "event_type"
+timestamp = "timestamp"
+details = "details"
+notified = "notified"
+
+# /events/security: every security event. The overview counts the same view.
+[[record_types]]
+name = "ng_security_event"
+table = "ng_security_events"
+id_column = "id"
+title_column = "event_type"
+created_column = "timestamp"
+changed_column = "timestamp"
+
+[record_types.fields]
+device_id = "device_id"
+event_type = "event_type"
+timestamp = "timestamp"
 details = "details"
 notified = "notified"
 
