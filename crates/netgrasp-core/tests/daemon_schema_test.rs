@@ -878,10 +878,11 @@ async fn unlinking_a_deleted_items_row_re_dirties_it() {
 // Events
 // ===========================================================================
 
-/// Retention, over `timestamp_epoch`. Comparing the cutoff against the
-/// `timestamptz` itself would not have compiled in Postgres' eyes — `bigint`
-/// against `timestamptz` has no operator — so this is the one place the old
-/// schema mismatch would have failed loudly rather than silently.
+/// Retention, over `"timestamp"`. The cutoff is unix seconds and the column a
+/// `timestamptz`, so the statement converts the cutoff once with
+/// `to_timestamp`; comparing the two bare would not compile in Postgres' eyes
+/// (`bigint` against `timestamptz` has no operator), which is what keeps this
+/// the one place a schema mismatch fails loudly rather than silently.
 #[tokio::test]
 async fn expired_events_prune_and_current_ones_do_not() {
     let mut conn = daemon_db("retention").await;
@@ -2420,4 +2421,220 @@ async fn an_existing_duplicate_stops_the_migration_and_is_named() {
             .await
             .is_empty()
     );
+}
+
+// ===========================================================================
+// The per-minute reads use the daemon's indexes
+// ===========================================================================
+//
+// The fixture carries the daemon's tables but not its indexes on `ng_events`,
+// so these tests create the two they rely on, in the daemon's own words: V1's
+// time index and V5's person column with its partial index. Each asserts the
+// plan with sequential scans priced out (`enable_seqscan = off`). That does not
+// force an index the statement cannot use; it only stops a scratch table of a
+// few rows from being cheaper to scan. A statement that cannot use the index
+// still plans a sequential scan, and the assertion catches it.
+
+/// netgraspd V1: `CREATE INDEX ng_events_time_idx …`.
+const DAEMON_V1_EVENT_TIME_INDEX: &str =
+    "CREATE INDEX ng_events_time_idx ON ng_events (\"timestamp\" DESC)";
+
+/// netgraspd V5: the person column on events and its partial index.
+const DAEMON_V5_EVENT_PERSON: &str = "ALTER TABLE ng_events ADD COLUMN person_item_id UUID; \
+     CREATE INDEX ng_events_person_idx ON ng_events (person_item_id, \"timestamp\" DESC) \
+     WHERE person_item_id IS NOT NULL";
+
+/// The plugin's 014: the merge record and the movements view that reads it.
+const PEOPLE_MIGRATION: &str =
+    include_str!("../../../plugins/netgrasp/migrations/014_netgrasp_people.sql");
+
+/// The plugin's 019: the movements view through the person index.
+const MOVEMENTS_BY_PERSON_INDEX: &str =
+    include_str!("../../../plugins/netgrasp/migrations/019_netgrasp_movements_by_person_index.sql");
+
+/// The plan Postgres chooses for `sql`, as text, with sequential scans priced
+/// out. `sql` may carry `$n` parameters; they are bound as the host binds them.
+async fn plan_without_seqscan(conn: &mut PgConnection, sql: &str, params: &[Value]) -> String {
+    conn.execute("SET enable_seqscan = off").await.unwrap();
+    let explain = format!("EXPLAIN {sql}");
+    let lines: Vec<String> = bind_json(params, sqlx::query(&explain))
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect();
+    conn.execute("RESET enable_seqscan").await.unwrap();
+    lines.join("\n")
+}
+
+/// The prune runs every minute and nearly always deletes nothing. It must find
+/// that out from the daemon's time index, not from a scan of the whole log:
+/// against the unindexed epoch twin it read the 4-million-row table every tick.
+#[tokio::test]
+async fn the_prune_finds_expired_events_through_the_daemons_time_index() {
+    let mut conn = daemon_db("prune_index").await;
+    sqlx::raw_sql(DAEMON_V1_EVENT_TIME_INDEX)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let cutoff = netgrasp_core::retention::cutoff(now(), 90);
+    let plan = plan_without_seqscan(
+        &mut conn,
+        queries::DELETE_EXPIRED_EVENTS,
+        &[json!(cutoff), json!(netgrasp_core::retention::PRUNE_BATCH)],
+    )
+    .await;
+    assert!(plan.contains("ng_events_time_idx"), "{plan}");
+    assert!(!plan.contains("Seq Scan on ng_events"), "{plan}");
+}
+
+/// Seed the same five events into whichever schema `conn` is on: two
+/// movements today (one of them by a person merged into another), one
+/// yesterday, and two events that are not movements at all.
+async fn seed_movements(conn: &mut PgConnection, with_person_column: bool) {
+    exec(
+        conn,
+        "INSERT INTO ng_people (item_id, name, state) VALUES ($1::uuid, 'Resident', 'home')",
+        &[json!(ITEM_A)],
+    )
+    .await;
+    exec(
+        conn,
+        "INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name) \
+         VALUES ($1::uuid, $2::uuid, 'Former name')",
+        &[json!(ITEM_B), json!(ITEM_A)],
+    )
+    .await;
+    let phone = seed_device(conn, "02:00:5e:00:16:01", Some("phone"), now()).await;
+    for (event_type, at, person) in [
+        (
+            "person_arrived",
+            "date_trunc('day', now()) + interval '1 minute'",
+            Some(ITEM_A),
+        ),
+        (
+            "person_departed",
+            "date_trunc('day', now()) + interval '2 minutes'",
+            Some(ITEM_B),
+        ),
+        (
+            "person_arrived",
+            "date_trunc('day', now()) - interval '1 hour'",
+            Some(ITEM_A),
+        ),
+        (
+            "ip_changed",
+            "date_trunc('day', now()) + interval '3 minutes'",
+            None,
+        ),
+        (
+            "arp_scan",
+            "date_trunc('day', now()) + interval '4 minutes'",
+            None,
+        ),
+    ] {
+        let details = match person {
+            Some(id) => json!({"person": "Resident", "person_item_id": id, "via": "AP"}),
+            None => json!({}),
+        };
+        let (column, value) = if with_person_column {
+            (", person_item_id", ", $4::uuid")
+        } else {
+            ("", "")
+        };
+        let sql = format!(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details{column}) \
+             VALUES ($1::bigint, $2, {at}, $3::jsonb{value})"
+        );
+        let mut params = vec![json!(phone), json!(event_type), details];
+        if with_person_column {
+            params.push(person.map_or(Value::Null, |p| json!(p)));
+        }
+        exec(conn, &sql, &params).await;
+    }
+}
+
+/// Today's movements, as the overview's include asks for them.
+const TODAYS_MOVEMENTS: &str = "SELECT event_type, person_item_id, person_name, device_mac \
+     FROM ng_person_movements WHERE day = to_char(now(), 'YYYY-MM-DD') ORDER BY timestamp_epoch";
+
+async fn todays_movements(
+    conn: &mut PgConnection,
+) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
+    sqlx::query_as(TODAYS_MOVEMENTS)
+        .fetch_all(conn)
+        .await
+        .unwrap()
+}
+
+/// 019 changes how the movements view is read and nothing about what it
+/// returns: over a V5 daemon it answers from the person index, with the same
+/// rows, names and merge attribution 014 gives over a V4 one.
+#[tokio::test]
+async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
+    // V4 daemon: 019 finds no person column and leaves 014's view alone.
+    let mut v4 = scratch(
+        "movements_v4",
+        &format!("{DAEMON_SCHEMA}\n{OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"),
+    )
+    .await;
+    let before: String =
+        sqlx::query_scalar("SELECT pg_get_viewdef('ng_person_movements'::regclass)")
+            .fetch_one(&mut v4)
+            .await
+            .unwrap();
+    sqlx::raw_sql(MOVEMENTS_BY_PERSON_INDEX)
+        .execute(&mut v4)
+        .await
+        .expect("019 applies over a daemon without the person column");
+    let after: String =
+        sqlx::query_scalar("SELECT pg_get_viewdef('ng_person_movements'::regclass)")
+            .fetch_one(&mut v4)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "019 changed the view over a V4 daemon");
+    seed_movements(&mut v4, false).await;
+    let expected = todays_movements(&mut v4).await;
+
+    // V5 daemon: the same events, the person column set the way the daemon sets it.
+    let mut v5 = scratch(
+        "movements_v5",
+        &format!(
+            "{DAEMON_SCHEMA}\n{DAEMON_V1_EVENT_TIME_INDEX};\n{DAEMON_V5_EVENT_PERSON};\n\
+             {OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"
+        ),
+    )
+    .await;
+    for _ in 0..2 {
+        sqlx::raw_sql(MOVEMENTS_BY_PERSON_INDEX)
+            .execute(&mut v5)
+            .await
+            .expect("019 applies, and applies again");
+    }
+    seed_movements(&mut v5, true).await;
+    let got = todays_movements(&mut v5).await;
+
+    assert_eq!(got, expected, "019 changed what the view returns");
+    assert_eq!(
+        got.len(),
+        2,
+        "today's two movements, not yesterday's: {got:?}"
+    );
+    assert_eq!(
+        got[1].1.as_deref(),
+        Some(ITEM_A),
+        "a merged person's movement is attributed to the kept person"
+    );
+
+    let plan = plan_without_seqscan(&mut v5, TODAYS_MOVEMENTS, &[]).await;
+    assert!(plan.contains("ng_events_person_idx"), "{plan}");
+    assert!(!plan.contains("Seq Scan on ng_events"), "{plan}");
+
+    // The overview counts the same movements through the same view.
+    let count: i64 = sqlx::query_scalar("SELECT movements_today FROM ng_overview")
+        .fetch_one(&mut v5)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
 }

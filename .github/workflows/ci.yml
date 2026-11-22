@@ -146,9 +146,12 @@ jobs:
           grep -q "the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema ... ok" test.log \
             || { echo "::error::the schema drift check did not pass"; exit 1; }
           # 018: one person per name, and an existing duplicate named, not deleted.
+          # The per-minute prune and the overview's movements read an index.
           for t in \
             one_person_per_name_is_enforced_by_the_index \
-            an_existing_duplicate_stops_the_migration_and_is_named
+            an_existing_duplicate_stops_the_migration_and_is_named \
+            the_prune_finds_expired_events_through_the_daemons_time_index \
+            movements_read_the_daemons_person_index_and_return_the_same_rows
           do
             grep -q "$t ... ok" test.log \
               || { echo "::error::$t did not pass"; exit 1; }
@@ -326,6 +329,15 @@ jobs:
           for _ in 1 2; do
             psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
               -f plugins/netgrasp/migrations/007_netgrasp_overview_views.sql
+          done
+          rows=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -tAc "select count(*) from ng_overview")
+          test "$rows" = "1"
+          # 019 rewrites the movements view only where the daemon's V5 person
+          # column exists. 001's tables are V4, so here it must be a no-op, twice.
+          for _ in 1 2; do
+            psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+              -f plugins/netgrasp/migrations/019_netgrasp_movements_by_person_index.sql
           done
           rows=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
             -tAc "select count(*) from ng_overview")
