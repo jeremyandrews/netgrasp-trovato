@@ -39,8 +39,8 @@ use serde_json::json;
 use trovato_sdk::types::{ApiRequest, ApiResponse};
 
 use crate::forms::{
-    DEVICE_NOTIFY, FORMS_SCRIPT, PERSON_NOTIFY, done, escape_html, field, problem, resolve_device,
-    sorted_people, themed,
+    DEVICE_NOTIFY, FORMS_SCRIPT, PERSON_NOTIFY, PERSON_PRESENCE, done, escape_html, field, problem,
+    resolve_device, sorted_people, themed,
 };
 use crate::people_forms::{back_or, device_meta, fields, token_and_back};
 use crate::{assist_host, db};
@@ -240,9 +240,18 @@ pub(crate) fn render(view: &AlertsView, token: &str) -> String {
 fn person_block(person: &PersonFacts, view: &AlertsView, token: &str) -> String {
     let name = escape_html(&person.name);
     let id = escape_html(&person.item_id);
-    let mut out = format!(
-        "<li class=\"ng-alerts__person\"><h3><a href=\"/item/{id}\">{name}</a></h3><ul class=\"ng-alerts__rules\">"
-    );
+    let mut out =
+        format!("<li class=\"ng-alerts__person\"><h3><a href=\"/item/{id}\">{name}</a></h3>");
+    // An untracked person never arrives or leaves, so their rules never fire.
+    // Say so rather than list them as if they would; never "away".
+    if netgrasp_core::presence::state_label(person.state.as_deref()) == "Not tracked" {
+        out.push_str(&format!(
+            "<p class=\"ng-alerts__presence\">Not tracked: nobody is told when {name} \
+             arrives or leaves until <a href=\"{PERSON_PRESENCE}?target={id}&amp;back={ALERTS}\">\
+             tracking is on for them</a>.</p>"
+        ));
+    }
+    out.push_str("<ul class=\"ng-alerts__rules\">");
     // Each switch posts both flags, because the person notify save reads both:
     // an absent one is off. So turning one off carries the other as it is.
     let switch = |arrive: bool, depart: bool, label: &str| {
@@ -765,6 +774,27 @@ mod tests {
             .expect(&html);
         assert!(arrive_switch.contains("name=\"depart\" value=\"1\""));
         assert!(!arrive_switch.contains("name=\"arrive\""));
+    }
+
+    /// An untracked person is listed as not tracked, never as away, and the
+    /// page links to the switch; a tracked one carries no such line.
+    #[test]
+    fn an_untracked_person_is_not_tracked_on_the_alerts_page() {
+        let mut v = view();
+        v.people = vec![jamie(true, false)];
+        let html = render(&v, "tok");
+        assert!(
+            html.contains("Not tracked: nobody is told when Jamie arrives"),
+            "{html}"
+        );
+        assert!(html.contains("/netgrasp/person/presence?target="), "{html}");
+        assert!(!html.contains("Away"), "{html}");
+
+        let mut home = jamie(true, false);
+        home.state = Some("home".into());
+        v.people = vec![home];
+        let html = render(&v, "tok");
+        assert!(!html.contains("Not tracked"), "{html}");
     }
 
     #[test]

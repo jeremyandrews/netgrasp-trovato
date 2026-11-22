@@ -54,6 +54,17 @@ const PLUGIN_MIGRATION: &str =
 const NOTIFY_MIGRATION: &str =
     include_str!("../../../plugins/netgrasp/migrations/015_netgrasp_notify_schema.sql");
 
+/// The plugin's guarded copy of the columns netgraspd V5 and V7 added: V5's
+/// person epochs and event person column only with no daemon, V7's
+/// `counts_for_presence` and `track_presence` always (022).
+const PRESENCE_SCHEMA: &str =
+    include_str!("../../../plugins/netgrasp/migrations/022_netgrasp_presence_schema.sql");
+
+/// The plugin's presence views (023): `ng_presence_tracking()`, the third
+/// person state on every view that lists people, and the gathers that read them.
+const PRESENCE_VIEWS: &str =
+    include_str!("../../../plugins/netgrasp/migrations/023_netgrasp_presence_views.sql");
+
 /// The plugin's overview views, applied on top of the daemon's DDL: the
 /// assistant's overview reads select from them, and they are defined over the
 /// daemon's tables, so the daemon's schema is the one they have to hold on.
@@ -295,17 +306,18 @@ async fn the_sync_pass_reads_a_dirty_device_row_with_both_timestamps() {
     );
 
     // And the rest of the user-owned set, which the mint carries onto a new
-    // Item. `notify` is the one that matters: the column is NOT NULL DEFAULT
-    // TRUE, so a projection that omitted it would have the mint claim `false`
-    // about every device the daemon has ever seen.
+    // Item. `notify` is NOT NULL, DEFAULT FALSE since the daemon's V6, so a
+    // projection that omitted it would decode as `None` here rather than the
+    // column's value. `counts_for_presence` (V7) is NULL, "by device type".
     assert_eq!(
         row.notify,
-        Some(true),
+        Some(false),
         "notify is not projected, so a minted Item cannot carry it"
     );
     assert_eq!(row.hidden, Some(false));
     assert_eq!(row.notes, None);
     assert_eq!(row.owner_item_id, None);
+    assert_eq!(row.counts_for_presence, None);
     assert_eq!(row.overlay().columns(), ["hidden", "notify"]);
 }
 
@@ -319,7 +331,7 @@ async fn the_sync_pass_reads_the_user_owned_columns_a_mint_has_to_carry() {
     exec(
         &mut conn,
         "UPDATE ng_devices SET owner_item_id = $1::uuid, notes = $2::text, \
-         hidden = TRUE, notify = FALSE WHERE id = $3::bigint",
+         hidden = TRUE, notify = FALSE, counts_for_presence = TRUE WHERE id = $3::bigint",
         &[json!(PERSON), json!("in the hall cupboard"), json!(id)],
     )
     .await;
@@ -334,16 +346,24 @@ async fn the_sync_pass_reads_the_user_owned_columns_a_mint_has_to_carry() {
     assert_eq!(row.notes.as_deref(), Some("in the hall cupboard"));
     assert_eq!(row.hidden, Some(true));
     assert_eq!(row.notify, Some(false));
+    assert_eq!(row.counts_for_presence, Some(true));
 
     let overlay = row.overlay();
     assert_eq!(
         overlay.columns(),
-        ["hidden", "notes", "notify", "owner_item_id"]
+        [
+            "counts_for_presence",
+            "hidden",
+            "notes",
+            "notify",
+            "owner_item_id"
+        ]
     );
     let fields = netgrasp_core::writeback::device_item_fields(&row.mac, &overlay);
     assert_eq!(fields["field_owner"], PERSON);
     assert_eq!(fields["field_notify"], false);
     assert_eq!(fields["field_hidden"], true);
+    assert_eq!(fields["field_counts_for_presence"], "counts");
 }
 
 /// The two statements that address a device row by its primary key. A `::uuid`
@@ -815,8 +835,9 @@ async fn the_person_mirror_upserts_and_retires_without_touching_the_daemons_colu
     assert_eq!(name, "Jeremy");
     assert_eq!(notes.as_deref(), Some("household"));
     assert!(notify);
+    // `untracked`, the column's default since the daemon's V7.
     assert_eq!(
-        state, "away",
+        state, "untracked",
         "the mirror upsert overwrote a daemon-owned column of ng_people"
     );
 
@@ -1007,7 +1028,7 @@ async fn the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema() {
     let mut daemon = scratch("copy_daemon", DAEMON_SCHEMA).await;
     let mut plugin = scratch(
         "copy_plugin",
-        &format!("{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}"),
+        &format!("{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{PRESENCE_SCHEMA}"),
     )
     .await;
 
@@ -2121,6 +2142,11 @@ async fn the_alerting_devices_are_counted_and_listed_by_owner() {
         .execute(&mut conn)
         .await
         .unwrap();
+    // Alerts are off by default since the daemon's V6; these are on.
+    sqlx::query("UPDATE ng_devices SET notify = TRUE")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     sqlx::query("UPDATE ng_devices SET hidden = TRUE WHERE id = $1")
         .bind(hidden)
         .execute(&mut conn)
@@ -2262,7 +2288,8 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
         .unwrap();
 
     let applied = sqlx::raw_sql(&format!(
-        "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}\n{ONE_PERSON_PER_NAME}"
+        "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}\n{ONE_PERSON_PER_NAME}\n\
+         {PRESENCE_SCHEMA}\n{PRESENCE_SCHEMA}"
     ))
     .execute(&mut conn)
     .await;
@@ -2278,7 +2305,7 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
         .await
         .unwrap();
 
-    applied.expect("001, 015, 017 and 018 apply as a role that owns no daemon table");
+    applied.expect("001, 015, 017, 018 and 022 apply as a role that owns no daemon table");
     assert_eq!(presence, ["ng_presence_open_idx"]);
     assert_eq!(location, ["ng_location_history_open_idx"]);
     assert!(
@@ -2427,9 +2454,9 @@ async fn an_existing_duplicate_stops_the_migration_and_is_named() {
 // The per-minute reads use the daemon's indexes
 // ===========================================================================
 //
-// The fixture carries the daemon's tables but not its indexes on `ng_events`,
-// so these tests create the two they rely on, in the daemon's own words: V1's
-// time index and V5's person column with its partial index. Each asserts the
+// The fixture carries the daemon's tables and V5's person index on `ng_events`
+// but not V1's time index, so the prune test creates that one in the daemon's
+// own words. Each asserts the
 // plan with sequential scans priced out (`enable_seqscan = off`). That does not
 // force an index the statement cannot use; it only stops a scratch table of a
 // few rows from being cheaper to scan. A statement that cannot use the index
@@ -2439,10 +2466,10 @@ async fn an_existing_duplicate_stops_the_migration_and_is_named() {
 const DAEMON_V1_EVENT_TIME_INDEX: &str =
     "CREATE INDEX ng_events_time_idx ON ng_events (\"timestamp\" DESC)";
 
-/// netgraspd V5: the person column on events and its partial index.
-const DAEMON_V5_EVENT_PERSON: &str = "ALTER TABLE ng_events ADD COLUMN person_item_id UUID; \
-     CREATE INDEX ng_events_person_idx ON ng_events (person_item_id, \"timestamp\" DESC) \
-     WHERE person_item_id IS NOT NULL";
+/// The fixture is the daemon at V7, which has V5's person column on events and
+/// its partial index. This takes them away again, to stand in for a V4 daemon.
+const DAEMON_V4_EVENTS: &str = "DROP INDEX ng_events_person_idx; \
+     ALTER TABLE ng_events DROP COLUMN person_item_id";
 
 /// The plugin's 014: the merge record and the movements view that reads it.
 const PEOPLE_MIGRATION: &str =
@@ -2576,7 +2603,7 @@ async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
     // V4 daemon: 019 finds no person column and leaves 014's view alone.
     let mut v4 = scratch(
         "movements_v4",
-        &format!("{DAEMON_SCHEMA}\n{OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"),
+        &format!("{DAEMON_SCHEMA}\n{DAEMON_V4_EVENTS};\n{OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"),
     )
     .await;
     let before: String =
@@ -2601,7 +2628,7 @@ async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
     let mut v5 = scratch(
         "movements_v5",
         &format!(
-            "{DAEMON_SCHEMA}\n{DAEMON_V1_EVENT_TIME_INDEX};\n{DAEMON_V5_EVENT_PERSON};\n\
+            "{DAEMON_SCHEMA}\n{DAEMON_V1_EVENT_TIME_INDEX};\n\
              {OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"
         ),
     )
@@ -2990,4 +3017,326 @@ async fn the_event_views_list_what_the_table_does_up_to_their_bound() {
             .unwrap();
     assert_eq!(total, 4, "the overview's total is the page's");
     assert_eq!(day, 3, "the identity change was more than a day ago");
+}
+
+// ===========================================================================
+// U18: presence is opt in
+// ===========================================================================
+//
+// netgraspd V7 added `ng_people.track_presence` and
+// `ng_devices.counts_for_presence`, both the plugin's to write, and a third
+// person state, `untracked`. These hold the plugin's half: both settings reach
+// their columns the way `notify` and `notify_arrive` do, and nobody untracked
+// is counted as home or as away.
+
+/// Stand-ins for the three kernel tables the plugin's view migrations write to
+/// (`gather_query`, `url_alias`, `role_permissions`), so 006, 012, 013 and 023
+/// apply in a scratch schema. What they write there is not read; the views and
+/// the function are.
+const KERNEL_TABLE_STUBS: &str = "CREATE TABLE gather_query (query_id TEXT PRIMARY KEY, \
+     label TEXT, description TEXT, definition JSONB NOT NULL DEFAULT '{}'::jsonb, \
+     display JSONB NOT NULL DEFAULT '{}'::jsonb, plugin TEXT, created BIGINT, changed BIGINT); \
+     CREATE TABLE url_alias (id UUID, source TEXT, alias TEXT, language TEXT, stage_id UUID, \
+     created BIGINT, UNIQUE (alias, language, stage_id)); \
+     CREATE TABLE role_permissions (role_id UUID, permission TEXT)";
+
+/// The views 023 builds on: 006's owner view, 012's listed view, 013's Home row.
+const OWNER_VIEW: &str =
+    include_str!("../../../plugins/netgrasp/migrations/006_netgrasp_owner_names.sql");
+const LISTED_VIEWS: &str =
+    include_str!("../../../plugins/netgrasp/migrations/012_netgrasp_device_tabs_search.sql");
+const HOME_VIEW: &str = include_str!("../../../plugins/netgrasp/migrations/013_netgrasp_home.sql");
+
+/// The plugin's views in manifest order up to 023, over `daemon`.
+fn presence_ddl(daemon: &str) -> String {
+    format!(
+        "{daemon}\n{KERNEL_TABLE_STUBS};\n{OWNER_VIEW}\n{OVERVIEW_VIEWS}\n{LISTED_VIEWS}\n\
+         {HOME_VIEW}\n{PRESENCE_SCHEMA}\n{PRESENCE_VIEWS}"
+    )
+}
+
+/// A schema with the daemon's V7 tables and the plugin's presence views, 023
+/// applied twice because it must be safe to.
+async fn presence_db(test: &str) -> PgConnection {
+    scratch(
+        test,
+        &format!("{}\n{PRESENCE_VIEWS}", presence_ddl(DAEMON_SCHEMA)),
+    )
+    .await
+}
+
+/// A person's "Track whether they are home" reaches `ng_people.track_presence`
+/// through the same upsert that carries `notify_arrive`, and a person saved
+/// without it is not tracked.
+#[tokio::test]
+async fn the_person_mirror_carries_track_presence() {
+    let mut conn = presence_db("track_presence").await;
+    async fn read(conn: &mut PgConnection) -> Result<(bool, bool), sqlx::Error> {
+        sqlx::query_as(
+            "SELECT track_presence, notify_arrive FROM ng_people WHERE item_id = $1::uuid",
+        )
+        .bind(Uuid::parse_str(PERSON).unwrap())
+        .fetch_one(conn)
+        .await
+    }
+    for (track, arrive) in [(true, true), (false, true), (true, false)] {
+        let Statement { sql, params, .. } = build_person_upsert(&json!({
+            "id": PERSON,
+            "title": "Resident",
+            "fields": {
+                "field_notify_arrive": {"value": arrive},
+                "field_track_presence": {"value": track},
+            },
+        }))
+        .unwrap();
+        bind_json(&params, sqlx::query(&sql))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(read(&mut conn).await.unwrap(), (track, arrive));
+    }
+
+    // An Item from before the field existed is not tracked: off by default.
+    let Statement { sql, params, .. } = build_person_upsert(&json!({
+        "id": PERSON,
+        "title": "Resident",
+        "fields": {"field_notify_arrive": true},
+    }))
+    .unwrap();
+    bind_json(&params, sqlx::query(&sql))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(read(&mut conn).await.unwrap(), (false, true));
+}
+
+/// The device's three choices reach `ng_devices.counts_for_presence` as NULL,
+/// TRUE and FALSE, and read back as the same choice, through both write paths:
+/// the cron sync's whole-Item write-back and a form's one-column edit.
+#[tokio::test]
+async fn the_three_presence_choices_round_trip_through_the_device_column() {
+    use netgrasp_core::model::DeviceEdit;
+    use netgrasp_core::presence::PresenceChoice;
+    use netgrasp_core::writeback::build_partial_update;
+
+    let mut conn = presence_db("counts_choice").await;
+    let id = seed_device(&mut conn, "02:00:5e:00:18:01", Some("demo-phone"), now()).await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET trovato_item_id = $1::uuid WHERE id = $2::bigint",
+        &[json!(ITEM_A), json!(id)],
+    )
+    .await;
+
+    #[derive(serde::Deserialize)]
+    struct Presence {
+        counts_for_presence: Option<bool>,
+        device_type: Option<String>,
+    }
+    async fn read(conn: &mut PgConnection, id: i64) -> Presence {
+        let rows: Vec<Presence> =
+            query_rows(conn, queries::SELECT_DEVICE_PRESENCE, &[json!(id)]).await;
+        rows.into_iter().next().unwrap()
+    }
+
+    // A device nobody chose for decides by type, and the seed is a phone.
+    let row = read(&mut conn, id).await;
+    assert_eq!(row.counts_for_presence, None);
+    assert_eq!(
+        netgrasp_core::presence::effective_description(
+            row.counts_for_presence,
+            row.device_type.as_deref()
+        ),
+        "Counts: phone"
+    );
+
+    for choice in [
+        PresenceChoice::DoesNotCount,
+        PresenceChoice::Counts,
+        PresenceChoice::ByType,
+    ] {
+        // The sync's path: the whole Item, read the way the sync reads it.
+        let mut item = device_item(ITEM_A, "Demo phone");
+        item["fields"]["field_counts_for_presence"] = json!({"value": choice.as_value()});
+        let stmt = build_update(ITEM_A, &overlay_from_item(&item).unwrap(), None).unwrap();
+        bind_json(&stmt.params, sqlx::query(&stmt.sql))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let row = read(&mut conn, id).await;
+        assert_eq!(
+            PresenceChoice::from_override(row.counts_for_presence),
+            choice
+        );
+
+        // A form's path: a sparse edit naming this one column.
+        exec(
+            &mut conn,
+            "UPDATE ng_devices SET counts_for_presence = NULL, notes = 'kept' WHERE id = $1::bigint",
+            &[json!(id)],
+        )
+        .await;
+        let edit = DeviceEdit {
+            counts_for_presence: Some(choice.to_override()),
+            ..DeviceEdit::default()
+        };
+        let stmt = build_partial_update(ITEM_A, &edit, None).unwrap();
+        assert_eq!(
+            stmt.columns,
+            ["counts_for_presence"],
+            "the edit wrote more than its column"
+        );
+        bind_json(&stmt.params, sqlx::query(&stmt.sql))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let row = read(&mut conn, id).await;
+        assert_eq!(
+            PresenceChoice::from_override(row.counts_for_presence),
+            choice
+        );
+        let notes: Option<String> =
+            sqlx::query_scalar("SELECT notes FROM ng_devices WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            notes.as_deref(),
+            Some("kept"),
+            "the sparse edit touched another column"
+        );
+    }
+}
+
+/// Somebody untracked is counted as neither home nor away, on Home's row and on
+/// the people view, and is listed after both.
+#[tokio::test]
+async fn untracked_people_are_counted_as_neither_home_nor_away() {
+    let mut conn = presence_db("untracked_counts").await;
+    for (id, name, state, track) in [
+        (ITEM_A, "Resident A", "home", true),
+        (ITEM_B, "Resident B", "away", true),
+        (PERSON, "Resident C", "untracked", false),
+    ] {
+        exec(
+            &mut conn,
+            "INSERT INTO ng_people (item_id, name, state, track_presence) \
+             VALUES ($1::uuid, $2, $3, $4::boolean)",
+            &[json!(id), json!(name), json!(state), json!(track)],
+        )
+        .await;
+    }
+
+    let (total, home, away, untracked): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT people_total, people_home, people_away, people_untracked FROM ng_home_presence",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!((total, home, away, untracked), (3, 1, 1, 1));
+
+    let listed: Vec<(String, String, bool, i32)> = sqlx::query_as(
+        "SELECT name, state, track_presence, state_rank FROM ng_people_presence_status \
+         ORDER BY state_rank, name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        listed,
+        [
+            ("Resident A".to_string(), "home".to_string(), true, 0),
+            ("Resident B".to_string(), "away".to_string(), true, 1),
+            ("Resident C".to_string(), "untracked".to_string(), false, 2),
+        ]
+    );
+
+    // The device-shaped who-is-home reads `owner_state`: an untracked owner's
+    // online device does not make them home.
+    let device = seed_device(&mut conn, "02:00:5e:00:18:02", Some("demo-laptop"), now()).await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET owner_item_id = $1::uuid WHERE id = $2::bigint",
+        &[json!(PERSON), json!(device)],
+    )
+    .await;
+    let owner_state: Option<String> =
+        sqlx::query_scalar("SELECT owner_state FROM ng_devices_listed_presence WHERE id = $1")
+            .bind(device)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(owner_state.as_deref(), Some("untracked"));
+}
+
+/// The install's switch reads as the daemon published it, and as NULL when no
+/// daemon has: Home's "tracking is off" line is drawn only for FALSE.
+#[tokio::test]
+async fn the_install_switch_reads_as_published_and_null_without_a_daemon() {
+    let mut conn = presence_db("global_switch").await;
+    async fn read(conn: &mut PgConnection) -> Result<Option<bool>, sqlx::Error> {
+        sqlx::query_scalar("SELECT presence_tracking FROM ng_home_presence")
+            .fetch_one(conn)
+            .await
+    }
+    assert_eq!(read(&mut conn).await.unwrap(), None, "no status row yet");
+
+    exec(
+        &mut conn,
+        "INSERT INTO ng_daemon_status (version, timezone, timezone_source, started_at, updated_at) \
+         VALUES ('test', 'UTC', 'config', now(), now())",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        read(&mut conn).await.unwrap(),
+        Some(false),
+        "off by default"
+    );
+
+    exec(
+        &mut conn,
+        "UPDATE ng_daemon_status SET presence_tracking = TRUE",
+        &[],
+    )
+    .await;
+    assert_eq!(read(&mut conn).await.unwrap(), Some(true));
+    let via_query: Option<bool> = sqlx::query_scalar(queries::SELECT_PRESENCE_TRACKING)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(via_query, Some(true));
+
+    // With no ng_daemon_status table at all, the demo's case, the views still
+    // build and the switch is NULL.
+    let mut bare = scratch(
+        "global_switch_bare",
+        &presence_ddl(&format!("{DAEMON_SCHEMA}\nDROP TABLE ng_daemon_status;")),
+    )
+    .await;
+    assert_eq!(read(&mut bare).await.unwrap(), None);
+}
+
+/// 022 over a daemon older than V7, as the tables' owner: it adds V7's two
+/// columns with V7's defaults, so the plugin can be installed first; over the
+/// V7 daemon it changes nothing.
+#[tokio::test]
+async fn the_presence_schema_adds_v7_columns_to_an_older_daemon_and_is_idempotent() {
+    let older = "ALTER TABLE ng_devices DROP COLUMN counts_for_presence; \
+                 ALTER TABLE ng_people DROP COLUMN track_presence; \
+                 CREATE TABLE refinery_schema_history (version INT4 PRIMARY KEY)";
+    let mut conn = scratch(
+        "presence_older",
+        &format!("{DAEMON_SCHEMA}\n{older};\n{PRESENCE_SCHEMA}\n{PRESENCE_SCHEMA}"),
+    )
+    .await;
+    let mut v7 = scratch("presence_v7", DAEMON_SCHEMA).await;
+    for table in ["ng_devices", "ng_people", "ng_events"] {
+        assert_eq!(
+            columns_of(&mut conn, "presence_older", table).await,
+            columns_of(&mut v7, "presence_v7", table).await,
+            "{table}"
+        );
+    }
 }

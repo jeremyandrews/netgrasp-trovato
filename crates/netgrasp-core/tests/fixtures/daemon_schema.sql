@@ -1,5 +1,12 @@
--- The netgrasp daemon's schema, milestones 1 through 3 and the notify tables
--- of V4, exactly as the daemon creates them.
+-- The netgrasp daemon's schema as of its V7 (netgraspd#34, presence opt in):
+-- V1 through V3, the notify tables of V4, V5's person epochs, event person and
+-- daemon status, V6's notify default and V7's presence columns, exactly as the
+-- daemon creates them. Until U18 this file stopped at V4, with V4's
+-- `notify DEFAULT TRUE`; it is now brought fully up to date.
+--
+-- Column order within a table is the order the faithful-copy test compares, so
+-- the columns later versions added with `ALTER TABLE … ADD COLUMN` come last,
+-- in the order they were added, which is where the daemon puts them too.
 --
 -- This is the canonical text. It is NOT the plugin's migration: the plugin ships
 -- a guarded copy in plugins/netgrasp/migrations/001_netgrasp_schema.sql so an
@@ -24,7 +31,8 @@ CREATE TABLE ng_devices (
     display_name           TEXT,
     notes                  TEXT,
     hidden                 BOOLEAN     NOT NULL DEFAULT FALSE,
-    notify                 BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- V6: off by default.
+    notify                 BOOLEAN     NOT NULL DEFAULT FALSE,
     owner_item_id          UUID,
     -- daemon owned identity
     resolved_name          TEXT,
@@ -53,7 +61,10 @@ CREATE TABLE ng_devices (
     first_seen_at_epoch    BIGINT GENERATED ALWAYS AS
         (EXTRACT(EPOCH FROM (first_seen_at AT TIME ZONE 'UTC'))::bigint) STORED,
     last_seen_at_epoch     BIGINT GENERATED ALWAYS AS
-        (EXTRACT(EPOCH FROM (last_seen_at AT TIME ZONE 'UTC'))::bigint) STORED
+        (EXTRACT(EPOCH FROM (last_seen_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    -- V7, user owned: NULL decides by device type (phone and wearable count),
+    -- TRUE counts for whether the owner is home, FALSE does not.
+    counts_for_presence    BOOLEAN
 );
 
 CREATE TABLE ng_presence (
@@ -80,7 +91,9 @@ CREATE TABLE ng_events (
     notified        BOOLEAN     NOT NULL DEFAULT FALSE,
     sync_state      TEXT        NOT NULL DEFAULT 'dirty',
     timestamp_epoch BIGINT GENERATED ALWAYS AS
-        (EXTRACT(EPOCH FROM ("timestamp" AT TIME ZONE 'UTC'))::bigint) STORED
+        (EXTRACT(EPOCH FROM ("timestamp" AT TIME ZONE 'UTC'))::bigint) STORED,
+    -- V5: the person a person_arrived / person_departed event is about.
+    person_item_id  UUID
 );
 
 CREATE TABLE ng_ip_history (
@@ -117,10 +130,18 @@ CREATE TABLE ng_people (
     notes            TEXT,
     notify_arrive    BOOLEAN NOT NULL DEFAULT FALSE,
     notify_depart    BOOLEAN NOT NULL DEFAULT FALSE,
-    state            TEXT    NOT NULL DEFAULT 'away',
+    -- V7: 'home', 'away' or 'untracked'; everyone starts untracked.
+    state            TEXT    NOT NULL DEFAULT 'untracked',
     current_location TEXT,
     last_arrived_at  TIMESTAMPTZ,
-    last_departed_at TIMESTAMPTZ
+    last_departed_at TIMESTAMPTZ,
+    -- V5: epoch twins.
+    last_arrived_at_epoch  BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_arrived_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    last_departed_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_departed_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    -- V7, user owned: whether this person's presence is tracked at all.
+    track_presence   BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- At most one open row per device, on both timelines that have one, under the
@@ -130,6 +151,10 @@ CREATE UNIQUE INDEX ng_presence_open_idx
     ON ng_presence (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
 CREATE UNIQUE INDEX ng_location_history_open_idx
     ON ng_location_history (device_id) WHERE ended_at IS NULL AND is_summary = FALSE;
+
+-- V5: a person's movements, read by the plugin's movements view (019).
+CREATE INDEX ng_events_person_idx ON ng_events (person_item_id, "timestamp" DESC)
+    WHERE person_item_id IS NOT NULL;
 
 -- V4: whether alerts can be delivered, and a test somebody asked for. Daemon
 -- owned, except that the plugin inserts ng_notify_requests rows. The daemon
@@ -162,3 +187,39 @@ CREATE TABLE ng_notify_requests (
 );
 CREATE INDEX ng_notify_requests_pending_idx ON ng_notify_requests (id)
     WHERE handled_at IS NULL;
+
+-- V5: what the daemon is and how it is configured, one row. V7 adds the
+-- install's presence switch (`presence_tracking` in netgraspd's config), which
+-- the plugin reads through `ng_presence_tracking()` (023).
+CREATE TABLE ng_daemon_status (
+    id                BIGINT      PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version           TEXT        NOT NULL,
+    timezone          TEXT        NOT NULL,
+    timezone_source   TEXT        NOT NULL,
+    started_at        TIMESTAMPTZ NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    started_at_epoch  BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (started_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    updated_at_epoch  BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (updated_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    presence_tracking BOOLEAN     NOT NULL DEFAULT FALSE
+);
+
+-- V5: one row per enricher, daemon owned. The plugin does not read it yet.
+CREATE TABLE ng_enrichment_status (
+    enricher              TEXT        PRIMARY KEY,
+    configured            BOOLEAN     NOT NULL,
+    state                 TEXT        NOT NULL,
+    polls                 BIGINT      NOT NULL DEFAULT 0,
+    failures              BIGINT      NOT NULL DEFAULT 0,
+    last_success_at       TIMESTAMPTZ,
+    last_failure_at       TIMESTAMPTZ,
+    last_error            TEXT,
+    updated_at            TIMESTAMPTZ NOT NULL,
+    last_success_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_success_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    last_failure_at_epoch BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (last_failure_at AT TIME ZONE 'UTC'))::bigint) STORED,
+    updated_at_epoch      BIGINT GENERATED ALWAYS AS
+        (EXTRACT(EPOCH FROM (updated_at AT TIME ZONE 'UTC'))::bigint) STORED
+);

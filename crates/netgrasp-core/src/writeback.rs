@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use crate::columns::USER_OWNED;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{DeviceEdit, DeviceOverlay};
+use crate::presence::PresenceChoice;
 
 /// Item field names carrying the device overlay.
 ///
@@ -41,6 +42,9 @@ pub const FIELD_NOTES: &str = "field_notes";
 pub const FIELD_HIDDEN: &str = "field_hidden";
 /// Whether the device's arrivals and departures are notable.
 pub const FIELD_NOTIFY: &str = "field_notify";
+/// Whether the device decides if its owner is home: `by_type`, `counts` or
+/// `does_not_count` ([`crate::presence::PresenceChoice`]).
+pub const FIELD_COUNTS_FOR_PRESENCE: &str = "field_counts_for_presence";
 
 /// Person Item fields.
 pub const FIELD_PERSON_NOTES: &str = "field_notes";
@@ -48,6 +52,16 @@ pub const FIELD_PERSON_NOTES: &str = "field_notes";
 pub const FIELD_NOTIFY_ARRIVE: &str = "field_notify_arrive";
 /// Whether to announce this person leaving.
 pub const FIELD_NOTIFY_DEPART: &str = "field_notify_depart";
+/// Whether to keep track of whether this person is home.
+pub const FIELD_TRACK_PRESENCE: &str = "field_track_presence";
+
+/// A device Item's presence choice. An absent or blank field is "by device
+/// type", the column's `NULL`.
+#[must_use]
+pub fn field_presence(item: &Value) -> PresenceChoice {
+    field_str(item, FIELD_COUNTS_FOR_PRESENCE)
+        .map_or(PresenceChoice::ByType, |v| PresenceChoice::parse(&v))
+}
 
 /// A statement ready for the `db` host: SQL with `$n` placeholders, its bound
 /// parameters, and the user-owned columns it writes.
@@ -125,6 +139,7 @@ pub fn overlay_from_item(item: &Value) -> CoreResult<DeviceOverlay> {
         notes: field_str(item, FIELD_NOTES),
         hidden: field_bool(item, FIELD_HIDDEN),
         notify: field_bool(item, FIELD_NOTIFY),
+        counts_for_presence: field_presence(item).to_override(),
     })
 }
 
@@ -246,6 +261,13 @@ pub fn build_partial_update(
             ),
             "hidden" => (json!(edit.hidden.unwrap_or_default()), "boolean"),
             "notify" => (json!(edit.notify.unwrap_or_default()), "boolean"),
+            // Nullable on purpose: NULL is "by device type", not "no".
+            "counts_for_presence" => (
+                edit.counts_for_presence
+                    .flatten()
+                    .map_or(Value::Null, |v| json!(v)),
+                "boolean",
+            ),
             // Unreachable while USER_OWNED and DeviceEdit agree — `names`
             // answers false for anything else, so this arm is only reached by a
             // column added to USER_OWNED and to `names` but not to here. The
@@ -305,6 +327,12 @@ pub fn device_item_fields(mac: &str, overlay: &DeviceEdit) -> Value {
     if let Some(notify) = overlay.notify {
         fields.insert(FIELD_NOTIFY.to_string(), json!(notify));
     }
+    if let Some(counts) = overlay.counts_for_presence {
+        fields.insert(
+            FIELD_COUNTS_FOR_PRESENCE.to_string(),
+            json!(PresenceChoice::from_override(counts).as_value()),
+        );
+    }
     Value::Object(fields)
 }
 
@@ -363,13 +391,31 @@ pub fn merged_device_fields(
         None => row.notify.unwrap_or_default(),
     };
 
-    json!({
+    // Three-way like the others, with one difference: a row read that did not
+    // select the column (`None`) leaves the field out rather than inventing
+    // "by device type" for it.
+    let presence = match edit.counts_for_presence {
+        Some(counts) => Some(PresenceChoice::from_override(counts)),
+        None if field(existing, FIELD_COUNTS_FOR_PRESENCE).is_some() => {
+            Some(field_presence(existing))
+        }
+        None => row.counts_for_presence.map(PresenceChoice::from_override),
+    };
+
+    let mut fields = json!({
         FIELD_MAC: mac,
         FIELD_OWNER: owner,
         FIELD_NOTES: notes,
         FIELD_HIDDEN: hidden,
         FIELD_NOTIFY: notify,
-    })
+    });
+    if let (Some(choice), Some(map)) = (presence, fields.as_object_mut()) {
+        map.insert(
+            FIELD_COUNTS_FOR_PRESENCE.to_string(),
+            json!(choice.as_value()),
+        );
+    }
+    fields
 }
 
 /// Build the statement mirroring an `ng_person` Item into `ng_people`.
@@ -402,16 +448,19 @@ pub fn build_person_upsert(item: &Value) -> CoreResult<Statement> {
         "notes".to_string(),
         "notify_arrive".to_string(),
         "notify_depart".to_string(),
+        "track_presence".to_string(),
     ];
 
     Ok(Statement {
-        sql: "INSERT INTO ng_people (item_id, name, notes, notify_arrive, notify_depart) \
-              VALUES ($1::uuid, $2::text, $3::text, $4::boolean, $5::boolean) \
+        sql: "INSERT INTO ng_people \
+                  (item_id, name, notes, notify_arrive, notify_depart, track_presence) \
+              VALUES ($1::uuid, $2::text, $3::text, $4::boolean, $5::boolean, $6::boolean) \
               ON CONFLICT (item_id) DO UPDATE SET \
                   name = EXCLUDED.name, \
                   notes = EXCLUDED.notes, \
                   notify_arrive = EXCLUDED.notify_arrive, \
-                  notify_depart = EXCLUDED.notify_depart"
+                  notify_depart = EXCLUDED.notify_depart, \
+                  track_presence = EXCLUDED.track_presence"
             .to_string(),
         params: vec![
             json!(id),
@@ -419,6 +468,7 @@ pub fn build_person_upsert(item: &Value) -> CoreResult<Statement> {
             field_str(item, FIELD_PERSON_NOTES).map_or(Value::Null, |v| json!(v)),
             json!(field_bool(item, FIELD_NOTIFY_ARRIVE)),
             json!(field_bool(item, FIELD_NOTIFY_DEPART)),
+            json!(field_bool(item, FIELD_TRACK_PRESENCE)),
         ],
         columns,
     })

@@ -154,7 +154,12 @@ jobs:
             movements_read_the_daemons_person_index_and_return_the_same_rows \
             the_assistants_event_reads_are_bounded_by_the_daemons_indexes \
             the_event_views_read_the_daemons_indexes \
-            the_event_views_list_what_the_table_does_up_to_their_bound
+            the_event_views_list_what_the_table_does_up_to_their_bound \
+            the_person_mirror_carries_track_presence \
+            the_three_presence_choices_round_trip_through_the_device_column \
+            untracked_people_are_counted_as_neither_home_nor_away \
+            the_install_switch_reads_as_published_and_null_without_a_daemon \
+            the_presence_schema_adds_v7_columns_to_an_older_daemon_and_is_idempotent
           do
             grep -q "$t ... ok" test.log \
               || { echo "::error::$t did not pass"; exit 1; }
@@ -237,6 +242,19 @@ jobs:
             the_alerts_page_reads_the_daemons_notify_status \
             a_test_request_is_inserted_and_its_outcome_read_back \
             recently_sent_lists_only_delivered_events_in_the_daemons_words
+          do
+            grep -q "$t ... ok" test.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+      # Presence is opt in (U18): both settings reach both tiers through the
+      # forms, and nobody untracked is home or away on any page, with the
+      # install's switch off said in one line. Named for the same reason.
+      - name: The presence suite proved both settings, Not tracked and the switch
+        run: |
+          for t in \
+            the_presence_forms_write_both_tiers_and_round_trip_the_three_choices \
+            untracked_people_are_not_tracked_everywhere_and_the_switch_off_is_said
           do
             grep -q "$t ... ok" test.log \
               || { echo "::error::$t did not pass"; exit 1; }
@@ -344,6 +362,32 @@ jobs:
             psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
               -f plugins/netgrasp/migrations/019_netgrasp_movements_by_person_index.sql
           done
+          rows=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+            -tAc "select count(*) from ng_overview")
+          test "$rows" = "1"
+
+      # 022 is netgraspd V7's presence settings (U18), guarded the way 015 is.
+      # With no daemon (no refinery_schema_history) it also adds the V5 columns
+      # 001's tables lack and V7's `untracked` default; a second run is a no-op.
+      # 023 writes kernel tables and is exercised by the test suite and the demo.
+      - name: The presence schema migration applies, twice
+        env:
+          PGPASSWORD: trovato
+        run: |
+          for _ in 1 2; do
+            psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
+              -f plugins/netgrasp/migrations/022_netgrasp_presence_schema.sql
+          done
+          n=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 -tAc \
+            "select count(*) from information_schema.columns where (table_name, column_name) in \
+             (('ng_devices', 'counts_for_presence'), ('ng_people', 'track_presence'), \
+              ('ng_people', 'last_arrived_at_epoch'), ('ng_events', 'person_item_id'))")
+          test "$n" = "4"
+          d=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 -tAc \
+            "select column_default from information_schema.columns \
+             where table_name = 'ng_people' and column_name = 'state'")
+          test "$d" = "'untracked'::text"
+          # The views 007 built still answer over the widened tables.
           rows=$(psql -h localhost -U trovato -d netgrasp_migrations -v ON_ERROR_STOP=1 \
             -tAc "select count(*) from ng_overview")
           test "$rows" = "1"

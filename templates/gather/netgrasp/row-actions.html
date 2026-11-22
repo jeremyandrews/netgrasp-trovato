@@ -116,9 +116,11 @@
                 {%- elif ng_row_notify %}Mute alerts
                 {%- else %}Unmute alerts{% endif -%}
             </a></li>
+            <li><a href="/netgrasp/device/presence?back={{ ng_back }}&amp;target={{ ng_target }}">Counts for who is home&hellip;</a></li>
             {%- else %}
             <li><a href="/netgrasp/person/rename?back={{ ng_back }}&amp;target={{ ng_target }}">Rename&hellip;</a></li>
             <li><a href="/netgrasp/person/notify?back={{ ng_back }}&amp;target={{ ng_target }}">Arrival alerts&hellip;</a></li>
+            <li><a href="/netgrasp/person/presence?back={{ ng_back }}&amp;target={{ ng_target }}">Track whether they are home&hellip;</a></li>
             {#
                 Merge and delete open a page that says what will change; the
                 page's button is the change. Neither is ever one click.

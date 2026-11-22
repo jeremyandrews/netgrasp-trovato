@@ -94,6 +94,8 @@ files = [
     "migrations/019_netgrasp_movements_by_person_index.sql",
     "migrations/020_netgrasp_event_views.sql",
     "migrations/021_netgrasp_event_gathers_read_the_views.sql",
+    "migrations/022_netgrasp_presence_schema.sql",
+    "migrations/023_netgrasp_presence_views.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -171,6 +173,13 @@ db_tables = [
     # view joins it so a merged person's past arrivals belong to the person
     # kept, without rewriting the daemon's events.
     "ng_person_merge",
+    # The three relations the presence record types read since 023: each is the
+    # view above it plus the presence columns (the person's switch, the
+    # install's, the owner's state). New views rather than columns added in
+    # place, because 006, 007, 012 and 013 must stay re-runnable (023 explains).
+    "ng_people_presence_status",
+    "ng_home_presence",
+    "ng_devices_listed_presence",
     # netgraspd's notify tables (its schema V4; 015 is the guarded copy). The
     # Alerts page reads whether delivery is configured from ng_notify_status,
     # and Send test inserts one row into ng_notify_requests for the daemon to
@@ -218,10 +227,12 @@ db_tables = [
 # the plugin's own statements name ng_devices directly.
 #
 # Since 012 it is `ng_devices_listed`: that same owner view, ng_devices_with_owner,
-# plus the lower-cased `search_text` the Devices search box filters on.
+# plus the lower-cased `search_text` the Devices search box filters on. Since 023
+# it is `ng_devices_listed_presence`, that plus the owner's `owner_state`, which
+# Who is home filters on.
 [[record_types]]
 name = "ng_device_state"
-table = "ng_devices_listed"
+table = "ng_devices_listed_presence"
 id_column = "id"
 title_column = "mac"
 created_column = "first_seen_at_epoch"
@@ -247,6 +258,9 @@ owner_id = "owner_item_id"
 # Exposed so a gather can sort and filter on it, which is what lets
 # /who-is-home order its cards by name rather than by uuid.
 owner_name = "owner_name"
+# The owner's ng_people.state (023), so the device-shaped Who is home lists only
+# the people the daemon counts as home.
+owner_state = "owner_state"
 hidden = "hidden"
 notify = "notify"
 item_id = "trovato_item_id"
@@ -444,7 +458,7 @@ current_location = "current_location"
 # One person, with the arrival times as epoch twins ng_people itself lacks.
 [[record_types]]
 name = "ng_person_presence"
-table = "ng_people_presence"
+table = "ng_people_presence_status"
 id_column = "item_id"
 title_column = "name"
 created_column = "last_arrived_at_epoch"
@@ -458,6 +472,11 @@ current_location = "current_location"
 last_arrived = "last_arrived_at_epoch"
 last_departed = "last_departed_at_epoch"
 devices_online = "devices_online"
+# 023: the person's own switch, the install's, and home/away/untracked as 0/1/2
+# so /people/home can list everybody in that order.
+track_presence = "track_presence"
+presence_tracking = "presence_tracking"
+state_rank = "state_rank"
 
 # One arrival or departure, with its `details` lifted into columns.
 [[record_types]]
@@ -508,10 +527,11 @@ search = "search_text"
 
 # The overview's single row. Its columns are counts, which is the only way a
 # gather page gets a number that is not a pager total.
-# Declared over `ng_home` since 013: the same row plus Home's own counts.
+# Declared over `ng_home` since 013: the same row plus Home's own counts; over
+# `ng_home_presence` since 023, which adds the untracked people and the switch.
 [[record_types]]
 name = "ng_overview"
-table = "ng_home"
+table = "ng_home_presence"
 id_column = "id"
 title_column = "today"
 created_column = "generated_at_epoch"
@@ -534,3 +554,8 @@ devices_unsorted = "devices_unsorted"
 arp_spoof_24h = "arp_spoof_24h"
 ip_conflict_24h = "ip_conflict_24h"
 rogue_dhcp_24h = "rogue_dhcp_24h"
+# 023: the people nobody is tracking, and whether the install tracks anybody.
+untracked_state = "untracked_state"
+presence_tracking = "presence_tracking"
+people_away = "people_away"
+people_untracked = "people_untracked"

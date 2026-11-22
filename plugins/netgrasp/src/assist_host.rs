@@ -794,16 +794,25 @@ pub(crate) fn person_payload(
         )
     });
 
+    // Start from every field the Item already has, so a field this function
+    // does not name (`field_track_presence`, and whatever comes after it)
+    // survives a rename or an alerts edit: the kernel replaces `fields`
+    // wholesale on save.
+    let mut fields = existing
+        .get("fields")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    fields.insert("field_notes".into(), json!(notes));
+    fields.insert("field_notify_arrive".into(), json!(arrive));
+    fields.insert("field_notify_depart".into(), json!(depart));
+
     json!({
         "id": item_id,
         "type": PERSON_TYPE,
         "title": title,
         "status": existing.get("status").and_then(Value::as_i64).unwrap_or(1),
-        "fields": {
-            "field_notes": notes,
-            "field_notify_arrive": arrive,
-            "field_notify_depart": depart,
-        }
+        "fields": fields,
     })
 }
 

@@ -71,18 +71,21 @@ SELECT
     v.fields::jsonb
 FROM (VALUES
     ('5eed0000-0000-4000-8000-000000000001', 'Jamie',  86400 * 30,
-     '{"field_notes": "Works from the studio most days.", "field_notify_arrive": true, "field_notify_depart": true}'),
+     '{"field_notes": "Works from the studio most days.", "field_notify_arrive": true, "field_notify_depart": true, "field_track_presence": true}'),
     ('5eed0000-0000-4000-8000-000000000002', 'Aurora', 86400 * 25,
-     '{"field_notes": "", "field_notify_arrive": true, "field_notify_depart": false}'),
+     '{"field_notes": "", "field_notify_arrive": true, "field_notify_depart": false, "field_track_presence": false}'),
     ('5eed0000-0000-4000-8000-000000000003', 'Arlo',   86400 * 25,
-     '{"field_notes": "Tablet is on the guest VLAN.", "field_notify_arrive": false, "field_notify_depart": false}')
+     '{"field_notes": "Tablet is on the guest VLAN.", "field_notify_arrive": false, "field_notify_depart": false, "field_track_presence": true}')
 ) AS v(id, title, age, fields);
 
-INSERT INTO ng_people (item_id, name, notes, notify_arrive, notify_depart, state, current_location, last_arrived_at)
+-- Presence is opt in (netgraspd V7): Jamie and Arlo are tracked, Aurora is
+-- not, so the People pages show all three states, Home, Away and Not tracked.
+-- An untracked person has no location; the daemon clears it.
+INSERT INTO ng_people (item_id, name, notes, notify_arrive, notify_depart, state, current_location, last_arrived_at, track_presence)
 VALUES
-    ('5eed0000-0000-4000-8000-000000000001', 'Jamie',  'Works from the studio most days.', TRUE,  TRUE,  'home', 'Studio',      NOW() - INTERVAL '3 hours'),
-    ('5eed0000-0000-4000-8000-000000000002', 'Aurora', NULL,                               TRUE,  FALSE, 'home', 'Living room', NOW() - INTERVAL '40 minutes'),
-    ('5eed0000-0000-4000-8000-000000000003', 'Arlo',   'Tablet is on the guest VLAN.',     FALSE, FALSE, 'away', NULL,          NOW() - INTERVAL '2 days');
+    ('5eed0000-0000-4000-8000-000000000001', 'Jamie',  'Works from the studio most days.', TRUE,  TRUE,  'home',      'Studio', NOW() - INTERVAL '3 hours',    TRUE),
+    ('5eed0000-0000-4000-8000-000000000002', 'Aurora', NULL,                               TRUE,  FALSE, 'untracked', NULL,     NOW() - INTERVAL '40 minutes', FALSE),
+    ('5eed0000-0000-4000-8000-000000000003', 'Arlo',   'Tablet is on the guest VLAN.',     FALSE, FALSE, 'away',      NULL,     NOW() - INTERVAL '2 days',     TRUE);
 
 -- ---------------------------------------------------------------------------
 -- Twelve devices: four states, seven types, three owners
@@ -340,6 +343,9 @@ JOIN ng_devices d ON d.mac = v.mac;
 -- through. The times agree with the people rows above: Jamie home three hours,
 -- Aurora forty minutes, Arlo left this morning after a night home.
 --
+-- Since its V5 the daemon also sets the `person_item_id` column, which the
+-- movements view reads through its index (019).
+--
 -- Since netgraspd's schema V4 the daemon also names the device (`device_name`)
 -- and, for a departure, when it was last heard from (`last_seen_at`), which is
 -- what the alert text and the Alerts page's "Recently sent" read. Arlo's phone
@@ -350,7 +356,12 @@ JOIN ng_devices d ON d.mac = v.mac;
 UPDATE ng_people SET last_departed_at = NOW() - INTERVAL '5 hours'
 WHERE item_id = '5eed0000-0000-4000-8000-000000000003';
 
-INSERT INTO ng_events (device_id, event_type, "timestamp", details, notified, sync_state)
+-- Arlo's only device is a tablet, which by type does not count for whether he
+-- is home; somebody chose that it does, so he is tracked by it. Jamie is
+-- tracked by type, by his phone.
+UPDATE ng_devices SET counts_for_presence = TRUE WHERE mac = '02:00:5e:00:00:04';
+
+INSERT INTO ng_events (device_id, event_type, "timestamp", details, notified, sync_state, person_item_id)
 SELECT d.id, v.event_type, NOW() - (v.ago || ' minutes')::interval,
        jsonb_build_object(
            'person', v.person,
@@ -364,7 +375,7 @@ SELECT d.id, v.event_type, NOW() - (v.ago || ' minutes')::interval,
                          || ' minutes')::interval) AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS"Z"')
        ),
-       TRUE, 'clean'
+       TRUE, 'clean', v.person_item_id::uuid
 FROM (VALUES
     ('02:00:5e:00:00:04', 'person_departed', 300, 'Arlo',   '5eed0000-0000-4000-8000-000000000003', NULL,          'Driveway AP'),
     ('02:00:5e:00:00:02', 'person_arrived',  180, 'Jamie',  '5eed0000-0000-4000-8000-000000000001', 'Studio',      'Driveway AP'),

@@ -223,6 +223,8 @@ async fn reset(pool: &PgPool) {
         "TRUNCATE ng_state",
         "TRUNCATE ng_person_merge",
         "TRUNCATE ng_notify_status, ng_notify_requests RESTART IDENTITY",
+        // The presence tests stand a daemon status row up; nothing else has one.
+        "DROP TABLE IF EXISTS ng_daemon_status",
     ] {
         sqlx::query(stmt).execute(pool).await.unwrap();
     }
@@ -1365,8 +1367,8 @@ async fn seed_house(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
         ),
     ] {
         sqlx::query(&format!(
-            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
-             VALUES ($1, $2, {at}, $3::jsonb || jsonb_build_object('person', $4::text, 'person_item_id', $5::text, 'device', 'aa:bb:cc:00:01:01'))"
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, person_item_id) \
+             VALUES ($1, $2, {at}, $3::jsonb || jsonb_build_object('person', $4::text, 'person_item_id', $5::text, 'device', 'aa:bb:cc:00:01:01'), $5::uuid)"
         ))
         .bind(phone)
         .bind(event_type)
@@ -1503,7 +1505,7 @@ fn no_overview_include_is_named_after_a_column_it_would_overwrite() {
         // what the record type now reads and so what the includes land on.
         let columns: HashSet<String> = sqlx::query_scalar(
             "SELECT column_name::text FROM information_schema.columns \
-             WHERE table_name IN ('ng_overview', 'ng_home')",
+             WHERE table_name IN ('ng_overview', 'ng_home', 'ng_home_presence')",
         )
         .fetch_all(&pool)
         .await
@@ -1511,7 +1513,8 @@ fn no_overview_include_is_named_after_a_column_it_would_overwrite() {
         .into_iter()
         .collect();
         let names: Vec<&String> = includes.as_object().unwrap().keys().collect();
-        assert_eq!(names.len(), 5, "{includes}");
+        // 023 added `untracked`, the people nobody is tracking.
+        assert_eq!(names.len(), 6, "{includes}");
         for name in names {
             assert!(
                 !columns.contains(name),
@@ -1708,9 +1711,27 @@ fn the_overviews_listings_are_pages_that_filter_and_render_on_their_own() {
         seed_house(&pool).await;
         let gather = wire_gather(&pool).await;
 
+        // Since 023 the page lists everybody: home first, then away, then
+        // anybody nobody is tracking, who is never counted as either.
         let home = gather_items(&gather, "ng_people_home", HashMap::new()).await;
-        assert_eq!(home.len(), 2, "only the people who are home: {home:?}");
-        assert!(render_page("ng_people_home", "Home now", "/people/home", &home).contains("Jamie"));
+        let states: Vec<(&str, &str)> = home
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap_or_default(),
+                    r["state"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [("Aurora", "home"), ("Jamie", "home"), ("Arlo", "away")],
+            "home first, earliest arrival first, then away: {home:?}"
+        );
+        let page = render_page("ng_people_home", "Home now", "/people/home", &home);
+        assert!(page.contains("Jamie"), "{page}");
+        assert!(page.contains("Away"), "{page}");
+        assert!(!page.contains("Not tracked"), "{page}");
 
         // The whole log, newest first, and one day of it by URL argument.
         let all = gather_items(&gather, "ng_person_movements", HashMap::new()).await;
@@ -5152,9 +5173,13 @@ async fn alerts_of(pool: &PgPool, id: Uuid) -> (bool, bool) {
 /// `details` the way the daemon writes them.
 async fn seed_arrival(pool: &PgPool, device: i64, person: Uuid, name: &str) {
     sqlx::query(
-        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+        // The person in both places the daemon puts them since its V5: the
+        // details and the `person_item_id` column (022 gives a standalone
+        // schema the column, and 019's movements view reads it when present).
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, person_item_id) \
          VALUES ($1, 'person_arrived', now() - interval '1 hour', \
-                 jsonb_build_object('person_item_id', $2::text, 'person', $3::text, 'location', 'Kitchen'))",
+                 jsonb_build_object('person_item_id', $2::text, 'person', $3::text, 'location', 'Kitchen'), \
+                 $2::uuid)",
     )
     .bind(device)
     .bind(person.to_string())
@@ -6352,11 +6377,11 @@ fn the_alerts_page_says_every_rule_where_alerts_go_and_what_was_sent() {
             .unwrap();
         seed_notify_status(&pool).await;
         sqlx::query(
-            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified) VALUES \
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified, person_item_id) VALUES \
              ($1, 'person_arrived', now() - interval '5 minutes', \
               jsonb_build_object('person', 'Jamie', 'person_item_id', $2::text, \
-                                 'device_name', 'Jamie''s iPhone'), TRUE), \
-             ($3, 'returned', now() - interval '4 minutes', '{}'::jsonb, FALSE)",
+                                 'device_name', 'Jamie''s iPhone'), TRUE, $2::uuid), \
+             ($3, 'returned', now() - interval '4 minutes', '{}'::jsonb, FALSE, NULL)",
         )
         .bind(phone)
         .bind(jamie.to_string())
@@ -6989,5 +7014,330 @@ fn the_event_pages_as_the_kernel_runs_them_read_the_daemons_indexes() {
         ] {
             sqlx::query(ddl).execute(&pool).await.unwrap();
         }
+    });
+}
+
+// ===========================================================================
+// U18: presence is opt in
+// ===========================================================================
+
+const FORM_DEVICE_PRESENCE: &str = "/netgrasp/device/presence";
+const FORM_PERSON_PRESENCE: &str = "/netgrasp/person/presence";
+const FORM_PERSON_RENAME: &str = "/netgrasp/person/rename";
+
+/// An Item field's value, whichever of the two shapes it is stored in.
+async fn item_field(pool: &PgPool, item_id: Uuid, field: &str) -> serde_json::Value {
+    let value: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT fields -> $2 FROM item WHERE id = $1")
+            .bind(item_id)
+            .bind(field)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let value = value.unwrap_or(serde_json::Value::Null);
+    value.get("value").cloned().unwrap_or(value)
+}
+
+/// The daemon's status row, standing in for a netgraspd at V7 that has
+/// published its `presence_tracking` setting.
+async fn publish_presence_tracking(pool: &PgPool, on: bool) {
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS ng_daemon_status; \
+         CREATE TABLE ng_daemon_status (id BIGINT PRIMARY KEY DEFAULT 1, version TEXT NOT NULL, \
+           timezone TEXT NOT NULL, timezone_source TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL, \
+           updated_at TIMESTAMPTZ NOT NULL, presence_tracking BOOLEAN NOT NULL DEFAULT FALSE)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ng_daemon_status (version, timezone, timezone_source, started_at, updated_at, \
+         presence_tracking) VALUES ('test', 'UTC', 'config', now(), now(), $1)",
+    )
+    .bind(on)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// **The two presence forms write both tiers.** The device form offers three
+/// choices and says the effective value and why; each choice lands in the
+/// Item's field and in `ng_devices.counts_for_presence` and reads back as
+/// itself. The person form's one switch lands in `field_track_presence` and
+/// `ng_people.track_presence`, and survives a rename, which rebuilds the
+/// person's fields.
+#[test]
+fn the_presence_forms_write_both_tiers_and_round_trip_the_three_choices() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let admin = ng_admin(&pool).await;
+        // A tablet: by type it does not count.
+        let device = seed_clean_device(&pool, "02:00:5e:00:18:01", None, "online").await;
+        let target = "02%3A00%3A5e%3A00%3A18%3A01";
+
+        let form = call_form(
+            &pool,
+            &admin,
+            "device_presence_form",
+            "GET",
+            FORM_DEVICE_PRESENCE,
+            serde_json::json!({"target": "02:00:5e:00:18:01"}),
+            "",
+        )
+        .await;
+        assert_eq!(form["status"], 200, "{form}");
+        let body = form["body"].as_str().unwrap_or_default();
+        for expected in [
+            r#"<option value="by_type" selected>By device type</option>"#,
+            r#"<option value="counts">Counts</option>"#,
+            r#"<option value="does_not_count">Does not count</option>"#,
+            "Now: <strong>Does not count: tablet</strong>",
+            "minted-by-the-kernel",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?}: {body}");
+        }
+
+        for (value, column) in [
+            ("counts", Some(true)),
+            ("does_not_count", Some(false)),
+            ("by_type", None),
+        ] {
+            let response = call_form(
+                &pool,
+                &admin,
+                "device_presence_save",
+                "POST",
+                FORM_DEVICE_PRESENCE,
+                serde_json::json!({}),
+                &format!("target={target}&back=%2Fdevices&value={value}"),
+            )
+            .await;
+            assert_eq!(response["status"], 200, "{response}");
+            let (counts, item): (Option<bool>, Option<Uuid>) = sqlx::query_as(
+                "SELECT counts_for_presence, trovato_item_id FROM ng_devices WHERE id = $1",
+            )
+            .bind(device)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(counts, column, "{value}: the column");
+            let item = item.expect("the edit minted the device's Item");
+            assert_eq!(
+                item_field(&pool, item, "field_counts_for_presence").await,
+                serde_json::json!(value),
+                "{value}: the Item field"
+            );
+            if value == "counts" {
+                let again = call_form(
+                    &pool,
+                    &admin,
+                    "device_presence_form",
+                    "GET",
+                    FORM_DEVICE_PRESENCE,
+                    serde_json::json!({"target": "02:00:5e:00:18:01"}),
+                    "",
+                )
+                .await;
+                let body = again["body"].as_str().unwrap_or_default();
+                assert!(
+                    body.contains(r#"<option value="counts" selected>"#)
+                        && body.contains("Counts: chosen for this device"),
+                    "{body}"
+                );
+            }
+        }
+        // The edit wrote its one column: alerts untouched.
+        assert_eq!(device_flags(&pool, device).await, (false, true));
+
+        // The person: off by default, on, kept through a rename, off again.
+        let person = seed_person_item(&pool, "Resident").await;
+        let track = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, bool>("SELECT track_presence FROM ng_people WHERE item_id = $1")
+                .bind(person)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        assert!(!track(pool.clone()).await, "a new person is not tracked");
+        let form = call_form(
+            &pool,
+            &admin,
+            "person_presence_form",
+            "GET",
+            FORM_PERSON_PRESENCE,
+            serde_json::json!({"target": person.to_string()}),
+            "",
+        )
+        .await;
+        assert_eq!(form["status"], 200, "{form}");
+        let body = form["body"].as_str().unwrap_or_default();
+        assert!(
+            body.contains(r#"name="track" value="1"> Track whether they are home"#),
+            "{body}"
+        );
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_presence_save",
+            "POST",
+            FORM_PERSON_PRESENCE,
+            serde_json::json!({}),
+            &format!("target={person}&back=%2Fpeople&track=1"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(track(pool.clone()).await, "the mirror did not follow");
+        assert_eq!(
+            item_field(&pool, person, "field_track_presence").await,
+            serde_json::json!(true)
+        );
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_rename_save",
+            "POST",
+            FORM_PERSON_RENAME,
+            serde_json::json!({}),
+            &format!("target={person}&back=%2Fpeople&value=Resident+Two"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(track(pool.clone()).await, "a rename turned tracking off");
+        assert_eq!(
+            item_field(&pool, person, "field_track_presence").await,
+            serde_json::json!(true),
+            "a rename dropped the field"
+        );
+
+        let response = call_form(
+            &pool,
+            &admin,
+            "person_presence_save",
+            "POST",
+            FORM_PERSON_PRESENCE,
+            serde_json::json!({}),
+            &format!("target={person}&back=%2Fpeople"),
+        )
+        .await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert!(!track(pool.clone()).await);
+        assert_eq!(
+            item_field(&pool, person, "field_track_presence").await,
+            serde_json::json!(false)
+        );
+    });
+}
+
+/// **Nobody untracked is home or away, anywhere.** Home counts them as
+/// neither and lists them on a line of their own; /people/home lists them last
+/// as "Not tracked"; /people's cards say "Not tracked"; Who is home leaves out
+/// their online device. With the install's switch off, Home, /people/home and
+/// /people say so in one line naming the config key; with it on, none does.
+#[test]
+fn untracked_people_are_not_tracked_everywhere_and_the_switch_off_is_said() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let untracked = seed_person_item(&pool, "Resident").await;
+        sqlx::query("UPDATE ng_people SET state = 'untracked' WHERE item_id = $1")
+            .bind(untracked)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Their laptop is online, which made somebody home before U18.
+        seed_clean_device(&pool, "02:00:5e:00:18:02", Some(untracked), "online").await;
+        publish_presence_tracking(&pool, false).await;
+        let gather = wire_gather(&pool).await;
+        let notice = "Set <code>presence_tracking = true</code> in netgraspd's config";
+
+        // Home.
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        let ov = &rows[0];
+        assert_eq!(
+            (
+                &ov["people_home"],
+                &ov["people_away"],
+                &ov["people_untracked"]
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!(1),
+                &serde_json::json!(1)
+            ),
+            "{ov}"
+        );
+        assert_eq!(ov["presence_tracking"], false, "{ov}");
+        let away: Vec<&str> = ov["away"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        let not: Vec<&str> = ov["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!((away, not), (vec!["Arlo"], vec!["Resident"]));
+        let html = render_page("ng_overview", "Overview", "/overview", &rows);
+        assert!(html.contains(notice), "{html}");
+        assert!(html.contains("Not tracked:"), "{html}");
+
+        // /people/home: everybody, the untracked last and never away.
+        let home = gather_items(&gather, "ng_people_home", HashMap::new()).await;
+        let last = home.last().unwrap();
+        assert_eq!(
+            (last["name"].as_str(), last["state"].as_str()),
+            (Some("Resident"), Some("untracked"))
+        );
+        let html = render_page("ng_people_home", "Home now", "/people/home", &home);
+        assert!(html.contains(notice), "{html}");
+        assert!(html.contains("Not tracked"), "{html}");
+
+        // /people: the card carries the daemon's state through 023's include.
+        let people_viewer = || {
+            UserContext::authenticated(
+                Uuid::now_v7(),
+                vec!["view netgrasp devices".into(), "access content".into()],
+            )
+        };
+        let people =
+            gather_items_as(&gather, "ng_person_list", HashMap::new(), people_viewer()).await;
+        let card = people
+            .iter()
+            .find(|r| r["title"] == "Resident")
+            .unwrap_or_else(|| panic!("the person's card: {people:?}"));
+        assert_eq!(card["presence"]["state"], "untracked", "{card}");
+        let html = render_page("ng_person_list", "People", "/people", &people);
+        assert!(html.contains(notice), "{html}");
+        assert!(
+            html.contains("ng-person__state--untracked\">Not tracked"),
+            "{html}"
+        );
+
+        // Who is home: the untracked owner's online laptop does not count.
+        let who = gather_items(&gather, "ng_who_is_home", HashMap::new()).await;
+        assert!(
+            who.iter().all(|r| r["mac"] != "02:00:5e:00:18:02"),
+            "an untracked person's device made them home: {who:?}"
+        );
+        assert!(!who.is_empty(), "the tracked owner's phone is still listed");
+
+        // The switch on: no notice anywhere.
+        publish_presence_tracking(&pool, true).await;
+        let rows = gather_items(&gather, "ng_overview", HashMap::new()).await;
+        assert!(!render_page("ng_overview", "Overview", "/overview", &rows).contains(notice));
+        let home = gather_items(&gather, "ng_people_home", HashMap::new()).await;
+        assert!(!render_page("ng_people_home", "Home now", "/people/home", &home).contains(notice));
+        let people =
+            gather_items_as(&gather, "ng_person_list", HashMap::new(), people_viewer()).await;
+        assert!(!people.is_empty());
+        assert!(!render_page("ng_person_list", "People", "/people", &people).contains(notice));
+        reset(&pool).await;
     });
 }

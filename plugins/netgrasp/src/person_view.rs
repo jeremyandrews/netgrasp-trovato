@@ -30,6 +30,24 @@ pub struct Presence {
     pub departed: Option<i64>,
     #[serde(default)]
     pub devices_online: i64,
+    /// The person's own switch (netgraspd V7).
+    #[serde(default)]
+    pub track_presence: Option<bool>,
+    /// The install's switch: `None` when no daemon has published it.
+    #[serde(default)]
+    pub presence_tracking: Option<bool>,
+}
+
+/// Why somebody is not tracked, in one sentence, most fundamental reason first.
+#[must_use]
+pub fn untracked_reason(presence: &Presence) -> &'static str {
+    if presence.presence_tracking == Some(false) {
+        "Presence tracking is off for everybody: set presence_tracking = true in the daemon's netgrasp.toml."
+    } else if presence.track_presence != Some(true) {
+        "Tracking whether they are home is off for this person."
+    } else {
+        "None of their devices counts: give them a phone or a watch, or choose a device that counts."
+    }
 }
 
 /// The page fragment.
@@ -48,10 +66,11 @@ pub fn render(
     out.push_str("<link rel=\"stylesheet\" href=\"/static/css/netgrasp.css\">");
     out.push_str("<section class='ng-person-page'>");
 
-    // Where they are.
-    let home = presence.state.as_deref() == Some("home");
+    // Where they are. Three states, and only "away" reads as away: a person
+    // nobody is tracking is neither in nor out.
+    let state = presence.state.as_deref();
     out.push_str("<p class='ng-person-page__state'>");
-    if home {
+    if state == Some("home") {
         out.push_str("<strong>Home</strong>");
         if let Some(t) = presence.arrived {
             out.push_str(&format!(
@@ -73,7 +92,7 @@ pub fn render(
                 }
             ));
         }
-    } else {
+    } else if state == Some("away") {
         out.push_str("<strong>Away</strong>");
         if let Some(t) = presence.departed {
             out.push_str(&format!(
@@ -81,6 +100,9 @@ pub fn render(
                 escape(&timeline::humanize_ago(Some(t), now))
             ));
         }
+    } else {
+        out.push_str("<strong>Not tracked</strong>. ");
+        out.push_str(&escape(untracked_reason(presence)));
     }
     out.push_str("</p>");
 
@@ -94,6 +116,10 @@ pub fn render(
         (
             format!("/netgrasp/person/notify?target={id}&amp;back={back}"),
             "Alerts",
+        ),
+        (
+            format!("/netgrasp/person/presence?target={id}&amp;back={back}"),
+            "Presence",
         ),
         (
             format!("/netgrasp/person/merge?target={id}&amp;back={back}"),
@@ -121,7 +147,7 @@ pub fn render(
     out.push_str("<h2>Devices</h2>");
     if devices.is_empty() {
         out.push_str(&format!(
-            "<p class='ng-empty'>No devices yet. A person is home when any device they own is online. \
+            "<p class='ng-empty'>No devices yet. A tracked person is home when a phone or watch of theirs is online. \
              <a href='/devices/assign?person={id}&amp;back={back}'>Give them a device</a>.</p>"
         ));
     } else {
@@ -237,7 +263,10 @@ mod tests {
             html.contains("you are told when Jamie gets home."),
             "{html}"
         );
-        assert!(html.contains("<strong>Away</strong>"), "{html}");
+        assert!(html.contains("/netgrasp/person/presence?target="), "{html}");
+        // No state at all is not away: nobody is tracking them.
+        assert!(html.contains("<strong>Not tracked</strong>"), "{html}");
+        assert!(!html.contains("Away"), "{html}");
         assert!(html.contains("No devices yet"), "{html}");
         assert!(html.contains("back=%2Fitem%2F5eed"), "{html}");
     }
@@ -275,5 +304,48 @@ mod tests {
         assert!(html.contains("at Kitchen"), "{html}");
         assert!(html.contains("<strong>Home</strong>"), "{html}");
         assert!(html.contains("(1 device online)"), "{html}");
+    }
+
+    #[test]
+    fn an_untracked_person_is_not_tracked_never_away_and_the_page_says_why() {
+        let base = Presence {
+            state: Some("untracked".into()),
+            departed: Some(500),
+            ..Presence::default()
+        };
+        let off_everywhere = Presence {
+            presence_tracking: Some(false),
+            track_presence: Some(true),
+            ..base.clone()
+        };
+        let html = render(&jamie(), &off_everywhere, &[], &[], 1_000);
+        assert!(html.contains("<strong>Not tracked</strong>"), "{html}");
+        assert!(!html.contains("Away"), "{html}");
+        assert!(!html.contains("left "), "{html}");
+        assert!(html.contains("presence_tracking = true"), "{html}");
+
+        let off_for_them = Presence {
+            presence_tracking: Some(true),
+            track_presence: Some(false),
+            ..base.clone()
+        };
+        let html = render(&jamie(), &off_for_them, &[], &[], 1_000);
+        assert!(html.contains("off for this person"), "{html}");
+
+        let nothing_counts = Presence {
+            presence_tracking: Some(true),
+            track_presence: Some(true),
+            ..base
+        };
+        let html = render(&jamie(), &nothing_counts, &[], &[], 1_000);
+        assert!(html.contains("None of their devices counts"), "{html}");
+
+        let away = Presence {
+            state: Some("away".into()),
+            departed: Some(500),
+            ..Presence::default()
+        };
+        let html = render(&jamie(), &away, &[], &[], 1_000);
+        assert!(html.contains("<strong>Away</strong>"), "{html}");
     }
 }

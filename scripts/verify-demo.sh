@@ -87,7 +87,8 @@ expect 'Needs attention' "the needs-attention section"
 expect 'href="/events/security"' "the link to the security events"
 expect 'Home now' "the people-home section"
 expect 'Jamie' "the seeded person Jamie, who is home"
-expect 'Aurora' "the seeded person Aurora, who is home"
+expect 'Aurora' "the seeded person Aurora, who is not tracked"
+expect 'Not tracked:' "the line naming the people nobody is tracking"
 expect '02:00:5e:00:00:0c' "the seeded device first seen 35 minutes ago"
 expect 'class="ng-menu"' "a row menu on a new device"
 expect 'more devices have no owner' "the line counting the devices left to sort"
@@ -166,6 +167,16 @@ form() {
     echo "    $1 renders"
 }
 form /people/add 'Alert me when they get home'
+# Presence (U18): the three states on /people/home, Aurora never away, and the
+# two forms that set who is tracked and which devices count.
+curl -s -b "$JAR" -o "$PAGE" "$BASE/people/home"
+for state in 'Home since' 'Away since' 'Not tracked'; do
+    grep -q "$state" "$PAGE" || fail "/people/home does not say $state"
+done
+echo "    /people/home lists Home, Away and Not tracked"
+form "/netgrasp/device/presence?target=02:00:5e:00:00:04" 'Counts: chosen for this device'
+form "/netgrasp/device/presence?target=02:00:5e:00:00:02" 'Counts: phone'
+form "/netgrasp/person/presence?target=$person" 'Track whether they are home'
 form /devices/assign 'name="device"'
 form "/netgrasp/device/owner?target=02:00:5e:00:00:0c" 'name="new_person"'
 # The chooser, or, once only one person is left, the sentence saying so.

@@ -77,7 +77,17 @@ pub const DAEMON_OWNED: &[&str] = &[
 /// text or boolean, and [`crate::writeback::build_update`] casts its placeholder
 /// `::uuid` for exactly that reason. Device ids, by contrast, are `bigint`;
 /// nothing in this set is one.
-pub const USER_OWNED: &[&str] = &["display_name", "hidden", "notes", "notify", "owner_item_id"];
+///
+/// `counts_for_presence` (netgraspd V7) is the one nullable boolean: `NULL`
+/// means "decide by device type", and `TRUE` or `FALSE` is a person's choice.
+pub const USER_OWNED: &[&str] = &[
+    "counts_for_presence",
+    "display_name",
+    "hidden",
+    "notes",
+    "notify",
+    "owner_item_id",
+];
 
 /// Columns this plugin owns: the link from a device row to its Item.
 ///

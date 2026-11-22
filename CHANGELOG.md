@@ -21,6 +21,59 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+### Added
+
+**Presence is opt in, and the plugin can say who is tracked and which devices
+count.** netgraspd's schema V7 stopped deciding that everybody is home or away.
+A person is tracked only when the install's `presence_tracking = true` is set
+in netgraspd's config, their own "Track whether they are home" is on, and they
+own a device that counts. Every other person is `untracked`, a third state
+that is neither home nor away. Before this the plugin had no way to set either
+setting, and every page that listed people knew only two states, so an
+untracked person would have read as away.
+
+- *Two settings, both user owned, synced the way `notify` and `notify_arrive`
+  are.* On a device, `field_counts_for_presence` (By device type, Counts, Does
+  not count), written to `ng_devices.counts_for_presence` as NULL, TRUE or
+  FALSE. By device type, a phone or a wearable counts and nothing else does. On
+  a person, `field_track_presence`, off by default, written to
+  `ng_people.track_presence`.
+- *Two forms in the row menu.* `/netgrasp/device/presence` offers the three
+  choices and says the device's effective value and why ("Counts: phone",
+  "Does not count: laptop", "Counts: chosen for this device"). The device page
+  shows the same line with a link to the form. `/netgrasp/person/presence` is
+  the one switch; the person page links to it.
+- *Not tracked, everywhere a person is listed.* Home lists the untracked on a
+  line of their own and counts them as neither home nor away. `/people/home`
+  lists everybody: home first, then away, then "Not tracked". `/people`'s
+  cards say Home, Away or Not tracked. The person page and the Alerts page say
+  "Not tracked" and why. The device-shaped Who is home lists only owners the
+  daemon has as home, so an untracked person's online laptop no longer makes
+  them home.
+- *The install's switch.* When netgraspd publishes `presence_tracking = false`
+  (`ng_daemon_status.presence_tracking`), Home, `/people` and `/people/home`
+  say so in one line naming the config key. With no daemon status to read,
+  they say nothing.
+- *Migrations.* `022_netgrasp_presence_schema.sql` is the guarded copy of V7's
+  two columns. It adds a column only where the column is missing and the role
+  owns the table. With no daemon at all it also adds the V5 columns 001's
+  copy lacked, and V7's `untracked` default. `023_netgrasp_presence_views.sql`
+  adds `ng_presence_tracking()` and three views over the ones the record types
+  read (`ng_people_presence_status`, `ng_home_presence`,
+  `ng_devices_listed_presence`). These are new views rather than widened ones,
+  so 006, 007, 012 and 013 stay re-runnable.
+- *A rename no longer drops a person's fields.* The person payload used to
+  rebuild `fields` from notes and the two alert flags alone. It now carries
+  every existing field forward, so a rename or an alerts edit cannot switch
+  tracking off.
+- *The daemon schema fixture is up to date.* It stopped at V4, with V4's
+  `notify DEFAULT TRUE`. It is now the daemon's schema as of V7: V5's people
+  epochs, event person column and index, and `ng_daemon_status` and
+  `ng_enrichment_status`; V6's `notify DEFAULT FALSE`; and V7's presence
+  columns and `untracked` default.
+- *Pairs with* the netgraspd release that carries schema V7. As always, the
+  daemon migrates first.
+
 ### Fixed
 
 **The event pages and the assistant's event reads answer from the daemon's
