@@ -21,6 +21,25 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
+Presence settings and a third presence state, "Not tracked", for netgraspd's
+schema version 7; one person per name; and event pages, the cron prune and the
+assistant reading the daemon's indexes instead of scanning the event log.
+
+| | |
+|---|---|
+| Pairs with | netgraspd 1.2.0, `ng_` schema version 7 |
+| Built against | Trovato 0.102.0, `trovato-sdk` revision `ca76a96`, `KERNEL_API_VERSION` (0, 102) |
+| Manifest | `version = "1.2.0"`, `api_version = "0.102"` |
+| Runs on | Trovato 0.102.0 or a later 0.x |
+
+Upgrade the daemon to 1.2.0 and run its `migrate` first. Where the kernel's
+role does not own the daemon's tables, the table owner grants it the two new
+presence columns (`UPDATE (counts_for_presence)` on `ng_devices`, and
+`INSERT (track_presence)` and `UPDATE (track_presence)` on `ng_people`) and
+creates migration 018's index; the README's role section has the statements.
+
 ### Added
 
 **Presence is opt in, and the plugin can say who is tracked and which devices
