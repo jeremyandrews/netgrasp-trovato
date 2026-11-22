@@ -159,7 +159,10 @@ jobs:
             the_three_presence_choices_round_trip_through_the_device_column \
             untracked_people_are_counted_as_neither_home_nor_away \
             the_install_switch_reads_as_published_and_null_without_a_daemon \
-            the_presence_schema_adds_v7_columns_to_an_older_daemon_and_is_idempotent
+            the_presence_schema_adds_v7_columns_to_an_older_daemon_and_is_idempotent \
+            the_fixture_carries_the_daemons_v8_event_indexes \
+            recently_sent_reads_the_daemons_notified_index \
+            the_security_pages_read_the_daemons_security_time_index
           do
             grep -q "$t ... ok" test.log \
               || { echo "::error::$t did not pass"; exit 1; }
@@ -181,6 +184,8 @@ jobs:
             || { echo "::error::the event pages' index test did not pass"; exit 1; }
           grep -q "the_security_pages_deepest_page_reads_at_most_the_newest_10000 ... ok" test.log \
             || { echo "::error::the security pager's bound test did not pass"; exit 1; }
+          grep -q "activity_and_new_devices_as_the_kernel_runs_them_read_the_daemons_type_index ... ok" test.log \
+            || { echo "::error::the activity and new devices index test did not pass"; exit 1; }
 
       # The row menu's forms are the plugin's only write path that a person
       # reaches without the assistant, and the three things that matter about
