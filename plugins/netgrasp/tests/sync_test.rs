@@ -6805,6 +6805,16 @@ async fn kernel_gather_sql(
     query_id: &str,
     url_args: &[(&str, &str)],
 ) -> (String, String) {
+    kernel_gather_page_sql(pool, query_id, url_args, 1).await
+}
+
+/// [`kernel_gather_sql`] for any page: the rows of page `page` and the count.
+async fn kernel_gather_page_sql(
+    pool: &PgPool,
+    query_id: &str,
+    url_args: &[(&str, &str)],
+    page: u32,
+) -> (String, String) {
     use trovato_kernel::gather::types::ContextualValue;
 
     let gather = wire_gather(pool).await;
@@ -6861,7 +6871,7 @@ async fn kernel_gather_sql(
     (
         format!(
             "SELECT row_to_json(t) FROM ({}) t",
-            builder.build(1, per_page)
+            builder.build(page, per_page)
         ),
         builder.build_count(),
     )
@@ -7014,6 +7024,277 @@ fn the_event_pages_as_the_kernel_runs_them_read_the_daemons_indexes() {
         ] {
             sqlx::query(ddl).execute(&pool).await.unwrap();
         }
+    });
+}
+
+/// The kernel's `compute_page_list` (`crates/kernel/src/routes/gather.rs`),
+/// which is private: page 1, the last page and two either side of the current
+/// one, with "..." for each gap.
+fn kernel_page_list(current: u32, total: u32) -> Vec<serde_json::Value> {
+    let mut shown = std::collections::BTreeSet::from([1, total]);
+    for p in current.saturating_sub(2).max(1)..=(current + 2).min(total) {
+        shown.insert(p);
+    }
+    let mut pages = Vec::new();
+    let mut last = 0;
+    for p in shown {
+        if last > 0 && p > last + 1 {
+            pages.push(serde_json::json!("..."));
+        }
+        pages.push(serde_json::json!(p));
+        last = p;
+    }
+    pages
+}
+
+/// The kernel's `templates/gather/pager.html` at the pinned revision, which
+/// netgrasp's `page.html` includes and the plugin's template directory does not
+/// carry. Verbatim, so a page that keeps the kernel's pager renders it here as
+/// it would there.
+const KERNEL_PAGER: &str = r#"<nav class="pager" aria-label="Pagination">
+    <ul class="pager__items">
+        {% if pager.current_page > 1 %}
+        <li class="pager__item pager__item--previous">
+            <a href="{{ pager.page_url_prefix }}page={{ pager.current_page - 1 }}">Previous</a>
+        </li>
+        {% endif %}
+
+        {% for page in pager.pages %}
+        <li class="pager__item{% if page == pager.current_page %} pager__item--active{% endif %}">
+            {% if page == pager.current_page %}
+            <span aria-current="page">{{ page }}</span>
+            {% elif page == "..." %}
+            <span class="pager__ellipsis">...</span>
+            {% else %}
+            <a href="{{ pager.page_url_prefix }}page={{ page }}">{{ page }}</a>
+            {% endif %}
+        </li>
+        {% endfor %}
+
+        {% if pager.current_page < pager.total_pages %}
+        <li class="pager__item pager__item--next">
+            <a href="{{ pager.page_url_prefix }}page={{ pager.current_page + 1 }}">Next</a>
+        </li>
+        {% endif %}
+    </ul>
+</nav>
+{# Pager styles live in static/css/theme.css #}
+"#;
+
+/// [`render_page`] for page `page` of a result of `total` rows, with the pager
+/// context `render_gather_with_theme` adds when there is more than one page.
+fn render_paged(
+    query_id: &str,
+    base_path: &str,
+    rows: &[serde_json::Value],
+    total: u64,
+    page: u32,
+    per_page: u32,
+) -> String {
+    let dir = plugin_source_dir().join("../../templates/**/*.html");
+    let mut tera = tera::Tera::new(&dir.to_string_lossy()).expect("the templates parse");
+    tera.add_raw_template("gather/pager.html", KERNEL_PAGER)
+        .expect("the kernel's pager parses");
+    let total_pages = total.div_ceil(u64::from(per_page)) as u32;
+    let mut context = tera::Context::new();
+    context.insert(
+        "query",
+        &serde_json::json!({"query_id": query_id, "label": query_id}),
+    );
+    context.insert("rows", rows);
+    context.insert("total", &total);
+    context.insert("page", &page);
+    context.insert("per_page", &per_page);
+    context.insert("total_pages", &total_pages);
+    context.insert("has_next", &(page < total_pages));
+    context.insert("has_prev", &(page > 1));
+    context.insert("base_path", base_path);
+    context.insert("exposed_filters", &serde_json::json!([]));
+    context.insert("filter_values", &serde_json::json!({}));
+    if total_pages > 1 {
+        context.insert(
+            "pager",
+            &serde_json::json!({
+                "current_page": page,
+                "total_pages": total_pages,
+                "page_url_prefix": format!("{base_path}?"),
+                "pages": kernel_page_list(page, total_pages),
+            }),
+        );
+    }
+    tera.render(&format!("gather/query--{query_id}.html"), &context)
+        .unwrap_or_else(|e| panic!("{query_id} failed to render: {e:#?}"))
+}
+
+/// Every page number a rendered page links to, in order.
+fn pager_links(html: &str) -> Vec<u32> {
+    html.split("?page=")
+        .skip(1)
+        .filter_map(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+        .collect()
+}
+
+/// How many rows the input of the statement's `Limit` produced: the rows a
+/// page read to return its 50, which for `OFFSET n` is at least `n + 50`.
+async fn rows_under_the_limit(pool: &PgPool, sql: &str) -> u64 {
+    fn find(node: &serde_json::Value) -> Option<u64> {
+        if node["Node Type"] == "Limit" {
+            let child = &node["Plans"][0];
+            let loops = child["Actual Loops"].as_u64().unwrap_or(1).max(1);
+            return child["Actual Rows"].as_u64().map(|r| r * loops);
+        }
+        node["Plans"].as_array()?.iter().find_map(find)
+    }
+    let plan: serde_json::Value =
+        sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    find(&plan[0]["Plan"]).unwrap_or_else(|| panic!("no Limit in {plan}"))
+}
+
+/// **/events/security offers no page deeper than the newest 10000.** Its
+/// total stays the exact count, the overview's, but the pager stops at the
+/// page that holds the 10000th newest event, so the deepest page it links to
+/// reads at most 10000 rows to show its 50. Before, the pager ran to the last
+/// of `total`, and that page read every security event on record and sorted
+/// them: about 190 ms on the live network, and more each day.
+///
+/// The plan is asked with ANALYZE, of the statement the kernel builds for the
+/// deepest page the rendered pager links to, so it fails on the old template
+/// whichever plan the planner picks for a table this size.
+#[test]
+fn the_security_pages_deepest_page_reads_at_most_the_newest_10000() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        for ddl in DAEMON_EVENT_INDEXES {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        // No statistics: the assertion below is on the rows a page reads, which
+        // no plan changes, and statistics for 72,000 rows would outlive the
+        // TRUNCATE at the end and change the plans the other event tests
+        // assert. So the table is not analyzed here, and autovacuum is kept
+        // from analyzing it in the background until it is empty again.
+        sqlx::query("ALTER TABLE ng_events SET (autovacuum_enabled = false)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let device = seed_device(&pool, "aa:bb:cc:00:27:01", None, "online").await;
+        // 12,000 security events among 60,000 others, a second apart.
+        sqlx::query(
+            "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+             SELECT $1, CASE WHEN g % 6 = 0 THEN 'arp_scan' ELSE 'ip_changed' END, \
+                    now() - make_interval(secs => g) \
+             FROM generate_series(1, 72000) g",
+        )
+        .bind(device)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let gather = wire_gather(&pool).await;
+        let context = QueryContext {
+            viewer: Some(network_viewer()),
+            ..QueryContext::default()
+        };
+        let first = gather
+            .execute(
+                "ng_event_security",
+                1,
+                HashMap::new(),
+                Uuid::parse_str(LIVE_STAGE).unwrap(),
+                &context,
+            )
+            .await
+            .unwrap();
+        let on_overview: i64 = sqlx::query_scalar("SELECT security_events FROM ng_home")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(first.total, 12_000, "the total is every security event");
+        assert_eq!(first.total, on_overview as u64);
+
+        let html = render_paged(
+            "ng_event_security",
+            "/events/security",
+            &first.items,
+            first.total,
+            1,
+            first.per_page,
+        );
+        assert!(
+            html.contains(&format!(
+                "showing {} of the newest 10000, page 1 of 200",
+                first.items.len()
+            )),
+            "{html}"
+        );
+        assert!(html.contains(">12000</span>"), "the total is exact: {html}");
+        let deepest = pager_links(&html).into_iter().max().unwrap();
+        assert_eq!(deepest, 10_000 / first.per_page, "{html}");
+
+        let (rows_sql, _) = kernel_gather_page_sql(&pool, "ng_event_security", &[], deepest).await;
+        let read = rows_under_the_limit(&pool, &rows_sql).await;
+        assert!(
+            read <= 10_000,
+            "the deepest page offered, {deepest}, read {read} rows: {rows_sql}"
+        );
+
+        sqlx::raw_sql(
+            "TRUNCATE ng_events CASCADE; ALTER TABLE ng_events RESET (autovacuum_enabled)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for ddl in [
+            "DROP INDEX IF EXISTS ng_events_time_idx",
+            "DROP INDEX IF EXISTS ng_events_device_idx",
+            "DROP INDEX IF EXISTS ng_events_security_idx",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+
+        // The pager's window and its last page, from the middle and the end.
+        let middle = render_paged(
+            "ng_event_security",
+            "/events/security",
+            &first.items,
+            first.total,
+            100,
+            first.per_page,
+        );
+        assert_eq!(pager_links(&middle), [99, 1, 98, 99, 101, 102, 200, 101]);
+        assert_eq!(middle.matches("pager__ellipsis").count(), 2, "{middle}");
+        let last = render_paged(
+            "ng_event_security",
+            "/events/security",
+            &first.items,
+            first.total,
+            200,
+            first.per_page,
+        );
+        assert_eq!(pager_links(&last), [199, 1, 198, 199]);
+        assert!(!last.contains("pager__item--next"), "{last}");
+        assert!(last.contains("page 200 of 200"), "{last}");
+
+        // Under the bound the page reads as it always did: no bound to name,
+        // and the kernel's own last page.
+        let few = render_paged(
+            "ng_event_security",
+            "/events/security",
+            &first.items,
+            120,
+            1,
+            first.per_page,
+        );
+        assert!(!few.contains("newest"), "{few}");
+        assert!(few.contains("page 1 of 3"), "{few}");
+        assert_eq!(pager_links(&few), [2, 3, 2]);
     });
 }
 

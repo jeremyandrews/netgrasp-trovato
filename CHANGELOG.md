@@ -95,6 +95,61 @@ untracked person would have read as away.
 
 ### Fixed
 
+**/events/security's pager stops at the newest 10,000 events, so its deepest
+page no longer reads and sorts every security event on record.** The total
+still counts all of them, with the overview's own statement. Root cause: a page
+is `ORDER BY "timestamp" DESC LIMIT 50 OFFSET n` over `ng_security_events`, and
+no daemon index gives security events in time order. `ng_events_security_idx`
+is on `(event_type, "timestamp" DESC)`, which is in time order only within one
+type. So the planner either walks `ng_events_time_idx` past about 24 other
+events for every security event, or reads all 171,000 from the security index
+and sorts them. Both cost more the deeper the page. The pager ran to page 3,430,
+and that page sorted the lot.
+
+- *The pager is bounded; the total is not.* `query--ng_event_security.html`
+  draws its own pager (a new `pager` block in `page.html`; the default is still
+  the kernel's) to the page that holds the 10,000th newest event: 200 pages of
+  50. Past the bound the scope reads "showing 50 of the newest 10000, page N of
+  200", the wording /events uses. The count stays `SELECT COUNT(*) FROM
+  ng_security_events`, the statement `ng_overview.security_events` runs, so
+  the two are still one number. The bound is not a view's `LIMIT` the way
+  /events's is: a record gather's rows and its total come from one relation,
+  so a bounded view would have bounded the total too.
+- *Considered and not taken.* A `UNION ALL` of the six types, each arm read in
+  index order and merged, answers page 200 in 5 ms on the synthetic copy. But
+  each arm needs a `LIMIT` before the planner will keep its index order, and
+  those arms cost the total its parallel scan: 17 ms became 44 ms. A keyset
+  pager filters the gather, and a gather's total counts what its filters keep,
+  so the total would have changed with the page.
+- *A page past 200 typed by hand* still loads with the old plan and links back.
+  It is not offered.
+
+Medians of nine `EXPLAIN ANALYZE` runs of the kernel's statements. "Deepest"
+is the last page the pager offers: page 3,430 (offset 171,450) before, page
+200 (offset 9,950) after. Live is read only, with the view inlined.
+
+| Statement | Synthetic before | Synthetic after | Live before | Live after |
+|---|---|---|---|---|
+| rows, page 1 | 0.28 ms | 0.28 ms | 0.25 ms | 0.25 ms |
+| rows, deepest page | 120 ms | 20.6 ms | 214 ms | 37.4 ms |
+| total | 17.1 ms | 17.1 ms | 12.5 ms | 12.5 ms |
+
+That is still not under 10 ms: page 200 walks the time index past about
+240,000 events to find its 10,000. A daemon index on the security events in
+time order finishes it. On the synthetic copy (4.1 million events in the live
+mix, PostgreSQL 16) it takes page 1 to 0.12 ms, page 200 to 4.2 ms and the
+total to 7.3 ms, with no change to the plugin:
+
+Needs a daemon index: `CREATE INDEX ng_events_security_time_idx ON ng_events ("timestamp" DESC) WHERE event_type IN ('arp_scan', 'arp_spoof', 'rogue_dhcp', 'identity_change', 'ip_conflict', 'gratuitous_arp');`
+
+It serves `SELECT ... FROM ng_security_events ORDER BY "timestamp" DESC LIMIT
+50 OFFSET n` and `SELECT COUNT(*) FROM ng_security_events`.
+
+A test renders the page for 12,000 security events, takes the deepest page its
+pager links to, and checks with `EXPLAIN ANALYZE` that the kernel's statement
+for that page reads at most 10,000 rows. On the old template the pager links
+to page 240, which reads all 12,000.
+
 **The event pages and the assistant's event reads answer from the daemon's
 indexes instead of scanning the event log.** On the live database (4.1 million
 events, 1.1 GB) each of these pages spent 100 to 200 ms per statement reading
