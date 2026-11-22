@@ -359,11 +359,24 @@ pub enum DeviceFilter {
     Unowned,
     /// Devices the daemon last saw online.
     Online,
+    /// Devices the daemon counts as idle: present recently, quiet now.
+    Idle,
+    /// Devices the daemon counts as gone.
+    Offline,
     /// Devices an admin hid from the listings.
     Hidden,
     /// Devices belonging to one person.
     Owner(String),
+    /// Devices whose OUI vendor contains this, ignoring case.
+    Vendor(String),
+    /// Devices whose type contains this, ignoring case.
+    Type(String),
 }
+
+/// What [`parse_device_filter`] says when it does not recognise a filter, and
+/// what a capped listing tells the model it can narrow with.
+pub const DEVICE_FILTERS: &str = "all, online, idle, offline, unowned, hidden, \
+     owner:<person>, vendor:<name>, type:<name>";
 
 /// Parse a `list_devices` filter.
 ///
@@ -372,21 +385,62 @@ pub enum DeviceFilter {
 /// A sentence naming the accepted values.
 pub fn parse_device_filter(raw: &str) -> Result<DeviceFilter, String> {
     let raw = raw.trim();
-    if let Some(owner) = raw.strip_prefix("owner:") {
-        let owner = owner.trim();
-        if owner.is_empty() {
-            return Err("'owner:' needs a name or a uuid after it".to_string());
+    for (prefix, make) in [
+        ("owner:", DeviceFilter::Owner as fn(String) -> DeviceFilter),
+        ("vendor:", DeviceFilter::Vendor),
+        ("type:", DeviceFilter::Type),
+    ] {
+        if let Some(value) = raw.strip_prefix(prefix) {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("'{prefix}' needs a value after it"));
+            }
+            return Ok(make(value.to_string()));
         }
-        return Ok(DeviceFilter::Owner(owner.to_string()));
     }
-    match raw {
+    match raw.to_ascii_lowercase().as_str() {
         "" | "all" => Ok(DeviceFilter::All),
         "unowned" => Ok(DeviceFilter::Unowned),
         "online" => Ok(DeviceFilter::Online),
+        "idle" => Ok(DeviceFilter::Idle),
+        "offline" => Ok(DeviceFilter::Offline),
         "hidden" => Ok(DeviceFilter::Hidden),
-        other => Err(format!(
-            "'{other}' is not a filter: use all, unowned, online, hidden, or owner:<person>"
-        )),
+        _ => Err(format!("'{raw}' is not a filter: use {DEVICE_FILTERS}")),
+    }
+}
+
+impl DeviceFilter {
+    /// The six parameters of [`crate::queries::SELECT_DEVICES_FILTERED`] and
+    /// [`crate::queries::SELECT_DEVICE_COUNTS`], in order: state, vendor
+    /// fragment, type fragment, unowned only, hidden only, owner Item id.
+    ///
+    /// `owner_item_id` is the person an [`DeviceFilter::Owner`] filter resolved
+    /// to; resolving a name needs the people, which only the host has.
+    #[must_use]
+    pub fn sql_params(&self, owner_item_id: Option<&str>) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let (state, vendor, kind, unowned, hidden) = match self {
+            Self::All | Self::Owner(_) => ("", "", "", false, false),
+            Self::Unowned => ("", "", "", true, false),
+            Self::Online => ("online", "", "", false, false),
+            Self::Idle => ("idle", "", "", false, false),
+            Self::Offline => ("offline", "", "", false, false),
+            Self::Hidden => ("", "", "", false, true),
+            Self::Vendor(v) => ("", v.as_str(), "", false, false),
+            Self::Type(t) => ("", "", t.as_str(), false, false),
+        };
+        let owner = match self {
+            Self::Owner(_) => owner_item_id.unwrap_or("00000000-0000-0000-0000-000000000000"),
+            _ => "",
+        };
+        vec![
+            json!(state),
+            json!(vendor),
+            json!(kind),
+            json!(unowned),
+            json!(hidden),
+            json!(owner),
+        ]
     }
 }
 
@@ -805,15 +859,22 @@ pub fn format_utc(epoch: i64) -> String {
     )
 }
 
-/// "3 hours ago", "just now", "in 2 minutes".
+/// "about 3 hours ago", "1 day 13 hours ago", "just now", "in 2 minutes".
+///
+/// **Rounded, never truncated.** The old phrase divided and dropped the
+/// remainder, so a device first seen 37 hours ago read "1 day ago" and the model
+/// answered "joined in the last 24 hours" from it (issue #32): it reasons from
+/// the relative phrase, not the UTC time beside it. So:
+///
+/// - under an hour, minutes rounded to the nearest minute;
+/// - under a day, hours rounded to the nearest hour, with "about" whenever the
+///   rounding moved it, so 1 hour 56 minutes is "about 2 hours ago";
+/// - from a day on, whole days **and** the remaining hours, rounded to the
+///   nearest hour, so 37 hours is "1 day 13 hours ago" and never "1 day ago".
 #[must_use]
 pub fn relative(epoch: i64, now: i64) -> String {
     let delta = now - epoch;
-    let (magnitude, suffix) = if delta < 0 {
-        (-delta, "from now")
-    } else {
-        (delta, "ago")
-    };
+    let magnitude = delta.abs();
     if magnitude < 60 {
         return if delta < 0 {
             "in under a minute".to_string()
@@ -821,15 +882,39 @@ pub fn relative(epoch: i64, now: i64) -> String {
             "just now".to_string()
         };
     }
-    let (count, unit) = if magnitude < 3_600 {
-        (magnitude / 60, "minute")
-    } else if magnitude < 86_400 {
-        (magnitude / 3_600, "hour")
+    let phrase = relative_magnitude(magnitude);
+    if delta < 0 {
+        format!("{phrase} from now")
     } else {
-        (magnitude / 86_400, "day")
-    };
-    let plural = if count == 1 { "" } else { "s" };
-    format!("{count} {unit}{plural} {suffix}")
+        format!("{phrase} ago")
+    }
+}
+
+/// "1 day 13 hours", "about 2 hours", "5 minutes": a duration of at least a
+/// minute, rounded as [`relative`] describes.
+fn relative_magnitude(seconds: i64) -> String {
+    fn unit(count: i64, name: &str) -> String {
+        format!("{count} {name}{}", if count == 1 { "" } else { "s" })
+    }
+    let minutes = (seconds + 30) / 60;
+    if minutes < 60 {
+        // 59.5 minutes and up has already rounded to an hour.
+        return unit(minutes, "minute");
+    }
+    let hours = (seconds + 1_800) / 3_600;
+    // Under a day stays in hours even when it rounds up to 24: 23 hours 40
+    // minutes is "about 24 hours", which a model will not read as more than a
+    // day, where "1 day" might be.
+    if seconds < 86_400 {
+        let about = if seconds % 3_600 == 0 { "" } else { "about " };
+        return format!("{about}{}", unit(hours, "hour"));
+    }
+    let (days, rest) = (hours / 24, hours % 24);
+    if rest == 0 {
+        unit(days, "day")
+    } else {
+        format!("{} {}", unit(days, "day"), unit(rest, "hour"))
+    }
 }
 
 /// A timestamp as the snapshots write one: absolute, then relative.
@@ -1139,6 +1224,38 @@ impl DeviceFacts {
             self.state.as_deref().unwrap_or("state unknown")
         ));
         line.push_str(&format!(", last seen {}", stamp(self.last_seen, now)));
+        line.push('\n');
+        line
+    }
+
+    /// One `list_devices` line: name, MAC, vendor, type, state, last seen, and
+    /// the owner by name when there is one.
+    ///
+    /// The vendor is on the line because without it the model counted vendors
+    /// from MAC prefixes (issue #33). The owner is a name, not a uuid: a
+    /// listing is read, and `list_people` has the uuids for a write.
+    #[must_use]
+    pub fn listing_line(&self, now: i64) -> String {
+        let mut line = format!("  {} — {}", self.label(), self.mac);
+        for value in [self.vendor.as_deref(), self.device_type.as_deref()]
+            .into_iter()
+            .filter_map(present)
+        {
+            line.push_str(&format!(", {value}"));
+        }
+        line.push_str(&format!(
+            ", {}, last seen {}",
+            present(self.state.as_deref()).unwrap_or("state unknown"),
+            stamp(self.last_seen, now)
+        ));
+        match (
+            present(self.owner_name.as_deref()),
+            present(self.owner_item_id.as_deref()),
+        ) {
+            (Some(name), _) => line.push_str(&format!(", owner {name}")),
+            (None, Some(id)) => line.push_str(&format!(", owner id {id} (no such person)")),
+            (None, None) => {}
+        }
         line.push('\n');
         line
     }
@@ -1675,6 +1792,9 @@ pub struct NewDeviceFacts {
     /// Latest observation, unix seconds.
     #[serde(default)]
     pub last_seen: Option<i64>,
+    /// How many devices matched before the row limit.
+    #[serde(default)]
+    pub total: i64,
 }
 
 impl NewDeviceFacts {
@@ -1745,26 +1865,59 @@ impl NewDeviceFacts {
     }
 }
 
-/// Render a `new_devices` answer: what appeared in the last seven days, and
-/// which of it still needs a person to name or assign it.
+/// The `new_devices` window when the call does not give one: seven days, as
+/// the overview's "New this week" is.
+pub const DEFAULT_NEW_DEVICE_HOURS: i64 = 168;
+
+/// Render a `new_devices` answer: what appeared in the last `hours`, and which
+/// of it still needs a person to name or assign it.
+///
+/// The window is stated with its start in UTC, so "in the last 24 hours" is a
+/// fact the model reads rather than one it infers from a relative phrase — the
+/// inference is how a device first seen 37 hours earlier was reported as new
+/// today (issue #32).
 #[must_use]
-pub fn render_new_devices(devices: &[NewDeviceFacts], now: i64) -> String {
+pub fn render_new_devices(devices: &[NewDeviceFacts], hours: i64, now: i64) -> String {
+    let window = hours_phrase(hours);
+    let since = format_utc(now - hours * 3_600);
     if devices.is_empty() {
-        return "No device was first seen in the last seven days.\n".to_string();
+        return format!("No device was first seen in {window} (since {since}).\n");
     }
+    let total = devices
+        .first()
+        .map_or(0, |d| d.total)
+        .max(devices.len() as i64);
     let todo = devices.iter().filter(|d| d.is_todo()).count();
     let mut out = format!(
-        "{} device{} first seen in the last seven days, newest first. \
-         {todo} of them {} neither a name a person gave it nor an owner, \
+        "{total} device{} first seen in {window} (since {since}), newest first. \
+         {todo} of {} {} neither a name a person gave it nor an owner, \
          which is what /devices/todo lists.\n",
-        devices.len(),
-        if devices.len() == 1 { "" } else { "s" },
+        if total == 1 { "" } else { "s" },
+        if (devices.len() as i64) < total {
+            "those listed"
+        } else {
+            "them"
+        },
         if todo == 1 { "has" } else { "have" }
     );
+    let budget = RESULT_MAX_BYTES.saturating_sub(out.len() + FOOTER_RESERVE);
+    let mut shown = 0i64;
+    let mut rows = String::new();
     for device in devices {
-        out.push_str(&device.render_line(now));
+        let line = device.render_line(now);
+        if rows.len() + line.len() > budget {
+            break;
+        }
+        rows.push_str(&line);
+        shown += 1;
     }
-    cap(&out, RESULT_MAX_BYTES)
+    out.push_str(&rows);
+    if shown < total {
+        out.push_str(&format!(
+            "Showing {shown} of {total}. Ask for a shorter window with hours to see the rest.\n"
+        ));
+    }
+    out
 }
 
 /// A trimmed, non-empty value, or nothing.
@@ -1855,24 +2008,43 @@ pub fn render_person_snapshot(person: &PersonFacts, devices: &[DeviceFacts], now
 
 /// The `netgrasp_network` scope's snapshot.
 ///
-/// When the data starts first (see [`render_monitoring_window`]), then people,
-/// then devices grouped by owner with an unowned group last, then
-/// the counts, then the security-event count. The grouping is the point: "which
-/// devices have no owner" is the question this scope exists to answer, and a
-/// flat list would make the model read every line to answer it.
+/// When the data starts first (see [`render_monitoring_window`]), then the
+/// device totals by state and by owner, then what the tools are for, then the
+/// people, then the security-event count.
+///
+/// **No device lines.** This is sent with every model call in a conversation,
+/// and it used to list every device grouped by owner: on a network of 171 it was
+/// about 10,000 bytes, cut at that cap partway through the list, so it cost a
+/// third of each call and still could not be counted from. What it carries now
+/// is what no tool hands back unasked — the clock, where the data starts, the
+/// totals and who the people are — and it says which tool answers the rest.
+/// The totals are the database's, over every device.
 #[must_use]
 pub fn render_network_snapshot(
     people: &[PersonFacts],
-    devices: &[DeviceFacts],
+    counts: &DeviceCounts,
     security_events_24h: i64,
     monitoring_since: Option<i64>,
     now: i64,
 ) -> String {
-    let mut out = String::with_capacity(4_096);
+    let mut out = String::with_capacity(2_048);
 
     // First, because it bounds every answer below it: a window that starts
     // before this has no data for a reason that is not an outage.
     out.push_str(&render_monitoring_window(monitoring_since, now));
+    out.push('\n');
+
+    out.push_str(&format!("Devices by state ({} total): ", counts.total));
+    out.push_str(&counted(&counts.state, |v| v.to_string()));
+    out.push_str(".\n");
+    out.push_str(&counts.owner_sentence());
+    out.push_str(
+        "This context lists no single device. For devices, and for exact counts by \
+         state, vendor or type, call list_devices: its header counts every matching \
+         device. Use find_devices to look one up by name or address, new_devices for \
+         what appeared recently, and events for what happened (security events, \
+         scans, alerts sent).\n",
+    );
     out.push('\n');
 
     if people.is_empty() {
@@ -1885,48 +2057,675 @@ pub fn render_network_snapshot(
     }
     out.push('\n');
 
-    for person in people {
-        let owned: Vec<&DeviceFacts> = devices
-            .iter()
-            .filter(|d| d.owner_item_id.as_deref() == Some(person.item_id.as_str()))
-            .collect();
-        if owned.is_empty() {
-            continue;
-        }
-        out.push_str(&format!("{}'s devices:\n", person.name));
-        for device in owned {
-            out.push_str(&device.render_line(now, true));
-        }
-    }
-
-    let known: Vec<&str> = people.iter().map(|p| p.item_id.as_str()).collect();
-    let unowned: Vec<&DeviceFacts> = devices
-        .iter()
-        .filter(|d| {
-            d.owner_item_id
-                .as_deref()
-                .is_none_or(|owner| !known.contains(&owner))
-        })
-        .collect();
-    if unowned.is_empty() {
-        out.push_str("Unowned devices: none\n");
-    } else {
-        out.push_str(&format!("Unowned devices ({}):\n", unowned.len()));
-        for device in &unowned {
-            out.push_str(&device.render_line(now, true));
-        }
-    }
-    out.push('\n');
-
-    out.push_str(&format!("Devices by state ({} total):\n", devices.len()));
-    for (state, count) in count_by_state(devices) {
-        out.push_str(&format!("  {state}: {count}\n"));
-    }
     out.push_str(&format!(
         "Security events in the last 24 hours: {security_events_24h}\n"
     ));
 
     cap(&out, SNAPSHOT_MAX_BYTES)
+}
+
+// =============================================================================
+// Device listings with exact counts
+// =============================================================================
+
+/// The longest row limit `list_devices` accepts.
+pub const MAX_LIST_ROWS: i64 = 200;
+
+/// How many rows `list_devices` returns when the call does not say.
+///
+/// Small on purpose: the counts above the rows answer every "how many"
+/// question exactly, and every row stays in the conversation for every later
+/// model call. A question that needs the rows themselves narrows the filter or
+/// raises the limit.
+pub const DEFAULT_LIST_ROWS: i64 = 40;
+
+/// One row of [`crate::queries::SELECT_DEVICE_COUNTS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceCount {
+    /// `state`, `vendor`, `type`, `owner` or `hidden`.
+    pub dimension: String,
+    /// The value counted. `''` for an absent vendor or type.
+    #[serde(default)]
+    pub value: String,
+    /// How many devices have it.
+    pub devices: i64,
+}
+
+/// A filter's devices counted every way the header reports, gathered from
+/// [`DeviceCount`] rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceCounts {
+    /// Every matching device.
+    pub total: i64,
+    /// By state: online, idle, offline first, then the rest by name.
+    pub state: Vec<(String, i64)>,
+    /// By vendor, most first; `''` (no vendor recorded) last.
+    pub vendor: Vec<(String, i64)>,
+    /// By type, most first; `''` (not identified) last.
+    pub kind: Vec<(String, i64)>,
+    /// Devices with an owner the mirror knows.
+    pub owned: i64,
+    /// Devices with no owner.
+    pub unowned: i64,
+    /// Devices whose owner id names nobody.
+    pub owner_missing: i64,
+    /// Devices hidden from the listings.
+    pub hidden: i64,
+}
+
+impl DeviceCounts {
+    /// Gather the database's rows. The total is the sum of the state counts,
+    /// which partition the devices.
+    #[must_use]
+    pub fn from_rows(rows: &[DeviceCount]) -> Self {
+        let mut counts = Self::default();
+        for row in rows {
+            let entry = (row.value.clone(), row.devices);
+            match row.dimension.as_str() {
+                "state" => {
+                    counts.total += row.devices;
+                    counts.state.push(entry);
+                }
+                "vendor" => counts.vendor.push(entry),
+                "type" => counts.kind.push(entry),
+                "owner" => match row.value.as_str() {
+                    "person" => counts.owned += row.devices,
+                    "none" => counts.unowned += row.devices,
+                    _ => counts.owner_missing += row.devices,
+                },
+                "hidden" if row.value == "yes" => counts.hidden += row.devices,
+                _ => {}
+            }
+        }
+        let rank = |state: &str| match state {
+            "online" => 0,
+            "idle" => 1,
+            "offline" => 2,
+            _ => 3,
+        };
+        counts
+            .state
+            .sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0)));
+        for list in [&mut counts.vendor, &mut counts.kind] {
+            list.sort_by(|a, b| {
+                a.0.is_empty()
+                    .cmp(&b.0.is_empty())
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+        }
+        counts
+    }
+
+    /// How many are in one state.
+    #[must_use]
+    pub fn in_state(&self, state: &str) -> i64 {
+        self.state
+            .iter()
+            .find(|(s, _)| s == state)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// "10 have an owner, 161 have none." and, when there are any, the
+    /// dangling owners and the hidden devices.
+    #[must_use]
+    pub fn owner_sentence(&self) -> String {
+        let mut out = format!(
+            "Owners: {} belong to a person, {} to nobody",
+            self.owned, self.unowned
+        );
+        if self.owner_missing > 0 {
+            out.push_str(&format!(
+                ", {} to an owner id that names no person",
+                self.owner_missing
+            ));
+        }
+        out.push('.');
+        if self.hidden > 0 {
+            out.push_str(&format!(" {} are hidden from listings.", self.hidden));
+        }
+        out.push('\n');
+        out
+    }
+
+    /// The header lines: by state, by vendor, by type, by owner. Never cut.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "By state: {}.\n",
+            counted(&self.state, |v| v.to_string())
+        ));
+        out.push_str(&format!(
+            "By vendor: {}.\n",
+            counted(&self.vendor, |v| if v.is_empty() {
+                "no vendor recorded".to_string()
+            } else {
+                v.to_string()
+            })
+        ));
+        out.push_str(&format!(
+            "By type: {}.\n",
+            counted(&self.kind, |v| if v.is_empty() {
+                "not identified".to_string()
+            } else {
+                v.to_string()
+            })
+        ));
+        out.push_str(&self.owner_sentence());
+        out
+    }
+}
+
+/// "online 73, idle 22, offline 76".
+fn counted(list: &[(String, i64)], name: impl Fn(&str) -> String) -> String {
+    if list.is_empty() {
+        return "none".to_string();
+    }
+    list.iter()
+        .map(|(value, n)| format!("{} {n}", name(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A row limit: defaulted, and held to `0..=max`.
+///
+/// # Errors
+///
+/// A sentence naming the range.
+pub fn parse_limit(
+    arguments: &serde_json::Value,
+    key: &str,
+    default: i64,
+    max: i64,
+) -> Result<i64, String> {
+    match arguments.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .filter(|n| (0..=max).contains(n))
+            .ok_or_else(|| format!("'{key}' must be a whole number from 0 to {max}")),
+    }
+}
+
+/// An hours argument: defaulted, and held to `1..=max`.
+///
+/// # Errors
+///
+/// A sentence naming the range.
+pub fn parse_hours(
+    arguments: &serde_json::Value,
+    key: &str,
+    default: i64,
+    max: i64,
+) -> Result<i64, String> {
+    match arguments.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .filter(|n| (1..=max).contains(n))
+            .ok_or_else(|| format!("'{key}' must be a whole number of hours from 1 to {max}")),
+    }
+}
+
+/// "the last 24 hours", "the last seven days", "the last 3 days".
+#[must_use]
+pub fn hours_phrase(hours: i64) -> String {
+    match hours {
+        1 => "the last hour".to_string(),
+        168 => "the last seven days".to_string(),
+        h if h >= 48 && h % 24 == 0 => format!("the last {} days", h / 24),
+        h => format!("the last {h} hours"),
+    }
+}
+
+/// Device rows under a byte budget: as many whole lines as fit.
+///
+/// Returns the lines and how many there are, so the caller can say "showing N
+/// of M" rather than present a cut list as the whole.
+#[must_use]
+pub fn device_rows(devices: &[DeviceFacts], now: i64, budget: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut shown = 0;
+    for device in devices {
+        let line = device.listing_line(now);
+        if out.len() + line.len() > budget {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    (out, shown)
+}
+
+/// Bytes kept back from a result's rows for the "showing N of M" footer.
+const FOOTER_RESERVE: usize = 400;
+
+/// Render a `list_devices` answer: exact counts first, then rows.
+///
+/// `what` is the filter in words ("(all)", "(vendor:ubiquiti)"). `counts` are
+/// the database's, over every matching device; `devices` are the rows the
+/// limit let through. The counts are never cut. The rows are, by the limit and
+/// then by [`RESULT_MAX_BYTES`], and when they are the answer and its summary
+/// both say "showing N of M" and how to narrow.
+///
+/// Returns the content and the one-line summary the chat shows.
+#[must_use]
+pub fn render_device_listing(
+    what: &str,
+    counts: &DeviceCounts,
+    devices: &[DeviceFacts],
+    now: i64,
+    max_bytes: usize,
+) -> (String, String) {
+    if counts.total == 0 {
+        return (
+            format!("No devices {what}.\n"),
+            format!("No devices {what}"),
+        );
+    }
+    let plural = if counts.total == 1 { "" } else { "s" };
+    let mut out = format!(
+        "{} device{plural} {what}. Counts over all {}, from the database; \
+         answer any \"how many\" from these, not from the rows:\n",
+        counts.total, counts.total
+    );
+    out.push_str(&counts.render());
+
+    let budget = max_bytes.saturating_sub(out.len() + FOOTER_RESERVE);
+    let (rows, shown) = device_rows(devices, now, budget);
+    if shown > 0 {
+        out.push_str("Devices, most recently seen first:\n");
+        out.push_str(&rows);
+    }
+    let total = counts.total;
+    let all_shown = shown as i64 >= total;
+    if !all_shown {
+        out.push_str(&format!(
+            "Showing {shown} of {total}. For others, narrow the filter ({DEVICE_FILTERS}) \
+             or raise limit (up to {MAX_LIST_ROWS}).\n"
+        ));
+    }
+    let states = counted(&counts.state, |v| v.to_string());
+    let summary = if all_shown {
+        format!("Listed {total} device{plural} {what}: {states}")
+    } else {
+        format!("Showing {shown} of {total} devices {what}: {states}")
+    };
+    (out, summary)
+}
+
+// =============================================================================
+// The events tool
+// =============================================================================
+
+/// The event types the daemon writes, as found in `ng_events` on a running
+/// install (2026-11): the vocabulary the `events` tool's description offers.
+/// Not a filter: a type the daemon adds later is still counted and listed.
+pub const KNOWN_EVENT_TYPES: &[&str] = &[
+    "arp_scan",
+    "arp_spoof",
+    "gratuitous_arp",
+    "identity_change",
+    "ip_changed",
+    "ip_conflict",
+    "name_updated",
+    "new_device",
+    "person_arrived",
+    "person_departed",
+    "returned",
+    "rogue_dhcp",
+    "went_offline",
+];
+
+/// The default `events` window, in hours.
+pub const DEFAULT_EVENT_HOURS: i64 = 24;
+
+/// How many event rows `events` lists when the call does not say.
+pub const DEFAULT_EVENT_ROWS: i64 = 20;
+
+/// The most event rows `events` lists.
+pub const MAX_EVENT_ROWS: i64 = 100;
+
+/// How many devices the by-device counts name.
+pub const EVENT_DEVICE_ROWS: i64 = 10;
+
+/// An `events` call, parsed. The device is resolved by the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventQuery {
+    /// Window start, unix seconds, inclusive.
+    pub start: i64,
+    /// Window end, unix seconds, exclusive.
+    pub end: i64,
+    /// The window in words, with its preposition: "in the last 24 hours (…)",
+    /// "from … to …".
+    pub window: String,
+    /// Only these types; empty for any.
+    pub types: Vec<String>,
+    /// Only security events.
+    pub security: bool,
+    /// Only events sent as alerts.
+    pub alerts: bool,
+    /// How many rows to list.
+    pub limit: i64,
+}
+
+impl EventQuery {
+    /// Parse the arguments against the clock: `hours` (default 24, at most
+    /// seven days) ending now, or `from` and `to`, at most seven days apart.
+    ///
+    /// # Errors
+    ///
+    /// A sentence for the model.
+    pub fn parse(arguments: &serde_json::Value, now: i64) -> Result<Self, String> {
+        let from = optional_str(arguments, "from")?;
+        let to = optional_str(arguments, "to")?;
+        let (start, end, window) = match (from, to) {
+            (Some(from), Some(to)) => {
+                let (start, end) = parse_window(&from, &to)?;
+                (
+                    start,
+                    end,
+                    format!("from {} to {}", format_utc(start), format_utc(end)),
+                )
+            }
+            (None, None) => {
+                let hours = parse_hours(
+                    arguments,
+                    "hours",
+                    DEFAULT_EVENT_HOURS,
+                    MAX_WINDOW_DAYS * 24,
+                )?;
+                // One second past now, so an event written this second is in.
+                (
+                    now - hours * 3_600,
+                    now + 1,
+                    format!(
+                        "in {} ({} to now, {})",
+                        hours_phrase(hours),
+                        format_utc(now - hours * 3_600),
+                        format_utc(now)
+                    ),
+                )
+            }
+            _ => return Err("pass both 'from' and 'to', or neither".to_string()),
+        };
+        let types = match optional_str(arguments, "type")? {
+            None => Vec::new(),
+            Some(raw) => {
+                let types: Vec<String> = raw
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if let Some(bad) = types
+                    .iter()
+                    .find(|t| !t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+                {
+                    return Err(format!(
+                        "'{bad}' is not an event type. Known types: {}",
+                        KNOWN_EVENT_TYPES.join(", ")
+                    ));
+                }
+                types
+            }
+        };
+        Ok(Self {
+            start,
+            end,
+            window,
+            types,
+            security: optional_bool(arguments, "security")?.unwrap_or(false),
+            alerts: optional_bool(arguments, "alerts")?.unwrap_or(false),
+            limit: parse_limit(arguments, "limit", DEFAULT_EVENT_ROWS, MAX_EVENT_ROWS)?,
+        })
+    }
+
+    /// The six parameters of the `events` statements' shared filter, `$1`–`$6`.
+    /// `device_id` is the resolved device, or `0` for any.
+    #[must_use]
+    pub fn sql_params(&self, device_id: i64) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        vec![
+            json!(self.start),
+            json!(self.end),
+            json!(self.types.join(",")),
+            json!(self.security),
+            json!(device_id),
+            json!(self.alerts),
+        ]
+    }
+}
+
+/// One row of [`crate::queries::SELECT_EVENT_COUNTS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventTypeCount {
+    /// The daemon's event type.
+    pub event_type: String,
+    /// How many in the window.
+    pub events: i64,
+    /// How many of those were sent as alerts.
+    #[serde(default)]
+    pub sent: i64,
+}
+
+/// One row of [`crate::queries::SELECT_EVENT_DEVICE_COUNTS`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EventDeviceCount {
+    /// The device, or `None` for events about no device.
+    #[serde(default)]
+    pub device_id: Option<i64>,
+    /// How many events.
+    pub events: i64,
+    /// How many devices had events in the window, the busiest or not.
+    #[serde(default)]
+    pub device_total: i64,
+    /// Its MAC, when the device still exists.
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Typed name.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Resolved name.
+    #[serde(default)]
+    pub resolved_name: Option<String>,
+    /// Hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// mDNS name.
+    #[serde(default)]
+    pub mdns_name: Option<String>,
+}
+
+/// "Name (mac)", or a sentence for an event with no device.
+fn event_device(
+    mac: Option<&str>,
+    display_name: Option<&str>,
+    resolved_name: Option<&str>,
+    hostname: Option<&str>,
+    mdns_name: Option<&str>,
+) -> String {
+    match present(mac) {
+        Some(mac) => device_phrase(
+            &device_label(display_name, resolved_name, hostname, mdns_name, mac),
+            mac,
+        ),
+        None => "no device".to_string(),
+    }
+}
+
+/// One row of [`crate::queries::SELECT_EVENTS_IN_WINDOW`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EventWindowFacts {
+    /// The daemon's event type.
+    pub event_type: String,
+    /// When, unix seconds.
+    #[serde(default)]
+    pub ts: Option<i64>,
+    /// The daemon's detail, as JSON text.
+    #[serde(default)]
+    pub details: Option<String>,
+    /// Whether it was sent as an alert.
+    #[serde(default)]
+    pub notified: bool,
+    /// The device's MAC, when there is one.
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Typed name.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Resolved name.
+    #[serde(default)]
+    pub resolved_name: Option<String>,
+    /// Hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// mDNS name.
+    #[serde(default)]
+    pub mdns_name: Option<String>,
+}
+
+impl EventWindowFacts {
+    /// One line: when, what, which device, whether it alerted, the detail.
+    #[must_use]
+    pub fn render_line(&self, now: i64) -> String {
+        let mut line = format!(
+            "  {} {} — {}",
+            stamp(self.ts, now),
+            self.event_type,
+            event_device(
+                self.mac.as_deref(),
+                self.display_name.as_deref(),
+                self.resolved_name.as_deref(),
+                self.hostname.as_deref(),
+                self.mdns_name.as_deref(),
+            )
+        );
+        if self.notified {
+            line.push_str(", sent as an alert");
+        }
+        if let Some(detail) = self
+            .details
+            .as_deref()
+            .map(|d| ellipsize(d, 80))
+            .filter(|d| !d.is_empty() && d != "null" && d != "{}")
+        {
+            line.push_str(&format!(": {detail}"));
+        }
+        line.push('\n');
+        line
+    }
+}
+
+/// Render an `events` answer: counts by type, alerts sent and the busiest
+/// devices, all counted by the database over every matching event, then the
+/// newest rows under the byte cap.
+///
+/// `device` is the device the call was narrowed to, in words. Returns the
+/// content and the chat summary.
+#[must_use]
+pub fn render_events(
+    query: &EventQuery,
+    device: Option<&str>,
+    types: &[EventTypeCount],
+    devices: &[EventDeviceCount],
+    rows: &[EventWindowFacts],
+    now: i64,
+    max_bytes: usize,
+) -> (String, String) {
+    let mut scope = Vec::new();
+    if query.security {
+        scope.push("security events only".to_string());
+    }
+    if !query.types.is_empty() {
+        scope.push(format!("type {}", query.types.join(" or ")));
+    }
+    if let Some(device) = device {
+        scope.push(format!("about {device}"));
+    }
+    if query.alerts {
+        scope.push("only those sent as alerts".to_string());
+    }
+    let scope = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", scope.join(", "))
+    };
+    let mut out = format!("Events {}{scope}.\n", query.window);
+
+    let total: i64 = types.iter().map(|t| t.events).sum();
+    if total == 0 {
+        out.push_str("No events matched.\n");
+        return (out, format!("No events {}{scope}", query.window));
+    }
+    let sent: i64 = types.iter().map(|t| t.sent).sum();
+    out.push_str(&format!(
+        "{total} event{} in all, {sent} of them sent as alerts. By type, counted by the \
+         database over every one:\n",
+        if total == 1 { "" } else { "s" }
+    ));
+    for t in types {
+        out.push_str(&format!("  {}: {}", t.event_type, t.events));
+        if crate::model::is_security_event(&t.event_type) {
+            out.push_str(" (security)");
+        }
+        if t.sent > 0 {
+            out.push_str(&format!(", {} sent as alerts", t.sent));
+        }
+        out.push('\n');
+    }
+
+    if let Some(first) = devices.first() {
+        let named = devices.len() as i64;
+        let of = first.device_total.max(named);
+        if of > named {
+            out.push_str(&format!("By device, busiest first ({named} of {of}):\n"));
+        } else {
+            out.push_str("By device, busiest first:\n");
+        }
+        for d in devices {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                event_device(
+                    d.mac.as_deref(),
+                    d.display_name.as_deref(),
+                    d.resolved_name.as_deref(),
+                    d.hostname.as_deref(),
+                    d.mdns_name.as_deref(),
+                ),
+                d.events
+            ));
+        }
+    }
+
+    let budget = max_bytes.saturating_sub(out.len() + FOOTER_RESERVE);
+    let mut lines = String::new();
+    let mut shown = 0i64;
+    for row in rows {
+        let line = row.render_line(now);
+        if lines.len() + line.len() > budget {
+            break;
+        }
+        lines.push_str(&line);
+        shown += 1;
+    }
+    if shown > 0 {
+        out.push_str("Newest first:\n");
+        out.push_str(&lines);
+    }
+    if shown < total {
+        out.push_str(&format!(
+            "Showing {shown} of {total} events. Count from the numbers above; for other rows \
+             narrow by type, device, security or a shorter window, or raise limit (up to \
+             {MAX_EVENT_ROWS}).\n"
+        ));
+    }
+    let summary = if shown < total {
+        format!("{total} events {}{scope}; showing {shown}", query.window)
+    } else {
+        format!("{total} events {}{scope}", query.window)
+    };
+    (out, summary)
 }
 
 /// How many devices are in each state, most common first, then alphabetical.
@@ -2243,10 +3042,10 @@ mod tests {
         assert!(
             parse_device_filter("owner:")
                 .unwrap_err()
-                .contains("needs a name")
+                .contains("needs a value")
         );
         assert!(
-            parse_device_filter("offline")
+            parse_device_filter("sideways")
                 .unwrap_err()
                 .contains("unowned")
         );
@@ -2521,13 +3320,41 @@ mod tests {
     // Time rendering
     // -------------------------------------------------------------------------
 
+    /// Issue #32: the relative phrase is what the model reasons from, so it
+    /// rounds, and above a day it carries the hours too. 37 hours read "1 day
+    /// ago" and was reported as "in the last 24 hours".
+    #[test]
+    fn relative_times_round_and_never_drop_the_hours_past_a_day() {
+        let hour = 3_600;
+        assert_ne!(relative(NOW - 37 * hour, NOW), "1 day ago");
+        assert_eq!(relative(NOW - 37 * hour, NOW), "1 day 13 hours ago");
+        // 1 hour 56 minutes: the nearest hour, said to be approximate.
+        assert_eq!(relative(NOW - (hour + 56 * 60), NOW), "about 2 hours ago");
+        assert_eq!(relative(NOW - (hour + 20 * 60), NOW), "about 1 hour ago");
+        // Just under a day stays in hours, so it never reads as a day or more.
+        assert_eq!(
+            relative(NOW - (23 * hour + 40 * 60), NOW),
+            "about 24 hours ago"
+        );
+        assert_eq!(relative(NOW - 24 * hour, NOW), "1 day ago");
+        // 47 hours 50 minutes rounds to two days, not "1 day 23 hours".
+        assert_eq!(relative(NOW - (47 * hour + 50 * 60), NOW), "2 days ago");
+        assert_eq!(
+            relative(NOW - (30 * hour + 10 * 60), NOW),
+            "1 day 6 hours ago"
+        );
+        assert_eq!(relative(NOW - 59 * 60 - 40, NOW), "about 1 hour ago");
+        assert_eq!(relative(NOW + 37 * hour, NOW), "1 day 13 hours from now");
+    }
+
     #[test]
     fn timestamps_are_absolute_utc_and_relative_together() {
         assert_eq!(format_utc(NOW), "2026-08-24 12:00:00 UTC");
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
 
         assert_eq!(relative(NOW, NOW), "just now");
-        assert_eq!(relative(NOW - 90, NOW), "1 minute ago");
+        assert_eq!(relative(NOW - 89, NOW), "1 minute ago");
+        assert_eq!(relative(NOW - 90, NOW), "2 minutes ago");
         assert_eq!(relative(NOW - 7_200, NOW), "2 hours ago");
         assert_eq!(relative(NOW - 86_400 * 3, NOW), "3 days ago");
         assert_eq!(relative(NOW + 7_200, NOW), "2 hours from now");
@@ -2821,8 +3648,40 @@ mod tests {
         assert!(empty.contains("Notes: none"), "{empty}");
     }
 
+    /// What [`crate::queries::SELECT_DEVICE_COUNTS`] returns for these
+    /// devices, worked out here the way the statement's `GROUP BY`s do it, so
+    /// the renderer can be tested without a database. The statement itself is
+    /// run against the daemon's schema in `daemon_schema_test`.
+    fn count_rows(devices: &[DeviceFacts], people: &[&str]) -> Vec<DeviceCount> {
+        let mut rows: Vec<DeviceCount> = Vec::new();
+        let mut bump = |dimension: &str, value: &str| match rows
+            .iter_mut()
+            .find(|r| r.dimension == dimension && r.value == value)
+        {
+            Some(row) => row.devices += 1,
+            None => rows.push(DeviceCount {
+                dimension: dimension.into(),
+                value: value.into(),
+                devices: 1,
+            }),
+        };
+        for d in devices {
+            bump("state", d.state.as_deref().unwrap_or("unknown"));
+            bump("vendor", d.vendor.as_deref().unwrap_or(""));
+            bump("type", d.device_type.as_deref().unwrap_or(""));
+            let owner = match d.owner_item_id.as_deref() {
+                None => "none",
+                Some(id) if people.contains(&id) => "person",
+                Some(_) => "missing",
+            };
+            bump("owner", owner);
+            bump("hidden", if d.hidden { "yes" } else { "no" });
+        }
+        rows
+    }
+
     #[test]
-    fn a_network_snapshot_groups_devices_by_owner_and_counts_by_state() {
+    fn a_network_snapshot_gives_totals_and_people_and_no_device_lines() {
         let people = vec![
             PersonFacts {
                 item_id: JAMIE.into(),
@@ -2844,16 +3703,17 @@ mod tests {
             device_line("02:00:5e:00:00:01", Some(JAMIE), "online"),
             device_line("02:00:5e:00:00:04", Some(ARLO), "offline"),
             device_line("02:00:5e:00:00:06", None, "idle"),
-            // An owner id with no person behind it: a real state, and it belongs
-            // in the unowned group rather than in a group of its own.
+            // An owner id with no person behind it: a real state, counted on
+            // its own rather than as owned.
             device_line(
                 "02:00:5e:00:00:0d",
                 Some("5eed0000-0000-4000-8000-00000000dead"),
                 "online",
             ),
         ];
+        let counts = DeviceCounts::from_rows(&count_rows(&devices, &[JAMIE, ARLO]));
 
-        let snapshot = render_network_snapshot(&people, &devices, 3, Some(NOW - 86_400), NOW);
+        let snapshot = render_network_snapshot(&people, &counts, 3, Some(NOW - 86_400), NOW);
 
         assert!(
             snapshot.contains("Monitoring data begins at 2026-08-23 12:00:00 UTC (1 day ago)"),
@@ -2862,34 +3722,275 @@ mod tests {
         assert!(snapshot.contains("People (2):"), "{snapshot}");
         assert!(snapshot.contains("Jamie (5eed0000"), "{snapshot}");
         assert!(snapshot.contains("1 device, home at Studio"), "{snapshot}");
-        assert!(snapshot.contains("Jamie's devices:"), "{snapshot}");
-        assert!(snapshot.contains("Arlo's devices:"), "{snapshot}");
-        assert!(snapshot.contains("Unowned devices (2):"), "{snapshot}");
-        assert!(snapshot.contains("02:00:5e:00:00:0d"), "{snapshot}");
         assert!(
-            snapshot.contains("Devices by state (4 total):"),
+            snapshot.contains("Devices by state (4 total): online 2, idle 1, offline 1."),
             "{snapshot}"
         );
-        assert!(snapshot.contains("online: 2"), "{snapshot}");
+        assert!(
+            snapshot.contains(
+                "Owners: 2 belong to a person, 1 to nobody, 1 to an owner id that names no person."
+            ),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("call list_devices"), "{snapshot}");
         assert!(
             snapshot.contains("Security events in the last 24 hours: 3"),
+            "{snapshot}"
+        );
+        // The point of it: no device is listed, so the context does not grow
+        // with the network.
+        for mac in ["02:00:5e:00:00:01", "02:00:5e:00:00:0d"] {
+            assert!(!snapshot.contains(mac), "{mac} listed: {snapshot}");
+        }
+    }
+
+    /// The network context stays the same size however many devices there
+    /// are: it is sent with every model call, and on a 171-device network it
+    /// used to be most of the 10,000-byte snapshot cap.
+    #[test]
+    fn the_network_snapshot_does_not_grow_with_the_device_count() {
+        let devices: Vec<DeviceFacts> = (0..171).map(synthetic_device).collect();
+        let counts = DeviceCounts::from_rows(&count_rows(&devices, &[]));
+        let snapshot = render_network_snapshot(&[], &counts, 0, Some(NOW - 86_400), NOW);
+        assert!(
+            snapshot.len() < 1_500,
+            "{} bytes: {snapshot}",
+            snapshot.len()
+        );
+        assert!(
+            snapshot.contains("Devices by state (171 total): online 73, idle 22, offline 76."),
             "{snapshot}"
         );
     }
 
     #[test]
     fn an_empty_network_still_renders_something_a_model_can_read() {
-        let snapshot = render_network_snapshot(&[], &[], 0, None, NOW);
+        let snapshot = render_network_snapshot(&[], &DeviceCounts::default(), 0, None, NOW);
         assert!(
             snapshot.contains("nothing has been observed yet"),
             "{snapshot}"
         );
         assert!(snapshot.contains("People: none"), "{snapshot}");
-        assert!(snapshot.contains("Unowned devices: none"), "{snapshot}");
         assert!(
-            snapshot.contains("Devices by state (0 total):"),
+            snapshot.contains("Devices by state (0 total): none."),
             "{snapshot}"
         );
+    }
+
+    /// One of 171 synthetic devices: 73 online, 22 idle, 76 offline; 41 from
+    /// one vendor, 21 from another, 45 with no vendor, the rest spread out.
+    fn synthetic_device(i: usize) -> DeviceFacts {
+        let state = match i {
+            0..73 => "online",
+            73..95 => "idle",
+            _ => "offline",
+        };
+        // Vendors interleaved with states, so a row cap that keeps the first
+        // rows would see a skewed sample of each.
+        let vendor = match i % 171 {
+            n if n % 4 == 0 && n < 164 => Some("Vendor A".to_string()),
+            n if n % 8 == 1 => Some("Vendor B".to_string()),
+            n if n % 4 == 2 || n % 4 == 3 && n < 60 => None,
+            n => Some(format!("Vendor {}", n % 7)),
+        };
+        DeviceFacts {
+            id: i as i64 + 1,
+            mac: format!("02:00:5e:00:{:02x}:{:02x}", i / 256, i % 256),
+            resolved_name: Some(format!("device-{i}")),
+            vendor,
+            device_type: Some(["phone", "media_player", "computer"][i % 3].to_string()),
+            state: Some(state.to_string()),
+            last_seen: Some(NOW - i as i64 * 600),
+            ..DeviceFacts::default()
+        }
+    }
+
+    /// Issue #33: on 171 devices the listing stopped at about 109 lines and
+    /// the model counted those. The header's counts are the database's over
+    /// every device, and they are exact however hard the rows are capped.
+    #[test]
+    fn a_listing_of_171_devices_has_exact_header_counts_whatever_the_cap() {
+        let devices: Vec<DeviceFacts> = (0..171).map(synthetic_device).collect();
+        let rows = count_rows(&devices, &[]);
+        let counts = DeviceCounts::from_rows(&rows);
+        let vendor_a = devices
+            .iter()
+            .filter(|d| d.vendor.as_deref() == Some("Vendor A"))
+            .count();
+        let no_vendor = devices.iter().filter(|d| d.vendor.is_none()).count();
+        assert_eq!(counts.total, 171);
+
+        for cap in [RESULT_MAX_BYTES, 6_000, 2_500, 0] {
+            let (content, summary) = render_device_listing("(all)", &counts, &devices, NOW, cap);
+            assert!(content.starts_with("171 devices (all)."), "{content}");
+            assert!(
+                content.contains("By state: online 73, idle 22, offline 76."),
+                "cap {cap}: {content}"
+            );
+            assert!(
+                content.contains(&format!("By vendor: Vendor A {vendor_a},")),
+                "cap {cap}: {content}"
+            );
+            assert!(
+                content.contains(&format!("no vendor recorded {no_vendor}.")),
+                "cap {cap}: {content}"
+            );
+            assert!(
+                content.contains("By type: computer 57, media_player 57, phone 57."),
+                "cap {cap}: {content}"
+            );
+            assert!(
+                content.contains("Owners: 0 belong to a person, 171 to nobody."),
+                "cap {cap}: {content}"
+            );
+            let listed = content.lines().filter(|l| l.starts_with("  ")).count();
+            assert!(listed < 171, "cap {cap} listed every row");
+            assert!(
+                content.contains(&format!("Showing {listed} of 171.")),
+                "cap {cap}: {content}"
+            );
+            assert!(
+                summary.starts_with(&format!("Showing {listed} of 171 devices (all)")),
+                "cap {cap}: {summary}"
+            );
+            assert!(
+                content.contains("vendor:<name>"),
+                "how to narrow: {content}"
+            );
+        }
+
+        // Every row fits when the cap allows and the limit lets them through.
+        let few: Vec<DeviceFacts> = devices[..5].to_vec();
+        let five = DeviceCounts::from_rows(&count_rows(&few, &[]));
+        let (content, summary) = render_device_listing("(all)", &five, &few, NOW, RESULT_MAX_BYTES);
+        assert!(!content.contains("Showing"), "{content}");
+        assert!(summary.starts_with("Listed 5 devices (all)"), "{summary}");
+    }
+
+    #[test]
+    fn a_listing_line_carries_the_vendor_and_the_owner() {
+        let mut device = synthetic_device(0);
+        device.owner_item_id = Some(JAMIE.into());
+        device.owner_name = Some("Jamie".into());
+        let line = device.listing_line(NOW);
+        assert!(line.contains("Vendor A, phone, online"), "{line}");
+        assert!(line.contains("owner Jamie"), "{line}");
+        assert!(!line.contains(JAMIE), "{line}");
+    }
+
+    #[test]
+    fn device_filters_cover_state_vendor_and_type() {
+        assert_eq!(parse_device_filter("idle").unwrap(), DeviceFilter::Idle);
+        assert_eq!(
+            parse_device_filter("Offline").unwrap(),
+            DeviceFilter::Offline
+        );
+        assert_eq!(
+            parse_device_filter("vendor: Ubiquiti").unwrap(),
+            DeviceFilter::Vendor("Ubiquiti".into())
+        );
+        assert_eq!(
+            parse_device_filter("type:phone").unwrap(),
+            DeviceFilter::Type("phone".into())
+        );
+        assert!(parse_device_filter("vendor:").is_err());
+        assert!(parse_device_filter("sideways").is_err());
+        let params = DeviceFilter::Vendor("Ubi".into()).sql_params(None);
+        assert_eq!(params[1], json!("Ubi"));
+        assert_eq!(params[0], json!(""));
+        let params = DeviceFilter::Owner("Jamie".into()).sql_params(Some(JAMIE));
+        assert_eq!(params[5], json!(JAMIE));
+    }
+
+    #[test]
+    fn an_events_call_parses_a_window_and_refuses_a_wide_one() {
+        let q = EventQuery::parse(&json!({}), NOW).unwrap();
+        assert_eq!((q.start, q.end), (NOW - 86_400, NOW + 1));
+        assert!(q.window.starts_with("in the last 24 hours"), "{}", q.window);
+        let q = EventQuery::parse(
+            &json!({"from": "2026-11-17T23:00:00Z", "to": "2026-11-18T23:00:00Z",
+                    "type": "gratuitous_arp", "security": true}),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(q.types, vec!["gratuitous_arp".to_string()]);
+        assert!(q.security);
+        assert_eq!(q.sql_params(7)[4], json!(7));
+        assert!(EventQuery::parse(&json!({"hours": 169}), NOW).is_err());
+        assert!(EventQuery::parse(&json!({"from": "2026-11-17T23:00:00Z"}), NOW).is_err());
+        assert!(EventQuery::parse(&json!({"type": "arp scan; drop"}), NOW).is_err());
+        assert!(
+            EventQuery::parse(
+                &json!({"from": "2026-11-01T00:00:00Z", "to": "2026-11-09T00:00:00Z"}),
+                NOW
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_events_answer_counts_by_type_before_any_row_and_says_what_it_cut() {
+        let q = EventQuery::parse(&json!({"limit": 3}), NOW).unwrap();
+        let types = vec![
+            EventTypeCount {
+                event_type: "arp_scan".into(),
+                events: 812,
+                sent: 0,
+            },
+            EventTypeCount {
+                event_type: "went_offline".into(),
+                events: 30,
+                sent: 4,
+            },
+        ];
+        let devices = vec![EventDeviceCount {
+            device_id: Some(1),
+            events: 800,
+            device_total: 12,
+            mac: Some("02:00:5e:00:00:01".into()),
+            resolved_name: Some("scanner".into()),
+            ..EventDeviceCount::default()
+        }];
+        let rows: Vec<EventWindowFacts> = (0..3)
+            .map(|i| EventWindowFacts {
+                event_type: "arp_scan".into(),
+                ts: Some(NOW - i * 60),
+                details: Some("{\"targets\": 254}".into()),
+                mac: Some("02:00:5e:00:00:01".into()),
+                ..EventWindowFacts::default()
+            })
+            .collect();
+        let (content, summary) =
+            render_events(&q, None, &types, &devices, &rows, NOW, RESULT_MAX_BYTES);
+        assert!(
+            content.contains("842 events in all, 4 of them sent as alerts"),
+            "{content}"
+        );
+        assert!(
+            content.contains("  arp_scan: 812 (security)\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("  went_offline: 30, 4 sent as alerts\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("By device, busiest first (1 of 12):"),
+            "{content}"
+        );
+        assert!(
+            content.contains("scanner (02:00:5e:00:00:01): 800"),
+            "{content}"
+        );
+        assert!(content.contains("Showing 3 of 842 events."), "{content}");
+        assert!(
+            content.find("arp_scan: 812") < content.find("Newest first"),
+            "{content}"
+        );
+        assert_eq!(summary, format!("842 events {}; showing 3", q.window));
+
+        let (none, _) = render_events(&q, None, &[], &[], &[], NOW, RESULT_MAX_BYTES);
+        assert!(none.contains("No events matched."), "{none}");
     }
 
     #[test]
@@ -3165,9 +4266,9 @@ mod tests {
         owned.owner_item_id = Some("0193a5a0-0000-7000-8000-00000000000a".into());
         owned.owner_name = Some("Jamie".into());
 
-        let out = render_new_devices(&[new_device(), named, owned], now);
+        let out = render_new_devices(&[new_device(), named, owned], 168, now);
         assert!(
-            out.starts_with("3 devices first seen in the last seven days"),
+            out.starts_with("3 devices first seen in the last seven days (since "),
             "{out}"
         );
         assert!(out.contains("1 of them has neither a name"), "{out}");
@@ -3175,8 +4276,8 @@ mod tests {
         assert!(out.contains("owner Jamie"), "{out}");
 
         assert_eq!(
-            render_new_devices(&[], now),
-            "No device was first seen in the last seven days.\n"
+            render_new_devices(&[], 24, now),
+            "No device was first seen in the last 24 hours (since 2026-09-20 14:13:20 UTC).\n"
         );
     }
 

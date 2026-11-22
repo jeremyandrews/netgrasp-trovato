@@ -187,7 +187,7 @@ pub const SELECT_MONITORING_START: &str = "SELECT LEAST(\
 /// `owner_item_id` and resolves no name, which is the state the demo seed carries
 /// on purpose.
 macro_rules! device_read {
-    ($tail:literal) => {
+    ($($tail:tt)+) => {
         concat!(
             "SELECT d.id, d.mac, d.display_name, d.resolved_name, d.hostname, d.mdns_name, ",
             "d.vendor, d.device_type, d.os_family, d.state, d.last_ip, d.last_ipv6, ",
@@ -197,7 +197,7 @@ macro_rules! device_read {
             "d.first_seen_at_epoch AS first_seen, d.last_seen_at_epoch AS last_seen, ",
             "(SELECT p.name FROM ng_people p WHERE p.item_id = d.owner_item_id) AS owner_name ",
             "FROM ng_devices d ",
-            $tail
+            $($tail)+
         )
     };
 }
@@ -233,6 +233,59 @@ pub const SELECT_DEVICES_BY_STATE: &str = device_read!(
 /// Devices an admin hid from the listings. `$1` is the row limit.
 pub const SELECT_DEVICES_HIDDEN: &str =
     device_read!("WHERE d.hidden = TRUE ORDER BY d.last_seen_at DESC NULLS LAST LIMIT $1::bigint");
+
+/// The `WHERE` clause every `list_devices` read shares: `$1` a state (`''` for
+/// any), `$2` a vendor fragment, `$3` a type fragment (`''` for any, matched
+/// with `ILIKE`), `$4` unowned only, `$5` hidden only, `$6` an owner's Item id
+/// as text (`''` for any).
+///
+/// One clause for the rows and the counts, so the header's numbers are over
+/// exactly the devices the rows are drawn from. The owner compares as text, so
+/// `''` never meets a `::uuid` cast that Postgres might evaluate anyway.
+macro_rules! device_filter {
+    () => {
+        "WHERE ($1::text = '' OR d.state = $1::text) \
+           AND ($2::text = '' OR d.vendor ILIKE '%' || $2::text || '%') \
+           AND ($3::text = '' OR d.device_type ILIKE '%' || $3::text || '%') \
+           AND (NOT $4::boolean OR d.owner_item_id IS NULL) \
+           AND (NOT $5::boolean OR d.hidden) \
+           AND ($6::text = '' OR d.owner_item_id::text = $6::text) "
+    };
+}
+
+/// The devices one `list_devices` filter selects, most recently seen first.
+/// `$1`–`$6` are `device_filter!`'s, `$7` the row limit.
+pub const SELECT_DEVICES_FILTERED: &str = device_read!(concat!(
+    device_filter!(),
+    "ORDER BY d.last_seen_at DESC NULLS LAST, d.id LIMIT $7::bigint"
+));
+
+/// How many devices one `list_devices` filter selects, by state, by vendor, by
+/// type, by owner and by hidden, over **every** matching row. `$1`–`$6` are
+/// `device_filter!`'s.
+///
+/// This is what makes a count answer exact whatever the row cap does: on a
+/// network of 171 devices the listing used to stop at about 109 lines and the
+/// model counted those as if they were all of them (issue #33). The database
+/// counts here, before any row is cut.
+///
+/// `owner` is `none` (no owner), `person` (an owner the mirror knows) or
+/// `missing` (an owner id nobody has any more). An absent vendor or type is
+/// `''`, which the renderer words.
+pub const SELECT_DEVICE_COUNTS: &str = concat!(
+    "WITH m AS (SELECT d.state, d.vendor, d.device_type, d.hidden, d.owner_item_id ",
+    "FROM ng_devices d ",
+    device_filter!(),
+    ") ",
+    "SELECT 'state'::text AS dimension, COALESCE(NULLIF(btrim(state), ''), 'unknown') AS value, ",
+    "COUNT(*) AS devices FROM m GROUP BY 2 ",
+    "UNION ALL SELECT 'vendor', COALESCE(btrim(vendor), ''), COUNT(*) FROM m GROUP BY 2 ",
+    "UNION ALL SELECT 'type', COALESCE(btrim(device_type), ''), COUNT(*) FROM m GROUP BY 2 ",
+    "UNION ALL SELECT 'owner', CASE WHEN owner_item_id IS NULL THEN 'none' ",
+    "WHEN EXISTS (SELECT 1 FROM ng_people p WHERE p.item_id = m.owner_item_id) THEN 'person' ",
+    "ELSE 'missing' END, COUNT(*) FROM m GROUP BY 2 ",
+    "UNION ALL SELECT 'hidden', CASE WHEN hidden THEN 'yes' ELSE 'no' END, COUNT(*) FROM m GROUP BY 2"
+);
 
 /// Devices whose name or address contains a fragment. `$1` is the fragment,
 /// `$2` the row limit.
@@ -382,13 +435,77 @@ pub const SELECT_PEOPLE_HOME: &str = "SELECT item_id::text AS item_id, name, cur
      ORDER BY last_arrived_at_epoch ASC NULLS LAST, name ASC";
 
 /// Devices first seen in the last seven days, newest first, hidden ones left
-/// out as the overview leaves them out. `$1` is the row limit.
+/// out as the overview leaves them out. `$1` is the row limit, `$2` a cutoff in
+/// unix seconds: only devices first seen at or after it. The view already stops
+/// at seven days, so a cutoff further back changes nothing.
+///
+/// `total` is how many devices matched before the limit, so a capped answer
+/// can say "showing 100 of 130" rather than claim the 100 are all of them.
 pub const SELECT_NEW_DEVICES: &str = "SELECT id, mac, display_name, resolved_name, hostname, \
      mdns_name, vendor, device_type, device_type_confidence, os_family, \
      identity_source, state, last_ip, owner_item_id::text AS owner_item_id, owner_name, \
-     first_seen_at_epoch AS first_seen, last_seen_at_epoch AS last_seen \
-     FROM ng_devices_new WHERE NOT hidden \
+     first_seen_at_epoch AS first_seen, last_seen_at_epoch AS last_seen, \
+     COUNT(*) OVER () AS total \
+     FROM ng_devices_new WHERE NOT hidden AND first_seen_at_epoch >= $2::bigint \
      ORDER BY first_seen_at_epoch DESC LIMIT $1::bigint";
+
+// ---------------------------------------------------------------------------
+// The events tool
+// ---------------------------------------------------------------------------
+
+/// The `WHERE` clause the three `events` reads share: `$1` the window start and
+/// `$2` its end, in unix seconds (start inclusive, end exclusive); `$3` a
+/// comma-separated list of event types (`''` for any); `$4` security events
+/// only; `$5` one device's id (`0` for any); `$6` only events sent as alerts.
+///
+/// The window is compared on `"timestamp"` rather than its epoch twin because
+/// that is the column the daemon indexes (`ng_events_time_idx`); the twin is
+/// only ever *selected*. The security list is the one
+/// [`SELECT_SECURITY_EVENTS`] carries, held to
+/// [`crate::model::SECURITY_EVENT_TYPES`] by a test.
+macro_rules! event_filter {
+    () => {
+        "WHERE e.\"timestamp\" >= to_timestamp($1::bigint) \
+           AND e.\"timestamp\" < to_timestamp($2::bigint) \
+           AND ($3::text = '' OR e.event_type = ANY (string_to_array($3::text, ','))) \
+           AND (NOT $4::boolean OR e.event_type IN \
+                ('arp_scan', 'arp_spoof', 'gratuitous_arp', 'identity_change', 'ip_conflict', 'rogue_dhcp')) \
+           AND ($5::bigint = 0 OR e.device_id = $5::bigint) \
+           AND (NOT $6::boolean OR e.notified) "
+    };
+}
+
+/// Events in a window, counted by type over every matching row, most common
+/// first. `$1`–`$6` are `event_filter!`'s. `sent` is how many of each were
+/// delivered as alerts.
+pub const SELECT_EVENT_COUNTS: &str = concat!(
+    "SELECT e.event_type, COUNT(*) AS events, COUNT(*) FILTER (WHERE e.notified) AS sent ",
+    "FROM ng_events e ",
+    event_filter!(),
+    "GROUP BY e.event_type ORDER BY 2 DESC, 1"
+);
+
+/// Events in a window, counted by device, the busiest first. `$1`–`$6` are
+/// `event_filter!`'s, `$7` how many devices to name. `device_total` is how
+/// many devices (or none, for events with no device) there were in all.
+pub const SELECT_EVENT_DEVICE_COUNTS: &str = concat!(
+    "SELECT c.device_id, c.events, COUNT(*) OVER () AS device_total, d.mac, d.display_name, ",
+    "d.resolved_name, d.hostname, d.mdns_name ",
+    "FROM (SELECT e.device_id, COUNT(*) AS events FROM ng_events e ",
+    event_filter!(),
+    "GROUP BY e.device_id) c LEFT JOIN ng_devices d ON d.id = c.device_id ",
+    "ORDER BY c.events DESC, c.device_id LIMIT $7::bigint"
+);
+
+/// The newest events in a window, with the device each was about. `$1`–`$6`
+/// are `event_filter!`'s, `$7` the row limit.
+pub const SELECT_EVENTS_IN_WINDOW: &str = concat!(
+    "SELECT e.event_type, e.timestamp_epoch AS ts, e.details::text AS details, e.notified, ",
+    "d.mac, d.display_name, d.resolved_name, d.hostname, d.mdns_name ",
+    "FROM ng_events e LEFT JOIN ng_devices d ON d.id = e.device_id ",
+    event_filter!(),
+    "ORDER BY e.\"timestamp\" DESC, e.id DESC LIMIT $7::bigint"
+);
 
 // ---------------------------------------------------------------------------
 // People: the person page, the bulk form, merge (U2)
@@ -603,6 +720,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DEVICES_BY_STATE", SELECT_DEVICES_BY_STATE),
     ("SELECT_DEVICES_HIDDEN", SELECT_DEVICES_HIDDEN),
     ("SELECT_DEVICES_BY_NAME", SELECT_DEVICES_BY_NAME),
+    ("SELECT_DEVICES_FILTERED", SELECT_DEVICES_FILTERED),
+    ("SELECT_DEVICE_COUNTS", SELECT_DEVICE_COUNTS),
     ("SELECT_PEOPLE_WITH_COUNTS", SELECT_PEOPLE_WITH_COUNTS),
     ("SELECT_PERSON_WITH_COUNT", SELECT_PERSON_WITH_COUNT),
     ("SELECT_PERSON_HOLDING_NAME", SELECT_PERSON_HOLDING_NAME),
@@ -615,6 +734,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_MOVEMENTS_ON_DAY", SELECT_MOVEMENTS_ON_DAY),
     ("SELECT_PEOPLE_HOME", SELECT_PEOPLE_HOME),
     ("SELECT_NEW_DEVICES", SELECT_NEW_DEVICES),
+    // The events tool (U15).
+    ("SELECT_EVENT_COUNTS", SELECT_EVENT_COUNTS),
+    ("SELECT_EVENT_DEVICE_COUNTS", SELECT_EVENT_DEVICE_COUNTS),
+    ("SELECT_EVENTS_IN_WINDOW", SELECT_EVENTS_IN_WINDOW),
     // People (U2).
     ("SELECT_DEVICES_TO_SORT", SELECT_DEVICES_TO_SORT),
     ("SELECT_PERSON_PRESENCE", SELECT_PERSON_PRESENCE),
@@ -784,6 +907,9 @@ mod tests {
         for (name, sql) in [
             ("SELECT_SECURITY_EVENTS", SELECT_SECURITY_EVENTS),
             ("SELECT_SECURITY_EVENT_COUNT", SELECT_SECURITY_EVENT_COUNT),
+            ("SELECT_EVENT_COUNTS", SELECT_EVENT_COUNTS),
+            ("SELECT_EVENT_DEVICE_COUNTS", SELECT_EVENT_DEVICE_COUNTS),
+            ("SELECT_EVENTS_IN_WINDOW", SELECT_EVENTS_IN_WINDOW),
         ] {
             for event_type in crate::model::SECURITY_EVENT_TYPES {
                 assert!(
@@ -825,6 +951,7 @@ mod tests {
             ("SELECT_DEVICES_BY_STATE", SELECT_DEVICES_BY_STATE),
             ("SELECT_DEVICES_HIDDEN", SELECT_DEVICES_HIDDEN),
             ("SELECT_DEVICES_BY_NAME", SELECT_DEVICES_BY_NAME),
+            ("SELECT_DEVICES_FILTERED", SELECT_DEVICES_FILTERED),
             ("SELECT_DEVICES_TO_SORT", SELECT_DEVICES_TO_SORT),
         ];
         let projection_of = |sql: &str| -> String {

@@ -150,22 +150,32 @@ fn load_owned_devices(item_id: &str) -> Result<Vec<DeviceFacts>, String> {
     .map_err(|e| format!("could not read the devices: {e}"))
 }
 
-/// Devices matching a listing filter.
-fn load_devices(filter: &DeviceFilter) -> Result<Vec<DeviceFacts>, String> {
-    match filter {
-        DeviceFilter::All => query_rows(queries::SELECT_DEVICES_ALL, &[json!(LIST_LIMIT)]),
-        DeviceFilter::Unowned => query_rows(queries::SELECT_DEVICES_UNOWNED, &[json!(LIST_LIMIT)]),
-        DeviceFilter::Online => query_rows(
-            queries::SELECT_DEVICES_BY_STATE,
-            &[json!("online"), json!(LIST_LIMIT)],
-        ),
-        DeviceFilter::Hidden => query_rows(queries::SELECT_DEVICES_HIDDEN, &[json!(LIST_LIMIT)]),
-        DeviceFilter::Owner(who) => {
-            let person = resolve_person(who)?;
-            return load_owned_devices(&person.item_id);
-        }
+/// The six filter parameters a `list_devices` filter binds, the owner resolved.
+fn filter_params(filter: &DeviceFilter) -> Result<Vec<Value>, String> {
+    let owner = match filter {
+        DeviceFilter::Owner(who) => Some(resolve_person(who)?.item_id),
+        _ => None,
+    };
+    Ok(filter.sql_params(owner.as_deref()))
+}
+
+/// Every device a filter selects, counted by state, vendor, type and owner by
+/// the database, over all of them.
+fn load_device_counts(params: &[Value]) -> Result<assist::DeviceCounts, String> {
+    let rows: Vec<assist::DeviceCount> = query_rows(queries::SELECT_DEVICE_COUNTS, params)
+        .map_err(|e| format!("could not count the devices: {e}"))?;
+    Ok(assist::DeviceCounts::from_rows(&rows))
+}
+
+/// The devices a filter selects, at most `limit`, most recently seen first.
+fn load_filtered_devices(params: &[Value], limit: i64) -> Result<Vec<DeviceFacts>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
     }
-    .map_err(|e| format!("could not read the devices: {e}"))
+    let mut bound = params.to_vec();
+    bound.push(json!(limit));
+    query_rows(queries::SELECT_DEVICES_FILTERED, &bound)
+        .map_err(|e| format!("could not read the devices: {e}"))
 }
 
 /// A device's three timelines: presence, locations and events.
@@ -1062,12 +1072,16 @@ pub fn scopes() -> Vec<trovato_sdk::types::AssistantScope> {
     )
     .description("Everything on the network: who owns what, and who is home.")
     .prompt(prompt(
-        "You are looking at the WHOLE network. The context lists every person and \
-         every device, grouped by owner. Use it to answer questions about ownership \
-         and presence, and propose changes when asked to tidy something up. \
+        "You are looking at the WHOLE network. The context gives the clock, the \
+         device totals by state and owner, and every person; it lists no single \
+         device. For any device question, and any count by state, vendor or type, \
+         call list_devices: its header has the database's exact counts over every \
+         matching device, so answer counts from the header, never by counting rows. \
          For who came or went on a day, and who is home now, call \
          arrivals_and_departures; for what appeared on the network recently, call \
-         new_devices. Both read exactly what the overview page shows.",
+         new_devices with the hours asked about; for what happened (security \
+         events, scans, alerts sent, event counts), call events. Read the absolute \
+         UTC times, not only the relative ones, when a question names a window.",
     ))
     .suggestions([
         "Who came home today?",
@@ -1093,25 +1107,70 @@ pub fn scopes() -> Vec<trovato_sdk::types::AssistantScope> {
             }
         })),
     )
-    .tool(AssistantTool::read(
-        "new_devices",
-        "Devices first seen on the network in the last seven days, newest first: \
-         what each looks like, how sure the daemon is, who owns it, and which still \
-         need a name or an owner.",
-    ))
+    .tool(
+        AssistantTool::read(
+            "new_devices",
+            "Devices first seen on the network in the last `hours` (default 168, \
+             seven days), newest first: what each looks like, how sure the daemon \
+             is, who owns it, and which still need a name or an owner. For \
+             \"joined in the last 24 hours\" pass hours: 24.",
+        )
+        .parameters(json!({
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How far back, in hours (1 to 168). Defaults to 168."
+                }
+            }
+        })),
+    )
     .tool(
         AssistantTool::read(
             "list_devices",
-            "List devices: all of them, or only the unowned, online or hidden ones, \
-             or only one person's.",
+            "Devices matching one filter. The header gives exact counts over every \
+             matching device by state, vendor, type and owner; then up to `limit` \
+             rows, most recently seen first, each with vendor, type, state and last \
+             seen. For a count, read the header (limit 0 returns only the header).",
         )
         .parameters(json!({
             "type": "object",
             "properties": {
                 "filter": {
                     "type": "string",
-                    "description": "all, unowned, online, hidden, or owner:<name or uuid>."
+                    "description": "all, online, idle, offline, unowned, hidden, \
+                                    owner:<name or uuid>, vendor:<part of a vendor name>, \
+                                    or type:<part of a device type>. Defaults to all."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many rows to list, 0 to 200. Defaults to 40."
                 }
+            }
+        })),
+    )
+    .tool(
+        AssistantTool::read(
+            "events",
+            "What the daemon recorded in a window: counts by event type (and how \
+             many were sent as alerts) and by device over every matching event, then \
+             the newest rows. Window: `hours` ending now (default 24), or `from` and \
+             `to`; at most seven days. Types include new_device, went_offline, \
+             returned, ip_changed, name_updated, person_arrived, person_departed, \
+             and the security types arp_scan, arp_spoof, gratuitous_arp, \
+             identity_change, ip_conflict, rogue_dhcp.",
+        )
+        .parameters(json!({
+            "type": "object",
+            "properties": {
+                "hours": {"type": "integer", "description": "1 to 168, ending now. Defaults to 24."},
+                "from": {"type": "string", "description": "ISO 8601 start, with `to` instead of hours."},
+                "to": {"type": "string", "description": "ISO 8601 end, later than `from`."},
+                "type": {"type": "string", "description": "One event type, or several separated by commas."},
+                "security": {"type": "boolean", "description": "Only security events."},
+                "alerts": {"type": "boolean", "description": "Only events sent as alerts."},
+                "device": {"type": "string", "description": "Only one device: a MAC address or numeric id."},
+                "limit": {"type": "integer", "description": "Rows to list, 0 to 100. Defaults to 20."}
             }
         })),
     )
@@ -1282,7 +1341,10 @@ fn person_context(item_id: &str, clock: i64) -> AssistantContext {
 
 fn network_context(clock: i64) -> AssistantContext {
     let people = load_people().unwrap_or_default();
-    let devices = load_devices(&DeviceFilter::All).unwrap_or_default();
+    let counts = load_device_counts(&DeviceFilter::All.sql_params(None)).unwrap_or_else(|e| {
+        host::log("warning", "netgrasp", &format!("network context: {e}"));
+        assist::DeviceCounts::default()
+    });
     let security = security_event_count(clock).unwrap_or(0);
     // When the data starts. A failed read degrades to `None`, which says
     // "nothing has been observed yet" — wrong in the same direction the rest of
@@ -1297,7 +1359,7 @@ fn network_context(clock: i64) -> AssistantContext {
         None
     });
     let snapshot =
-        assist::render_network_snapshot(&people, &devices, security, monitoring_since, clock);
+        assist::render_network_snapshot(&people, &counts, security, monitoring_since, clock);
 
     AssistantContext::new("Netgrasp network", snapshot)
         .link("Devices", "/devices")
@@ -1345,7 +1407,8 @@ pub fn tool(call: &trovato_sdk::types::AssistantToolCall) -> AssistantToolResult
         (SCOPE_NETWORK, "list_devices") => list_devices(&call.arguments),
         (SCOPE_NETWORK, "who_was_online") => who_was_online(&call.arguments),
         (SCOPE_NETWORK, "arrivals_and_departures") => arrivals_and_departures(&call.arguments),
-        (SCOPE_NETWORK, "new_devices") => new_devices(),
+        (SCOPE_NETWORK, "new_devices") => new_devices(&call.arguments),
+        (SCOPE_NETWORK, "events") => events(&call.arguments),
 
         // Writes.
         (SCOPE_DEVICE, "set_owner") => set_owner(&scope_id, &call.arguments, describing),
@@ -1419,12 +1482,23 @@ fn find_devices(arguments: &Value) -> Result<AssistantToolResult, String> {
 fn list_devices(arguments: &Value) -> Result<AssistantToolResult, String> {
     let raw = assist::optional_str(arguments, "filter")?.unwrap_or_else(|| "all".to_string());
     let filter = assist::parse_device_filter(&raw)?;
-    let devices = load_devices(&filter)?;
-    Ok(render_device_list(
+    let limit = assist::parse_limit(
+        arguments,
+        "limit",
+        assist::DEFAULT_LIST_ROWS,
+        assist::MAX_LIST_ROWS,
+    )?;
+    let params = filter_params(&filter)?;
+    let counts = load_device_counts(&params)?;
+    let devices = load_filtered_devices(&params, limit)?;
+    let (content, summary) = assist::render_device_listing(
+        &format!("({})", raw.trim()),
+        &counts,
         &devices,
-        &format!("({raw})"),
         now().unwrap_or(0),
-    ))
+        assist::RESULT_MAX_BYTES,
+    );
+    Ok(AssistantToolResult::ok(content, summary))
 }
 
 fn person_devices(item_id: &str) -> Result<AssistantToolResult, String> {
@@ -1437,6 +1511,8 @@ fn person_devices(item_id: &str) -> Result<AssistantToolResult, String> {
     ))
 }
 
+/// A plain device list, for the reads that have no counts header: rows under the
+/// byte cap, and "showing N of M" when the cap cut them.
 fn render_device_list(devices: &[DeviceFacts], what: &str, clock: i64) -> AssistantToolResult {
     if devices.is_empty() {
         return AssistantToolResult::ok(
@@ -1444,21 +1520,21 @@ fn render_device_list(devices: &[DeviceFacts], what: &str, clock: i64) -> Assist
             format!("No devices {what}"),
         );
     }
-    let mut out = format!("{} devices {what}:\n", devices.len());
-    for device in devices {
-        out.push_str(&device.render_line(clock, true));
-        if let Some(owner) = device.owner() {
-            out.push_str(&format!("    owner: {}\n", person_line(&owner)));
-        }
+    let total = devices.len();
+    let mut out = format!("{total} devices {what}:\n");
+    let (rows, shown) = assist::device_rows(
+        devices,
+        clock,
+        assist::RESULT_MAX_BYTES.saturating_sub(out.len() + 200),
+    );
+    out.push_str(&rows);
+    if shown < total {
+        out.push_str(&format!(
+            "Showing {shown} of {total}. Search for something narrower to see the rest.\n"
+        ));
+        return AssistantToolResult::ok(out, format!("Showing {shown} of {total} devices {what}"));
     }
-    AssistantToolResult::ok(
-        assist::cap(&out, assist::RESULT_MAX_BYTES),
-        format!("Listed {} devices {what}", devices.len()),
-    )
-}
-
-fn person_line(person: &PersonCandidate) -> String {
-    format!("{} ({})", person.name, person.item_id)
+    AssistantToolResult::ok(out, format!("Listed {total} devices {what}"))
 }
 
 fn device_history_here(item_id: &str, arguments: &Value) -> Result<AssistantToolResult, String> {
@@ -1556,18 +1632,76 @@ fn arrivals_and_departures(arguments: &Value) -> Result<AssistantToolResult, Str
     ))
 }
 
-/// Devices first seen in the last seven days.
-fn new_devices() -> Result<AssistantToolResult, String> {
+/// Devices first seen in the last `hours` (default seven days).
+fn new_devices(arguments: &Value) -> Result<AssistantToolResult, String> {
+    let hours = assist::parse_hours(
+        arguments,
+        "hours",
+        assist::DEFAULT_NEW_DEVICE_HOURS,
+        assist::MAX_WINDOW_DAYS * 24,
+    )?;
+    let clock = now().map_err(|e| format!("could not read the clock: {e}"))?;
     let devices: Vec<NewDeviceFacts> = query_rows(
         queries::SELECT_NEW_DEVICES,
-        &[json!(assist::MAX_NEW_DEVICE_ROWS)],
+        &[
+            json!(assist::MAX_NEW_DEVICE_ROWS),
+            json!(clock - hours * 3_600),
+        ],
     )
     .map_err(|e| format!("could not read the new devices: {e}"))?;
-    let rendered = assist::render_new_devices(&devices, now().unwrap_or(0));
+    let total = devices.first().map_or(0, |d| d.total);
+    let rendered = assist::render_new_devices(&devices, hours, clock);
     Ok(AssistantToolResult::ok(
         rendered,
-        format!("{} devices new this week", devices.len()),
+        format!(
+            "{total} devices first seen in {}",
+            assist::hours_phrase(hours)
+        ),
     ))
+}
+
+/// Events in a window: counts by type and by device over every one, then the
+/// newest rows. Read only, like every read here.
+fn events(arguments: &Value) -> Result<AssistantToolResult, String> {
+    let clock = now().map_err(|e| format!("could not read the clock: {e}"))?;
+    let query = assist::EventQuery::parse(arguments, clock)?;
+    let device = match assist::optional_str(arguments, "device")? {
+        Some(raw) => Some(load_device(&assist::parse_device_ref(&raw)?)?),
+        None => None,
+    };
+    let params = query.sql_params(device.as_ref().map_or(0, |d| d.id));
+
+    let types: Vec<assist::EventTypeCount> = query_rows(queries::SELECT_EVENT_COUNTS, &params)
+        .map_err(|e| format!("could not count the events: {e}"))?;
+    let (devices, rows) = if types.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut by_device = params.clone();
+        by_device.push(json!(assist::EVENT_DEVICE_ROWS));
+        let devices: Vec<assist::EventDeviceCount> =
+            query_rows(queries::SELECT_EVENT_DEVICE_COUNTS, &by_device)
+                .map_err(|e| format!("could not count the events by device: {e}"))?;
+        let rows: Vec<assist::EventWindowFacts> = if query.limit == 0 {
+            Vec::new()
+        } else {
+            let mut listed = params.clone();
+            listed.push(json!(query.limit));
+            query_rows(queries::SELECT_EVENTS_IN_WINDOW, &listed)
+                .map_err(|e| format!("could not read the events: {e}"))?
+        };
+        (devices, rows)
+    };
+
+    let (content, summary) = assist::render_events(
+        &query,
+        device.as_ref().map(DeviceFacts::phrase).as_deref(),
+        &types,
+        &devices,
+        &rows,
+        clock,
+        assist::RESULT_MAX_BYTES,
+    );
+    Ok(AssistantToolResult::ok(content, summary))
 }
 
 // --- writes ---------------------------------------------------------------

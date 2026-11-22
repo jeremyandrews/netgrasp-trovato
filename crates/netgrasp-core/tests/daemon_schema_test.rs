@@ -1610,13 +1610,354 @@ async fn the_overview_reads_decode_through_the_db_host_over_the_daemons_schema()
     assert_eq!(home[0].devices_online, 1);
     assert_eq!(home[1].arrived, None);
 
-    let new: Vec<NewDeviceFacts> =
-        query_rows(&mut conn, queries::SELECT_NEW_DEVICES, &[json!(50)]).await;
+    let new: Vec<NewDeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_NEW_DEVICES,
+        &[json!(50), json!(now() - 7 * 86_400)],
+    )
+    .await;
     assert_eq!(new.len(), 1, "the 300-day-old phone is not new");
     assert_eq!(new[0].mac, "aa:bb:cc:00:07:02");
     let confidence = new[0].device_type_confidence.expect("a REAL decodes");
     assert!((confidence - 0.75).abs() < 1e-6, "{confidence}");
     assert!(new[0].first_seen.is_some());
+    assert_eq!(new[0].total, 1);
+}
+
+/// Issue #32: `new_devices` with `hours: 24` leaves out a device first seen 30
+/// hours ago, and keeps one first seen 2 hours ago. Before, it had no window
+/// and the model read "first seen 1 day ago" as inside the last day.
+#[tokio::test]
+async fn new_devices_in_the_last_24_hours_leaves_out_one_first_seen_30_hours_ago() {
+    use netgrasp_core::assist::{NewDeviceFacts, render_new_devices};
+
+    let mut conn = scratch(
+        "new_devices_window",
+        &format!("{DAEMON_SCHEMA}\n{OVERVIEW_VIEWS}"),
+    )
+    .await;
+    let now = now();
+    for (mac, hours_ago) in [("02:00:5e:00:30:01", 30), ("02:00:5e:00:02:01", 2)] {
+        let id = seed_device(&mut conn, mac, None, now).await;
+        exec(
+            &mut conn,
+            "UPDATE ng_devices SET first_seen_at = to_timestamp($1::bigint) WHERE id = $2::bigint",
+            &[json!(now - hours_ago * 3_600), json!(id)],
+        )
+        .await;
+    }
+
+    let day: Vec<NewDeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_NEW_DEVICES,
+        &[json!(100), json!(now - 24 * 3_600)],
+    )
+    .await;
+    let macs: Vec<&str> = day.iter().map(|d| d.mac.as_str()).collect();
+    assert_eq!(
+        macs,
+        ["02:00:5e:00:02:01"],
+        "30 hours ago is not the last 24"
+    );
+    let text = render_new_devices(&day, 24, now);
+    assert!(
+        text.starts_with("1 device first seen in the last 24 hours"),
+        "{text}"
+    );
+    assert!(!text.contains("02:00:5e:00:30:01"), "{text}");
+
+    let week: Vec<NewDeviceFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_NEW_DEVICES,
+        &[json!(100), json!(now - 168 * 3_600)],
+    )
+    .await;
+    assert_eq!(week.len(), 2);
+    assert_eq!(week[0].total, 2);
+    let text = render_new_devices(&week, 168, now);
+    assert!(text.contains("first seen 2"), "{text}");
+    assert!(text.contains("(1 day 6 hours ago)"), "{text}");
+}
+
+/// Issue #33, against the daemon's schema: 171 devices, counted by the
+/// database. The header is exact whatever the row limit and the byte cap let
+/// through, and the rows say how many of how many they are.
+#[tokio::test]
+async fn list_devices_counts_all_171_devices_in_sql_whatever_the_cap() {
+    use netgrasp_core::assist::{
+        DeviceCount, DeviceCounts, DeviceFacts, DeviceFilter, render_device_listing,
+    };
+
+    let mut conn = daemon_db("list_171").await;
+    // 73 online, 22 idle, 76 offline; 41 from Vendor A, 21 from Vendor B, 45
+    // with no vendor, 64 from Vendor C; one owned by a person, one by an id
+    // nobody has, two hidden.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_devices (mac, vendor, device_type, state, first_seen_at, last_seen_at, hidden) \
+         SELECT '02:00:5e:01:' || lpad(to_hex(i / 256), 2, '0') || ':' || lpad(to_hex(i % 256), 2, '0'), \
+                CASE WHEN i % 171 < 41 THEN 'Vendor A' WHEN i < 62 THEN 'Vendor B' \
+                     WHEN i < 107 THEN NULL ELSE 'Vendor C' END, \
+                CASE WHEN i % 3 = 0 THEN 'phone' ELSE 'media_player' END, \
+                CASE WHEN i % 7 = 0 AND i < 154 THEN 'idle' \
+                     WHEN i % 2 = 0 THEN 'online' ELSE 'offline' END, \
+                now() - interval '30 days', now() - (i || ' minutes')::interval, i < 2 \
+         FROM generate_series(0, 170) AS i",
+        &[],
+    )
+    .await;
+    exec(
+        &mut conn,
+        "INSERT INTO ng_people (item_id, name) VALUES ($1::uuid, 'Jamie')",
+        &[json!(PERSON)],
+    )
+    .await;
+    exec(
+        &mut conn,
+        "UPDATE ng_devices SET owner_item_id = CASE WHEN mac LIKE '%:00:05' THEN $1::uuid \
+                                                   ELSE $2::uuid END \
+         WHERE mac LIKE '%:00:05' OR mac LIKE '%:00:06'",
+        &[json!(PERSON), json!(ITEM_A)],
+    )
+    .await;
+
+    #[derive(serde::Deserialize)]
+    struct Truth {
+        online: i64,
+        idle: i64,
+        offline: i64,
+        vendor_a: i64,
+        no_vendor: i64,
+    }
+    let truth: Vec<Truth> = query_rows(
+        &mut conn,
+        "SELECT count(*) FILTER (WHERE state = 'online') AS online, \
+                count(*) FILTER (WHERE state = 'idle') AS idle, \
+                count(*) FILTER (WHERE state = 'offline') AS offline, \
+                count(*) FILTER (WHERE vendor = 'Vendor A') AS vendor_a, \
+                count(*) FILTER (WHERE vendor IS NULL) AS no_vendor FROM ng_devices",
+        &[],
+    )
+    .await;
+    let truth = &truth[0];
+    assert_eq!(truth.online + truth.idle + truth.offline, 171);
+
+    let params = DeviceFilter::All.sql_params(None);
+    let rows: Vec<DeviceCount> =
+        query_rows(&mut conn, queries::SELECT_DEVICE_COUNTS, &params).await;
+    let counts = DeviceCounts::from_rows(&rows);
+    assert_eq!(counts.total, 171);
+    assert_eq!(counts.in_state("online"), truth.online);
+    assert_eq!(counts.in_state("idle"), truth.idle);
+    assert_eq!(counts.in_state("offline"), truth.offline);
+    assert_eq!(
+        (counts.owned, counts.owner_missing, counts.unowned),
+        (1, 1, 169)
+    );
+    assert_eq!(counts.hidden, 2);
+
+    for (limit, cap) in [(200, 12_000), (40, 12_000), (200, 3_000)] {
+        let mut bound = params.clone();
+        bound.push(json!(limit));
+        let devices: Vec<DeviceFacts> =
+            query_rows(&mut conn, queries::SELECT_DEVICES_FILTERED, &bound).await;
+        assert_eq!(devices.len() as i64, limit.min(171));
+        let (content, summary) = render_device_listing("(all)", &counts, &devices, now(), cap);
+        assert!(
+            content.contains(&format!(
+                "By state: online {}, idle {}, offline {}.",
+                truth.online, truth.idle, truth.offline
+            )),
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!("Vendor A {}", truth.vendor_a)),
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!("no vendor recorded {}.", truth.no_vendor)),
+            "{content}"
+        );
+        let listed = content.lines().filter(|l| l.starts_with("  ")).count();
+        assert!(listed < 171, "limit {limit}, cap {cap}: every row fit");
+        assert!(
+            content.contains(&format!("Showing {listed} of 171.")),
+            "{content}"
+        );
+        assert!(
+            summary.starts_with(&format!("Showing {listed} of 171 devices")),
+            "{summary}"
+        );
+    }
+
+    // The filters select what they say, and their counts are over just them.
+    for (filter, expected) in [
+        (DeviceFilter::Offline, truth.offline),
+        (DeviceFilter::Idle, truth.idle),
+        (DeviceFilter::Vendor("vendor a".into()), truth.vendor_a),
+        (DeviceFilter::Type("phone".into()), 57),
+        (DeviceFilter::Hidden, 2),
+        (DeviceFilter::Unowned, 169),
+    ] {
+        let params = filter.sql_params(None);
+        let rows: Vec<DeviceCount> =
+            query_rows(&mut conn, queries::SELECT_DEVICE_COUNTS, &params).await;
+        assert_eq!(DeviceCounts::from_rows(&rows).total, expected, "{filter:?}");
+        let mut bound = params.clone();
+        bound.push(json!(200));
+        let devices: Vec<DeviceFacts> =
+            query_rows(&mut conn, queries::SELECT_DEVICES_FILTERED, &bound).await;
+        assert_eq!(devices.len() as i64, expected, "{filter:?}");
+    }
+    let owner = DeviceFilter::Owner("Jamie".into()).sql_params(Some(PERSON));
+    let rows: Vec<DeviceCount> = query_rows(&mut conn, queries::SELECT_DEVICE_COUNTS, &owner).await;
+    assert_eq!(DeviceCounts::from_rows(&rows).total, 1);
+}
+
+/// The `events` tool's three reads against a fixture: counts by type and by
+/// device are over every event in the window, the rows are the newest, and
+/// the filters (type, security, device, alerts, window) select what they say.
+#[tokio::test]
+async fn the_events_tool_counts_match_the_fixture() {
+    use netgrasp_core::assist::{
+        EventDeviceCount, EventQuery, EventTypeCount, EventWindowFacts, render_events,
+    };
+
+    let mut conn = daemon_db("events_tool").await;
+    let now = now();
+    let scanner = seed_device(&mut conn, "02:00:5e:00:0e:01", Some("scanner"), now).await;
+    let phone = seed_device(&mut conn, "02:00:5e:00:0e:02", Some("phone"), now).await;
+    // (device, type, minutes ago, sent as an alert), and how many of each.
+    let fixture: &[(i64, &str, i64, bool, usize)] = &[
+        (scanner, "arp_scan", 10, false, 30),
+        (scanner, "gratuitous_arp", 20, false, 4),
+        (phone, "gratuitous_arp", 30, false, 2),
+        (phone, "ip_changed", 40, false, 12),
+        (phone, "went_offline", 50, true, 3),
+        (phone, "returned", 55, true, 1),
+        // Outside the default 24 hours, inside seven days.
+        (phone, "new_device", 60 * 30, true, 1),
+        (scanner, "arp_spoof", 60 * 48, true, 2),
+        // Outside seven days.
+        (scanner, "arp_scan", 60 * 24 * 9, false, 5),
+    ];
+    for &(device, event_type, minutes, sent, n) in fixture {
+        for k in 0..n {
+            exec(
+                &mut conn,
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified) \
+                 VALUES ($1::bigint, $2, to_timestamp($3::bigint), '{\"n\": 1}'::jsonb, $4)",
+                &[
+                    json!(device),
+                    json!(event_type),
+                    json!(now - minutes * 60 - k as i64),
+                    json!(sent),
+                ],
+            )
+            .await;
+        }
+    }
+    // One event about no device.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_events (event_type, \"timestamp\") VALUES ('rogue_dhcp', to_timestamp($1::bigint))",
+        &[json!(now - 300)],
+    )
+    .await;
+
+    async fn run(
+        conn: &mut PgConnection,
+        query: &EventQuery,
+        device: i64,
+    ) -> (
+        Vec<EventTypeCount>,
+        Vec<EventDeviceCount>,
+        Vec<EventWindowFacts>,
+    ) {
+        let params = query.sql_params(device);
+        let types = query_rows(conn, queries::SELECT_EVENT_COUNTS, &params).await;
+        let mut p = params.clone();
+        p.push(json!(10));
+        let devices = query_rows(conn, queries::SELECT_EVENT_DEVICE_COUNTS, &p).await;
+        let mut p = params.clone();
+        p.push(json!(query.limit));
+        let rows = query_rows(conn, queries::SELECT_EVENTS_IN_WINDOW, &p).await;
+        (types, devices, rows)
+    }
+    let count = |types: &[EventTypeCount], t: &str| {
+        types
+            .iter()
+            .find(|c| c.event_type == t)
+            .map_or(0, |c| c.events)
+    };
+
+    // The default: the last 24 hours, every type.
+    let q = EventQuery::parse(&json!({}), now).unwrap();
+    let (types, devices, rows) = run(&mut conn, &q, 0).await;
+    assert_eq!(count(&types, "arp_scan"), 30);
+    assert_eq!(count(&types, "gratuitous_arp"), 6);
+    assert_eq!(count(&types, "ip_changed"), 12);
+    assert_eq!(count(&types, "went_offline"), 3);
+    assert_eq!(count(&types, "rogue_dhcp"), 1);
+    assert_eq!(count(&types, "new_device"), 0, "30 hours ago is outside 24");
+    assert_eq!(types[0].event_type, "arp_scan", "most common first");
+    assert_eq!(types.iter().map(|t| t.sent).sum::<i64>(), 4);
+    assert_eq!(devices[0].mac.as_deref(), Some("02:00:5e:00:0e:01"));
+    assert_eq!(devices[0].events, 34);
+    assert_eq!(devices[0].device_total, 3, "two devices and no device");
+    assert_eq!(rows.len(), 20);
+    assert!(rows[0].ts >= rows[19].ts, "newest first");
+    let (content, summary) = render_events(&q, None, &types, &devices, &rows, now, 12_000);
+    assert!(
+        content.contains("53 events in all, 4 of them sent as alerts"),
+        "{content}"
+    );
+    assert!(content.contains("Showing 20 of 53 events."), "{content}");
+    assert!(
+        summary.starts_with("53 events in the last 24 hours"),
+        "{summary}"
+    );
+
+    // Security only, over seven days.
+    let q = EventQuery::parse(&json!({"hours": 168, "security": true}), now).unwrap();
+    let (types, _, _) = run(&mut conn, &q, 0).await;
+    let total: i64 = types.iter().map(|t| t.events).sum();
+    assert_eq!(
+        total,
+        30 + 6 + 2 + 1,
+        "arp_scan, gratuitous_arp, arp_spoof, rogue_dhcp"
+    );
+    assert_eq!(count(&types, "ip_changed"), 0);
+
+    // One type, one device, an explicit window.
+    let from = assist_iso(now - 3_600);
+    let to = assist_iso(now);
+    let q = EventQuery::parse(
+        &json!({"from": from, "to": to, "type": "gratuitous_arp"}),
+        now,
+    )
+    .unwrap();
+    let (types, _, rows) = run(&mut conn, &q, phone).await;
+    assert_eq!(count(&types, "gratuitous_arp"), 2);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|r| r.mac.as_deref() == Some("02:00:5e:00:0e:02"))
+    );
+
+    // Alerts only.
+    let q = EventQuery::parse(&json!({"hours": 168, "alerts": true}), now).unwrap();
+    let (types, _, rows) = run(&mut conn, &q, 0).await;
+    assert_eq!(types.iter().map(|t| t.events).sum::<i64>(), 3 + 1 + 1 + 2);
+    assert!(rows.iter().all(|r| r.notified));
+}
+
+/// An instant as ISO 8601, for an `events` window.
+fn assist_iso(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .expect("in range")
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 // ===========================================================================

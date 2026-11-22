@@ -2221,6 +2221,129 @@ fn the_network_assistant_answers_who_came_home_today_and_what_is_new() {
     });
 }
 
+/// The three reads issue #32 and #33 were about, through the real
+/// `tap_assistant_tool`: `list_devices` counts every device in its header and
+/// says how many rows it showed, `new_devices` takes a window, and `events`
+/// counts by type before it lists anything.
+#[test]
+fn the_network_assistant_counts_devices_and_events_exactly() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        seed_house(&pool).await;
+        let admin = ng_admin(&pool).await;
+        let call = |tool: &'static str, args: serde_json::Value| {
+            let (pool, admin) = (pool.clone(), admin.clone());
+            async move {
+                let result = call_tool(
+                    &pool,
+                    &admin,
+                    "netgrasp_network",
+                    None,
+                    tool,
+                    args,
+                    "execute",
+                )
+                .await;
+                assert_eq!(result["ok"], true, "{tool}: {result}");
+                (
+                    result["content"].as_str().unwrap_or_default().to_string(),
+                    result["summary"].as_str().unwrap_or_default().to_string(),
+                )
+            }
+        };
+
+        // Five devices, one row asked for: the counts are still all five.
+        let (text, summary) = call("list_devices", serde_json::json!({"limit": 1})).await;
+        assert!(text.starts_with("5 devices (all)."), "{text}");
+        assert!(text.contains("By state: online 4, offline 1."), "{text}");
+        assert!(
+            text.contains("By vendor: Apple 4, no vendor recorded 1."),
+            "{text}"
+        );
+        assert!(text.contains("Showing 1 of 5."), "{text}");
+        assert!(
+            summary.starts_with("Showing 1 of 5 devices (all)"),
+            "{summary}"
+        );
+
+        let (text, _) = call("list_devices", serde_json::json!({"filter": "offline"})).await;
+        assert!(text.starts_with("1 device (offline)."), "{text}");
+        assert!(text.contains("aa:bb:cc:00:01:05"), "{text}");
+        assert!(!text.contains("aa:bb:cc:00:01:04"), "{text}");
+
+        let (text, _) = call(
+            "list_devices",
+            serde_json::json!({"filter": "vendor:apple"}),
+        )
+        .await;
+        assert!(text.starts_with("4 devices (vendor:apple)."), "{text}");
+
+        // Two hours ago is in the last day; six days ago is not.
+        let (text, _) = call("new_devices", serde_json::json!({"hours": 24})).await;
+        assert!(
+            text.starts_with("1 device first seen in the last 24 hours"),
+            "{text}"
+        );
+        assert!(text.contains("aa:bb:cc:00:01:04"), "{text}");
+        assert!(!text.contains("aa:bb:cc:00:01:05"), "{text}");
+
+        // Events: counted by type over the window, then listed.
+        let phone: i64 =
+            sqlx::query_scalar("SELECT id FROM ng_devices WHERE mac = 'aa:bb:cc:00:01:01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        for minutes in 1..=25 {
+            sqlx::query(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+                 VALUES ($1, 'arp_scan', now() - make_interval(mins => $2))",
+            )
+            .bind(phone)
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let (text, summary) = call(
+            "events",
+            serde_json::json!({"type": "arp_scan", "limit": 5}),
+        )
+        .await;
+        assert!(
+            text.contains("25 events in all, 0 of them sent as alerts"),
+            "{text}"
+        );
+        assert!(text.contains("  arp_scan: 25 (security)"), "{text}");
+        assert!(
+            text.contains("jamie-phone (aa:bb:cc:00:01:01): 25"),
+            "{text}"
+        );
+        assert!(text.contains("Showing 5 of 25 events."), "{text}");
+        assert!(summary.contains("showing 5"), "{summary}");
+
+        let refused = call_tool(
+            &pool,
+            &admin,
+            "netgrasp_network",
+            None,
+            "events",
+            serde_json::json!({"hours": 500}),
+            "execute",
+        )
+        .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+
+        // Reads write nothing.
+        let dirty: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ng_devices WHERE trovato_item_id IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(dirty, 0, "a read minted an item");
+    });
+}
+
 /// Somebody without the permission gets neither answer.
 #[test]
 fn the_overview_reads_refuse_a_caller_without_the_permission() {
@@ -2229,7 +2352,12 @@ fn the_overview_reads_refuse_a_caller_without_the_permission() {
         reset(&pool).await;
         seed_house(&pool).await;
         let nobody = ng_nobody(&pool).await;
-        for tool in ["arrivals_and_departures", "new_devices"] {
+        for tool in [
+            "arrivals_and_departures",
+            "new_devices",
+            "events",
+            "list_devices",
+        ] {
             let result = call_tool(
                 &pool,
                 &nobody,
@@ -2876,7 +3004,12 @@ fn the_three_scopes_are_declared_and_the_kernel_registry_accepts_them() {
         assert!(network.tool("who_was_online").is_some());
         // The overview's two questions are reads, and adding them added no
         // write: the count below is the one it was before they existed.
-        for read in ["arrivals_and_departures", "new_devices"] {
+        for read in [
+            "arrivals_and_departures",
+            "new_devices",
+            "events",
+            "list_devices",
+        ] {
             let tool = network
                 .tool(read)
                 .unwrap_or_else(|| panic!("the network scope has no {read}"));
@@ -2945,10 +3078,17 @@ fn each_scopes_context_describes_what_it_was_opened_on() {
         let context = open_context(&pool, &admin, SCOPE_NETWORK, None).await;
         let snapshot = context["snapshot"].as_str().unwrap_or_default();
         assert!(snapshot.contains("People (1):"), "{snapshot}");
-        assert!(snapshot.contains("Jamie's devices:"), "{snapshot}");
         assert!(
-            snapshot.contains("Devices by state (1 total):"),
+            snapshot.contains("Devices by state (1 total): offline 1."),
             "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Owners: 1 belong to a person, 0 to nobody."),
+            "{snapshot}"
+        );
+        assert!(
+            !snapshot.contains("02:00:5e:00:00:04"),
+            "the network context lists no device: {snapshot}"
         );
         assert!(
             snapshot.contains("Security events in the last 24 hours: 0"),
