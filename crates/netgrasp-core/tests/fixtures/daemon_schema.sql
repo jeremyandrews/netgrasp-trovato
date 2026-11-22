@@ -1,8 +1,13 @@
--- The netgrasp daemon's schema as of its V7 (netgraspd#34, presence opt in):
+-- The netgrasp daemon's schema as of its V8 (netgraspd#36, event indexes):
 -- V1 through V3, the notify tables of V4, V5's person epochs, event person and
--- daemon status, V6's notify default and V7's presence columns, exactly as the
--- daemon creates them. Until U18 this file stopped at V4, with V4's
--- `notify DEFAULT TRUE`; it is now brought fully up to date.
+-- daemon status, V6's notify default, V7's presence columns and V8's three
+-- partial indexes on ng_events, exactly as the daemon creates them. Until U18
+-- this file stopped at V4, with V4's `notify DEFAULT TRUE`.
+--
+-- Not every daemon index is here: V1's time and device indexes and V2's
+-- security index on ng_events are left to the tests that need them, which
+-- create them in the daemon's words. V8's are here because every page they
+-- serve has to find them in the daemon's real schema.
 --
 -- Column order within a table is the order the faithful-copy test compares, so
 -- the columns later versions added with `ALTER TABLE … ADD COLUMN` come last,
@@ -155,6 +160,21 @@ CREATE UNIQUE INDEX ng_location_history_open_idx
 -- V5: a person's movements, read by the plugin's movements view (019).
 CREATE INDEX ng_events_person_idx ON ng_events (person_item_id, "timestamp" DESC)
     WHERE person_item_id IS NOT NULL;
+
+-- V8: the event pages' indexes. Every event but ip_changed by type and time
+-- (Activity, /events/new-devices), the delivered alerts by time ("Recently
+-- sent"), and the six security types in one time order (/events/security at
+-- any depth, and its total).
+CREATE INDEX ng_events_type_time_idx
+    ON ng_events (event_type, "timestamp" DESC)
+    WHERE event_type <> 'ip_changed';
+CREATE INDEX ng_events_notified_time_idx
+    ON ng_events ("timestamp" DESC)
+    WHERE notified;
+CREATE INDEX ng_events_security_time_idx
+    ON ng_events ("timestamp" DESC)
+    WHERE event_type IN ('arp_scan', 'arp_spoof', 'rogue_dhcp', 'identity_change',
+                         'ip_conflict', 'gratuitous_arp');
 
 -- V4: whether alerts can be delivered, and a test somebody asked for. Daemon
 -- owned, except that the plugin inserts ng_notify_requests rows. The daemon

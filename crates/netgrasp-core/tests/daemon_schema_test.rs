@@ -2625,11 +2625,14 @@ async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
     let expected = todays_movements(&mut v4).await;
 
     // V5 daemon: the same events, the person column set the way the daemon sets it.
+    // The fixture is at V8, whose type index serves today's person events as
+    // well; it is dropped here, so the plan below is the person index's.
     let mut v5 = scratch(
         "movements_v5",
         &format!(
-            "{DAEMON_SCHEMA}\n{DAEMON_V1_EVENT_TIME_INDEX};\n\
-             {OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"
+            "{}\n{DAEMON_V1_EVENT_TIME_INDEX};\n\
+             {OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}",
+            without_v8_indexes(DAEMON_SCHEMA)
         ),
     )
     .await;
@@ -2656,6 +2659,30 @@ async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
 
     let plan = plan_without_seqscan(&mut v5, TODAYS_MOVEMENTS, &[]).await;
     assert!(plan.contains("ng_events_person_idx"), "{plan}");
+    assert!(!plan.contains("Seq Scan on ng_events"), "{plan}");
+
+    // At V8 the planner may take either the person index or the type index,
+    // which has today's person events in time order too; either is an index
+    // read, and the rows are the same.
+    let mut v8 = scratch(
+        "movements_v8",
+        &format!(
+            "{DAEMON_SCHEMA}\n{DAEMON_V1_EVENT_TIME_INDEX};\n\
+             {OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}"
+        ),
+    )
+    .await;
+    sqlx::raw_sql(MOVEMENTS_BY_PERSON_INDEX)
+        .execute(&mut v8)
+        .await
+        .expect("019 applies at V8");
+    seed_movements(&mut v8, true).await;
+    assert_eq!(todays_movements(&mut v8).await, expected);
+    let plan = plan_without_seqscan(&mut v8, TODAYS_MOVEMENTS, &[]).await;
+    assert!(
+        plan.contains("ng_events_person_idx") || plan.contains("ng_events_type_time_idx"),
+        "{plan}"
+    );
     assert!(!plan.contains("Seq Scan on ng_events"), "{plan}");
 
     // The overview counts the same movements through the same view.
@@ -3339,4 +3366,162 @@ async fn the_presence_schema_adds_v7_columns_to_an_older_daemon_and_is_idempoten
             "{table}"
         );
     }
+}
+
+// ===========================================================================
+// netgraspd V8: the indexes Recently sent and the security pager read
+// ===========================================================================
+//
+// V8's three partial indexes on `ng_events` are in the fixture, as the daemon
+// creates them. Each test plans its statement on the fixture and again on the
+// fixture with V8's indexes dropped, a daemon at V7: with them the plan reads
+// the index, without them it cannot, and both answer the same rows. So the test
+// fails on a fixture that lacks them, and proves the page still works, slower,
+// against a daemon that has not migrated to V8.
+
+/// netgraspd V8's indexes on `ng_events`, by name.
+const DAEMON_V8_EVENT_INDEXES: [&str; 3] = [
+    "ng_events_type_time_idx",
+    "ng_events_notified_time_idx",
+    "ng_events_security_time_idx",
+];
+
+/// `ddl` with V8's indexes dropped after it: the same schema at V7.
+fn without_v8_indexes(ddl: &str) -> String {
+    format!("{ddl}\nDROP INDEX {};", DAEMON_V8_EVENT_INDEXES.join(", "))
+}
+
+#[tokio::test]
+async fn the_fixture_carries_the_daemons_v8_event_indexes() {
+    let mut conn = daemon_db("v8_indexes").await;
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes \
+          WHERE schemaname = current_schema() AND tablename = 'ng_events' \
+            AND indexname = ANY($1) ORDER BY indexname",
+    )
+    .bind(DAEMON_V8_EVENT_INDEXES.to_vec())
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    let mut expected: Vec<&str> = DAEMON_V8_EVENT_INDEXES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(found, expected);
+}
+
+/// "Recently sent" (`SELECT_RECENTLY_SENT`) reads the delivered alerts from
+/// `ng_events_notified_time_idx`. Without it nothing indexes `notified`, and
+/// the statement read the whole log: 109 ms live over 4.1 million events.
+#[tokio::test]
+async fn recently_sent_reads_the_daemons_notified_index() {
+    let mut answers = Vec::new();
+    for (name, ddl) in [
+        ("recently_sent_v8", DAEMON_SCHEMA.to_string()),
+        ("recently_sent_v7", without_v8_indexes(DAEMON_SCHEMA)),
+    ] {
+        let with_index = name.ends_with("v8");
+        let mut conn = scratch(name, &ddl).await;
+        let phone = seed_device(&mut conn, "02:00:5e:00:26:01", Some("phone"), now()).await;
+        seed_person(&mut conn, PERSON, "Resident", "home").await;
+        for (event_type, ago, notified) in [
+            ("ip_changed", 60, false),
+            ("returned", 120, true),
+            ("new_device", 180, true),
+            ("arp_scan", 240, false),
+            ("went_offline", 300, true),
+        ] {
+            exec(
+                &mut conn,
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, notified) \
+                 VALUES ($1::bigint, $2, now() - make_interval(secs => $3::bigint), \
+                         '{}'::jsonb, $4)",
+                &[json!(phone), json!(event_type), json!(ago), json!(notified)],
+            )
+            .await;
+        }
+        let plan =
+            plan_without_seqscan(&mut conn, queries::SELECT_RECENTLY_SENT, &[json!(20)]).await;
+        assert_eq!(
+            plan.contains("ng_events_notified_time_idx"),
+            with_index,
+            "{name}: {plan}"
+        );
+        if with_index {
+            assert!(!plan.contains("Seq Scan on ng_events"), "{name}: {plan}");
+        }
+        let rows: Vec<netgrasp_core::alerts::SentAlert> =
+            query_rows(&mut conn, queries::SELECT_RECENTLY_SENT, &[json!(20)]).await;
+        answers.push(
+            rows.iter()
+                .map(|r| r.event_type.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(answers[0], ["returned", "new_device", "went_offline"]);
+    assert_eq!(
+        answers[0], answers[1],
+        "the same alerts, with or without V8"
+    );
+}
+
+/// /events/security's rows at its deepest page read
+/// `ng_events_security_time_idx`: the six security types in one time order. V2's `ng_events_security_idx` is in time order only within
+/// one type, so without V8 a deep page walks the time index past every other
+/// event or sorts every security event.
+#[tokio::test]
+async fn the_security_pages_read_the_daemons_security_time_index() {
+    let mut answers = Vec::new();
+    for (name, with_index) in [("security_time_v8", true), ("security_time_v7", false)] {
+        let views = format!(
+            "{}\n{OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}\n{EVENT_VIEWS}",
+            daemon_event_indexes()
+        );
+        let ddl = if with_index {
+            format!("{DAEMON_SCHEMA}\n{views}")
+        } else {
+            format!("{}\n{views}", without_v8_indexes(DAEMON_SCHEMA))
+        };
+        let mut conn = scratch(name, &ddl).await;
+        let device = seed_device(&mut conn, "02:00:5e:00:26:02", Some("phone"), now()).await;
+        for (event_type, ago) in [
+            ("ip_changed", 60),
+            ("arp_scan", 120),
+            ("identity_change", 180),
+            ("gratuitous_arp", 240),
+            ("new_device", 300),
+        ] {
+            seed_event(&mut conn, device, event_type, ago).await;
+        }
+        // The deep page needs the six types in one time order, which only V8
+        // gives. The total is a count of the same rows, which either security
+        // index answers; on a table this small the planner may take V2's.
+        let deep =
+            "SELECT * FROM ng_security_events ORDER BY \"timestamp\" DESC LIMIT 50 OFFSET 9950";
+        let plan = plan_without_seqscan_or_sort(&mut conn, deep).await;
+        assert_eq!(
+            plan.contains("ng_events_security_time_idx"),
+            with_index,
+            "{name}: {deep}\n{plan}"
+        );
+        assert!(!plan.contains("Seq Scan on ng_events"), "{name}: {plan}");
+        let plan =
+            plan_without_seqscan_or_sort(&mut conn, "SELECT count(*) FROM ng_security_events")
+                .await;
+        assert!(plan.contains("ng_events_security_"), "{name}: {plan}");
+        assert!(!plan.contains("Seq Scan on ng_events"), "{name}: {plan}");
+        let types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM ng_security_events ORDER BY \"timestamp\" DESC LIMIT 50",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        answers.push(types);
+    }
+    assert_eq!(
+        answers[0],
+        ["arp_scan", "identity_change", "gratuitous_arp"]
+    );
+    assert_eq!(
+        answers[0], answers[1],
+        "the same events, with or without V8"
+    );
 }

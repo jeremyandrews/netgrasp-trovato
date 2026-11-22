@@ -21,6 +21,55 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+### Changed
+
+**The plugin's tests know netgraspd V8's three event indexes, and prove the
+pages that need them read them.** Activity, /events/new-devices, the Alerts
+page's "Recently sent" and the deep pages of /events/security read the whole
+event log. The root cause was on the daemon side: no index on `ng_events`
+covered `new_device` or the person types, none covered `notified`, and the
+security index gave security events in time order only one type at a time. The
+plugin's role owns none of the daemon's tables, so it could not add them.
+netgraspd V8 (netgraspd#36, merged) now does: `ng_events_type_time_idx` (every event but
+`ip_changed`, by type and time), `ng_events_notified_time_idx` (delivered
+alerts by time) and `ng_events_security_time_idx` (the six security types in one
+time order, which 1.2.0's security pager asked for). No statement the plugin
+runs changes, and no page shows anything different; screenshots before and
+after are byte-identical (`docs/screenshots/u26/`).
+
+- *The daemon schema fixture is at V8.* It carries the three indexes in the
+  daemon's words.
+- *Plan tests.* Activity's and the new device list's statements, the rows and
+  the pager's total exactly as the kernel builds them, plan onto
+  `ng_events_type_time_idx`; `SELECT_RECENTLY_SENT` onto
+  `ng_events_notified_time_idx`; the security pager's page 200 onto
+  `ng_events_security_time_idx`. Each also runs without the index, a daemon at
+  V7, and answers the same rows, so a daemon that has not migrated is slower
+  and nothing else. The Activity test takes the index from the fixture, so it
+  fails on a fixture without it.
+- *The movements test plans a V5 daemon as a V5 daemon.* At V8 the planner may
+  read today's person events from the type index instead of the person index;
+  either is an index read, and a V8 check says so.
+
+Medians of nine `EXPLAIN ANALYZE` runs of the kernel's statements. Synthetic:
+PostgreSQL 16, the daemon's DDL, 4.1 million events in the live type mix,
+before and after the daemon's own V8 migration. Live: read only, before only;
+it has V8 with the next paired release.
+
+| Statement | Synthetic before | Synthetic after | Live before |
+|---|---|---|---|
+| /activity, rows | 156 ms | 0.13 ms | 199 ms |
+| /activity, total | 158 ms | 0.04 ms | 197 ms |
+| /events/new-devices, rows | 83 ms | 0.15 ms | 109 ms |
+| /events/new-devices, total | 82 ms | 0.02 ms | 112 ms |
+| Alerts, Recently sent | 81 ms | 0.02 ms | 109 ms |
+| /events/security, rows (page 1) | 0.48 ms | 0.07 ms | 0.13 ms |
+| /events/security, rows (page 200) | 141 ms | 3.0 ms | 42 ms |
+| /events/security, total | 14 ms | 6.2 ms | 20 ms |
+
+The live log has no delivered alerts yet; with 2,000 on the synthetic copy,
+"Recently sent" takes 30.6 ms without V8 and 0.07 ms with it.
+
 ## [1.2.0] - 2026-11-22
 
 Presence settings and a third presence state, "Not tracked", for netgraspd's

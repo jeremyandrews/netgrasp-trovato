@@ -7622,3 +7622,138 @@ fn untracked_people_are_not_tracked_everywhere_and_the_switch_off_is_said() {
         reset(&pool).await;
     });
 }
+
+// ===========================================================================
+// Activity and the new device list read the daemon's V8 type index
+// ===========================================================================
+
+/// The daemon's schema fixture, which carries netgraspd V8's indexes on
+/// `ng_events` in the daemon's words.
+const DAEMON_SCHEMA_FIXTURE: &str =
+    include_str!("../../../crates/netgrasp-core/tests/fixtures/daemon_schema.sql");
+
+/// The `CREATE INDEX` statement for `name`, taken from the daemon's schema
+/// fixture, so that the test below fails on a fixture without it.
+fn fixture_index(name: &str) -> String {
+    let start = DAEMON_SCHEMA_FIXTURE
+        .find(&format!("CREATE INDEX {name}"))
+        .unwrap_or_else(|| panic!("the daemon schema fixture has no {name}"));
+    let statement = &DAEMON_SCHEMA_FIXTURE[start..];
+    let end = statement.find(';').expect("a statement ends");
+    statement[..end].to_string()
+}
+
+/// **Activity and /events/new-devices read `ng_events_type_time_idx`.** Both
+/// statements each page runs, the rows and the pager's total, exactly as the
+/// kernel builds them from the gathers the plugin ships, plan onto netgraspd
+/// V8's index on every event but `ip_changed` by type and time, and read no
+/// sequential scan of `ng_events`. Before V8 no index covered `new_device` or
+/// the person events, and each statement read the whole log (110 to 200 ms
+/// live, over 4.1 million events).
+///
+/// Without the index (a daemon at V7) the same statements still run, plan
+/// without it, and the pages list the same events with the same totals: slower
+/// is the only difference.
+#[test]
+fn activity_and_new_devices_as_the_kernel_runs_them_read_the_daemons_type_index() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let device = seed_device(&pool, "aa:bb:cc:00:26:01", None, "online").await;
+        for (event_type, ago) in [
+            ("ip_changed", 10),
+            ("new_device", 20),
+            ("arp_spoof", 30),
+            ("returned", 40),
+            ("ip_changed", 50),
+            ("new_device", 60),
+            ("arp_scan", 70),
+        ] {
+            sqlx::query(
+                "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+                 VALUES ($1, $2, to_timestamp($3))",
+            )
+            .bind(device)
+            .bind(event_type)
+            .bind((now() - ago) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let index = fixture_index("ng_events_type_time_idx");
+        let gather = wire_gather(&pool).await;
+        let context = QueryContext {
+            viewer: Some(network_viewer()),
+            ..QueryContext::default()
+        };
+
+        let mut pages = HashMap::new();
+        for with_index in [true, false] {
+            if with_index {
+                sqlx::query(&index).execute(&pool).await.unwrap();
+            } else {
+                sqlx::query("DROP INDEX ng_events_type_time_idx")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            for query_id in ["ng_activity", "ng_event_new_devices"] {
+                let (rows_sql, count_sql) = kernel_gather_sql(&pool, query_id, &[]).await;
+                for (what, sql) in [("rows", &rows_sql), ("count", &count_sql)] {
+                    let plan = plan_with_indexes_preferred(&pool, sql).await;
+                    assert_eq!(
+                        plan.contains("ng_events_type_time_idx"),
+                        with_index,
+                        "{query_id} {what}, index {with_index}: {sql}\n{plan}"
+                    );
+                    if with_index {
+                        assert!(
+                            !plan.contains("Seq Scan on ng_events"),
+                            "{query_id} {what}: {sql}\n{plan}"
+                        );
+                    }
+                }
+                let page = gather
+                    .execute(
+                        query_id,
+                        1,
+                        HashMap::new(),
+                        Uuid::parse_str(LIVE_STAGE).unwrap(),
+                        &context,
+                    )
+                    .await
+                    .unwrap();
+                let listed: Vec<(String, i64)> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item["event_type"].as_str().unwrap_or_default().to_string(),
+                            item["id"].as_i64().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let answer = (page.total, listed);
+                match pages.get(query_id) {
+                    None => {
+                        pages.insert(query_id, answer);
+                    }
+                    Some(with) => assert_eq!(
+                        with, &answer,
+                        "{query_id} lists something else without the index"
+                    ),
+                }
+            }
+        }
+        let types = |query_id: &str| -> Vec<String> {
+            pages[query_id].1.iter().map(|(t, _)| t.clone()).collect()
+        };
+        assert_eq!(pages["ng_activity"].0, 3);
+        assert_eq!(
+            types("ng_activity"),
+            ["new_device", "arp_spoof", "new_device"]
+        );
+        assert_eq!(pages["ng_event_new_devices"].0, 2);
+        assert_eq!(types("ng_event_new_devices"), ["new_device", "new_device"]);
+    });
+}
