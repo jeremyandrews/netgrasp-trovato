@@ -9,7 +9,7 @@ members = [
 # The plugin's own version, semantic from 1.0.0 on. It says nothing about the
 # kernel: which Trovato this builds against is `kernel-release.toml` at the
 # repository root, and CHANGELOG.md records the pin for every release.
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["Jeremiah Andrews"]
