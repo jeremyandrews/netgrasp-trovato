@@ -30,7 +30,7 @@ event log. The root cause was on the daemon side: no index on `ng_events`
 covered `new_device` or the person types, none covered `notified`, and the
 security index gave security events in time order only one type at a time. The
 plugin's role owns none of the daemon's tables, so it could not add them.
-netgraspd V8 (netgraspd#36) now does: `ng_events_type_time_idx` (every event but
+netgraspd V8 (netgraspd#36, merged) now does: `ng_events_type_time_idx` (every event but
 `ip_changed`, by type and time), `ng_events_notified_time_idx` (delivered
 alerts by time) and `ng_events_security_time_idx` (the six security types in one
 time order, which 1.2.0's security pager asked for). No statement the plugin
