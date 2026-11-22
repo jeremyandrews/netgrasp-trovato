@@ -1,9 +1,10 @@
 {#
-    The event table, shared by all three event gathers: ng_event_log,
-    ng_event_security and ng_event_by_device.
+    The event table, shared by every event gather: ng_event_log,
+    ng_event_security, ng_event_by_device, ng_event_new_devices and
+    ng_activity.
 
-    Rows are `ng_event` records — flat, keyed by the physical column names of
-    ng_events. The event log's `row.fields is object` guard was always false and
+    Rows are event records (`ng_event`, or one of the three record types over
+    020's views) — flat, keyed by the physical column names of ng_events. The event log's `row.fields is object` guard was always false and
     its else-branch dutifully rendered a dash in every cell of every row: a full
     page of well-formed nothing, with no error anywhere to say so. Nothing here
     reaches for the Item shape.
@@ -18,7 +19,8 @@
 
     The list below is the daemon's own idea of which event types are security
     relevant, and it is now written in three places: here, in the
-    `ng_event_security` gather's `in` filter (002_netgrasp_gathers.sql), and in
+    `ng_security_events` view that /events/security and the overview read
+    (020_netgrasp_event_views.sql), and in
     netgrasp_core::model::SECURITY_EVENT_TYPES. A unit test in the plugin
     asserts this file lists every one of them, the same way another asserts it
     of the migration. Adding a type to the daemon and to none of the three is

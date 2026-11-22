@@ -23,6 +23,75 @@ Compatibility section has the table.
 
 ### Fixed
 
+**The event pages and the assistant's event reads answer from the daemon's
+indexes instead of scanning the event log.** On the live database (4.1 million
+events, 1.1 GB) each of these pages spent 100 to 200 ms per statement reading
+all of `ng_events`. Four root causes:
+
+- *The event record type sorted on a column nothing indexes.* `ng_event` maps
+  its `timestamp` field to `timestamp_epoch`, the daemon's generated twin, so
+  every `ORDER BY` a gather asked for sorted the whole table to show its first
+  page. /events, /events/security and /events/device now read record types
+  (`ng_event_recent`, `ng_security_event`, `ng_device_event`) whose
+  `timestamp` maps to `"timestamp"`, which `ng_events_time_idx` and
+  `ng_events_device_idx` serve. The templates still print the epoch twin, so
+  every time reads exactly as before. The record admin's listing of
+  `ng_event` sorts on `"timestamp"` too.
+- *The pager counted every row.* A record gather's total is `COUNT(*)` over
+  its relation, and for /events that was the whole log, and for the busiest
+  device on /events/device nearly all of it (4.06 million rows). Migration 020
+  puts /events over `ng_events_recent`, the newest 10,000 events, and
+  /events/device over `ng_device_events`, each device's newest 10,000, both
+  read from an index. Where a total reaches the bound the page says "10000+"
+  and "showing 100 of the newest 10000"; under it the count is exact and reads
+  as it did.
+- *The assistant's windows were on the twin.* `SELECT_DEVICE_EVENTS`,
+  `SELECT_SECURITY_EVENTS` and `SELECT_SECURITY_EVENT_COUNT` compared their
+  cutoff with `timestamp_epoch`, so each read the whole log to keep one day or
+  one week of it. They compare `"timestamp" >= to_timestamp($n)` and sort on
+  `"timestamp"`.
+- *The security total was two statements.* The overview's `security_events`
+  and the /events/security pager each counted the six security types with
+  their own copy of the list. Both now count one view, `ng_security_events`,
+  with one statement, `SELECT count(*) FROM ng_security_events`, which the
+  daemon's `ng_events_security_idx` answers by itself. Migration 021 moves the
+  three gathers, guarded so a site that edited one keeps its edit.
+
+Medians of nine `EXPLAIN ANALYZE` runs, live database:
+
+| Statement | Before | After |
+|---|---|---|
+| /events, rows (page 1) | 179 ms | 0.16 ms |
+| /events, rows (page 100) | 366 ms | 4.8 ms |
+| /events, total | 110 ms | 1.1 ms |
+| /events/security, rows (page 1) | 165 ms | 0.12 ms |
+| /events/security, total | 21 ms | 20 ms |
+| `ng_overview.security_events` | 20 ms | 16 ms |
+| /events/device, busiest device, rows | 197 ms | 2.4 ms |
+| /events/device, busiest device, total | 129 ms | 1.4 ms |
+| `SELECT_DEVICE_EVENTS` (7 days) | 123 ms | 0.36 ms |
+| `SELECT_SECURITY_EVENTS` (1 day) | 157 ms | 0.05 ms |
+| `SELECT_SECURITY_EVENT_COUNT` (1 day) | 160 ms | 0.16 ms |
+
+Not fixed, because they need an index only the daemon can add:
+
+- /activity and /events/new-devices filter on `new_device` (and the person
+  types), which no daemon index covers. Sorting them on `"timestamp"` made
+  the planner walk the time index looking for rare rows, slower than the scan
+  (Activity 250 ms against 160 ms live), so they keep their sort. A daemon
+  index `ON ng_events (event_type, "timestamp" DESC) WHERE event_type <>
+  'ip_changed'` takes both under 0.2 ms with no change to the plugin.
+- The Alerts page's "Recently sent" (`SELECT_RECENTLY_SENT`, `WHERE notified`)
+  has no index to read. Walking the time index backwards until 20 sent alerts
+  are found reads the whole log when fewer exist, which is the live case (no
+  event is marked notified): 297 ms against the 93 ms scan. A daemon index
+  `ON ng_events ("timestamp" DESC) WHERE notified` answers the current
+  statement in 0.01 ms.
+
+Tests plan the kernel's own SQL for the three gathers (built with its
+`GatherQueryBuilder` from the shipped gathers and record types) and the three
+assistant statements against the daemon's indexes, and fail on the old ones.
+
 **The two requests the site serves every minute no longer scan the whole
 event log, so they finish under the 100 ms slow threshold instead of logging a
 WARN or ERROR each time.** A 78-hour field run logged about 120 slow-request

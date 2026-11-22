@@ -359,10 +359,17 @@ pub const SELECT_OWNED_DEVICE_COUNT: &str =
 
 /// Recent events for one device. `$1` is the device id, `$2` the cutoff in unix
 /// seconds, `$3` the row limit.
+///
+/// The window and the order are on `"timestamp"`, not its epoch twin, so the
+/// daemon's `ng_events_device_idx` (`device_id, "timestamp" DESC`) answers both:
+/// the read is the newest `$3` entries of one device's slice of the index. On
+/// the twin it read every event the device had and sorted them, which for the
+/// busiest device on the live network was four million rows. The twin is still
+/// what is selected, so `ts` is the same integer it was.
 pub const SELECT_DEVICE_EVENTS: &str = "SELECT event_type, timestamp_epoch AS ts, \
      details::text AS details \
-     FROM ng_events WHERE device_id = $1::bigint AND timestamp_epoch >= $2::bigint \
-     ORDER BY timestamp_epoch DESC LIMIT $3::bigint";
+     FROM ng_events WHERE device_id = $1::bigint AND \"timestamp\" >= to_timestamp($2::bigint) \
+     ORDER BY \"timestamp\" DESC LIMIT $3::bigint";
 
 /// Recent security events across the network. `$1` is the cutoff in unix
 /// seconds, `$2` the row limit.
@@ -372,19 +379,27 @@ pub const SELECT_DEVICE_EVENTS: &str = "SELECT event_type, timestamp_epoch AS ts
 /// binding an array through the `db` host's JSON parameter encoding would be a
 /// type negotiation for no gain. It must stay in step with
 /// [`crate::model::SECURITY_EVENT_TYPES`], and a test asserts it does.
+///
+/// The window and the order are on `"timestamp"`, which the daemon indexes
+/// twice over here (`ng_events_time_idx`, and `ng_events_security_idx` on the
+/// type and the time), so the read is bounded by the window before the type
+/// list is applied. On the epoch twin it was a scan of the whole log.
 pub const SELECT_SECURITY_EVENTS: &str = "SELECT e.event_type, e.timestamp_epoch AS ts, \
      e.details::text AS details, d.mac \
      FROM ng_events e LEFT JOIN ng_devices d ON d.id = e.device_id \
      WHERE e.event_type IN \
        ('arp_scan', 'arp_spoof', 'gratuitous_arp', 'identity_change', 'ip_conflict', 'rogue_dhcp') \
-       AND e.timestamp_epoch >= $1::bigint \
-     ORDER BY e.timestamp_epoch DESC LIMIT $2::bigint";
+       AND e.\"timestamp\" >= to_timestamp($1::bigint) \
+     ORDER BY e.\"timestamp\" DESC LIMIT $2::bigint";
 
 /// How many security events since a cutoff. `$1` is the cutoff in unix seconds.
+///
+/// On `"timestamp"` for [`SELECT_SECURITY_EVENTS`]'s reason: the count reads
+/// the window's slice of an index, not the whole log.
 pub const SELECT_SECURITY_EVENT_COUNT: &str = "SELECT COUNT(*) AS event_count FROM ng_events \
      WHERE event_type IN \
        ('arp_scan', 'arp_spoof', 'gratuitous_arp', 'identity_change', 'ip_conflict', 'rogue_dhcp') \
-       AND timestamp_epoch >= $1::bigint";
+       AND \"timestamp\" >= to_timestamp($1::bigint)";
 
 /// Presence spans overlapping a window, across every device. `$1` is the window
 /// start, `$2` the end, `$3` the row limit.

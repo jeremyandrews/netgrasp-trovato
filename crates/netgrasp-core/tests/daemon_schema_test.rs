@@ -2638,3 +2638,356 @@ async fn movements_read_the_daemons_person_index_and_return_the_same_rows() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+// ===========================================================================
+// The event pages and the assistant's event reads use the daemon's indexes
+// ===========================================================================
+//
+// Same method as the two tests above: the daemon's own index DDL on the
+// fixture, sequential scans priced out, and an assertion on the plan. A
+// statement that compares or sorts the unindexed `timestamp_epoch` still plans
+// it, so the plan names the twin, and that is what fails.
+
+/// netgraspd V1: a device's events by time.
+const DAEMON_V1_EVENT_DEVICE_INDEX: &str =
+    "CREATE INDEX ng_events_device_idx ON ng_events (device_id, \"timestamp\" DESC)";
+
+/// netgraspd V2: the security types by time, partial on exactly those types.
+const DAEMON_V2_EVENT_SECURITY_INDEX: &str = "CREATE INDEX ng_events_security_idx \
+     ON ng_events (event_type, \"timestamp\" DESC) WHERE event_type IN ('arp_scan', \
+     'arp_spoof', 'rogue_dhcp', 'identity_change', 'ip_conflict', 'gratuitous_arp')";
+
+/// The plugin's 020: the event pages' three views and the overview over one.
+const EVENT_VIEWS: &str =
+    include_str!("../../../plugins/netgrasp/migrations/020_netgrasp_event_views.sql");
+
+/// The daemon's three indexes on `ng_events` that the event reads rely on.
+fn daemon_event_indexes() -> String {
+    format!(
+        "{DAEMON_V1_EVENT_TIME_INDEX};\n{DAEMON_V1_EVENT_DEVICE_INDEX};\n\
+         {DAEMON_V2_EVENT_SECURITY_INDEX};"
+    )
+}
+
+/// The plan for `sql` with sequential scans and explicit sorts priced out.
+///
+/// A scratch table of a few rows has no statistics, and the planner happily
+/// sorts five rows rather than walk an index for them. Pricing the sort out,
+/// as [`plan_without_seqscan`] prices out the scan, leaves it the index order
+/// wherever an index can give one; a statement whose order no index gives
+/// (the epoch twin's) still plans its sort, and the assertions see it.
+async fn plan_without_seqscan_or_sort(conn: &mut PgConnection, sql: &str) -> String {
+    conn.execute("SET enable_sort = off").await.unwrap();
+    let plan = plan_without_seqscan(conn, sql, &[]).await;
+    conn.execute("RESET enable_sort").await.unwrap();
+    plan
+}
+
+/// Whether some index scan in `plan` is bounded by event time: an index or
+/// recheck condition on `"timestamp" >=`, the window the statement was given.
+fn time_is_an_index_condition(plan: &str) -> bool {
+    plan.lines().any(|l| {
+        (l.contains("Index Cond") || l.contains("Recheck Cond")) && l.contains("\"timestamp\" >=")
+    })
+}
+
+/// Insert one event `ago` seconds before now.
+async fn seed_event(conn: &mut PgConnection, device: i64, event_type: &str, ago: i64) {
+    exec(
+        conn,
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details) \
+         VALUES ($1::bigint, $2, now() - make_interval(secs => $3::bigint), '{}'::jsonb)",
+        &[json!(device), json!(event_type), json!(ago)],
+    )
+    .await;
+}
+
+/// The assistant's three event reads take a window. Each must spend it on an
+/// index: the window and the order on `"timestamp"`, which the daemon indexes,
+/// so the read is the window's slice of the device index or the security index
+/// (or the time index) and the type list is applied to that slice. Against the
+/// epoch twin each was a scan of the whole log, and for the busiest device on
+/// the live network a sort of four million rows to return ten.
+#[tokio::test]
+async fn the_assistants_event_reads_are_bounded_by_the_daemons_indexes() {
+    let mut conn = scratch(
+        "assist_event_plans",
+        &format!("{DAEMON_SCHEMA}\n{}", daemon_event_indexes()),
+    )
+    .await;
+    let device = seed_device(&mut conn, "02:00:5e:00:24:01", Some("phone"), now()).await;
+    for (event_type, ago) in [
+        ("ip_changed", 60),
+        ("arp_scan", 120),
+        ("arp_spoof", 180),
+        ("ip_changed", 3 * 86_400),
+    ] {
+        seed_event(&mut conn, device, event_type, ago).await;
+    }
+    let cutoff = now() - 86_400;
+    for (name, sql, params) in [
+        (
+            "SELECT_DEVICE_EVENTS",
+            queries::SELECT_DEVICE_EVENTS,
+            vec![json!(device), json!(cutoff), json!(10)],
+        ),
+        (
+            "SELECT_SECURITY_EVENTS",
+            queries::SELECT_SECURITY_EVENTS,
+            vec![json!(cutoff), json!(20)],
+        ),
+        (
+            "SELECT_SECURITY_EVENT_COUNT",
+            queries::SELECT_SECURITY_EVENT_COUNT,
+            vec![json!(cutoff)],
+        ),
+    ] {
+        let plan = plan_without_seqscan(&mut conn, sql, &params).await;
+        assert!(!plan.contains("Seq Scan on ng_events"), "{name}: {plan}");
+        assert!(
+            !plan.contains("timestamp_epoch"),
+            "{name} compares or sorts the unindexed epoch twin: {plan}"
+        );
+        assert!(
+            time_is_an_index_condition(&plan),
+            "{name}'s window is not an index condition: {plan}"
+        );
+    }
+    let plan = plan_without_seqscan(
+        &mut conn,
+        queries::SELECT_DEVICE_EVENTS,
+        &[json!(device), json!(cutoff), json!(10)],
+    )
+    .await;
+    assert!(plan.contains("ng_events_device_idx"), "{plan}");
+    assert!(
+        !plan.contains("Sort"),
+        "the device index gives the order, there is nothing to sort: {plan}"
+    );
+
+    // And they still answer the same: three events in the day, two of them
+    // security events, newest first.
+    let events: Vec<netgrasp_core::assist::EventFacts> = query_rows(
+        &mut conn,
+        queries::SELECT_DEVICE_EVENTS,
+        &[json!(device), json!(cutoff), json!(10)],
+    )
+    .await;
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(types, ["ip_changed", "arp_scan", "arp_spoof"]);
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        event_count: i64,
+    }
+    let counted: Vec<CountRow> = query_rows(
+        &mut conn,
+        queries::SELECT_SECURITY_EVENT_COUNT,
+        &[json!(cutoff)],
+    )
+    .await;
+    assert_eq!(counted[0].event_count, 2);
+}
+
+/// Over a V4 daemon with its event indexes, the plugin's views from 007, 014 and
+/// 020, in install order.
+async fn event_views_db(test: &str) -> PgConnection {
+    scratch(
+        test,
+        &format!(
+            "{DAEMON_SCHEMA}\n{}\n{OVERVIEW_VIEWS}\n{PEOPLE_MIGRATION}\n{EVENT_VIEWS}",
+            daemon_event_indexes()
+        ),
+    )
+    .await
+}
+
+/// 020's views read the daemon's indexes: the newest events from the time
+/// index, one device's from the device index, and the security events, which
+/// the page lists and the overview counts, from the security index. Each count
+/// is bounded where it can be, so no page's total is a count of the whole log.
+#[tokio::test]
+async fn the_event_views_read_the_daemons_indexes() {
+    let mut conn = event_views_db("event_view_plans").await;
+    let device = seed_device(&mut conn, "02:00:5e:00:24:02", Some("phone"), now()).await;
+    for (event_type, ago) in [("ip_changed", 60), ("arp_scan", 120), ("new_device", 180)] {
+        seed_event(&mut conn, device, event_type, ago).await;
+    }
+    let one_device = format!("device_id = {device}");
+    for (what, sql, index, bounded) in [
+        (
+            "the event log's rows",
+            "SELECT * FROM ng_events_recent ORDER BY \"timestamp\" DESC LIMIT 100".to_string(),
+            "ng_events_time_idx",
+            false,
+        ),
+        (
+            "the event log's count",
+            "SELECT count(*) FROM ng_events_recent".to_string(),
+            "ng_events_time_idx",
+            true,
+        ),
+        (
+            "a device's rows",
+            format!(
+                "SELECT * FROM ng_device_events WHERE {one_device} \
+                 ORDER BY \"timestamp\" DESC LIMIT 100"
+            ),
+            "ng_events_device_idx",
+            true,
+        ),
+        (
+            "a device's count",
+            format!("SELECT count(*) FROM ng_device_events WHERE {one_device}"),
+            "ng_events_device_idx",
+            true,
+        ),
+        (
+            "the security rows",
+            "SELECT * FROM ng_security_events ORDER BY \"timestamp\" DESC LIMIT 50".to_string(),
+            "ng_events_",
+            false,
+        ),
+        (
+            "the security count",
+            "SELECT count(*) FROM ng_security_events".to_string(),
+            "ng_events_security_idx",
+            false,
+        ),
+        (
+            "the overview's security count",
+            "SELECT security_events FROM ng_overview".to_string(),
+            "ng_events_security_idx",
+            false,
+        ),
+    ] {
+        let plan = plan_without_seqscan_or_sort(&mut conn, &sql).await;
+        assert!(plan.contains(index), "{what} does not read {index}: {plan}");
+        assert!(!plan.contains("Seq Scan on ng_events"), "{what}: {plan}");
+        assert!(!plan.contains("timestamp_epoch"), "{what}: {plan}");
+        if bounded {
+            assert!(
+                plan.contains("Limit"),
+                "{what} is not bounded by the view's LIMIT: {plan}"
+            );
+        }
+    }
+    let plan = plan_without_seqscan_or_sort(
+        &mut conn,
+        "SELECT * FROM ng_events_recent ORDER BY \"timestamp\" DESC LIMIT 100",
+    )
+    .await;
+    assert!(
+        !plan.contains("Sort"),
+        "the time index gives the event log its order: {plan}"
+    );
+}
+
+/// The views change how the event pages read and nothing about what they list:
+/// the same rows in the same order as the statement over `ng_events` each one
+/// replaces, the bound where the log is longer than it, and one security count
+/// that the overview and the page share.
+#[tokio::test]
+async fn the_event_views_list_what_the_table_does_up_to_their_bound() {
+    let mut conn = event_views_db("event_view_rows").await;
+    let busy = seed_device(&mut conn, "02:00:5e:00:24:03", Some("busy"), now()).await;
+    let quiet = seed_device(&mut conn, "02:00:5e:00:24:04", Some("quiet"), now()).await;
+    // More than the bound for one device, a few for the other, one with none.
+    exec(
+        &mut conn,
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+         SELECT $1::bigint, 'ip_changed', now() - make_interval(secs => g) \
+         FROM generate_series(1, 10050) g",
+        &[json!(busy)],
+    )
+    .await;
+    for (event_type, ago) in [
+        ("arp_spoof", 30),
+        ("new_device", 90_000),
+        ("identity_change", 200_000),
+        ("arp_scan", 5),
+    ] {
+        seed_event(&mut conn, quiet, event_type, ago).await;
+    }
+    exec(
+        &mut conn,
+        "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
+         VALUES (NULL, 'gratuitous_arp', now() - interval '2 seconds')",
+        &[],
+    )
+    .await;
+
+    async fn ids(conn: &mut PgConnection, sql: &str) -> Vec<i64> {
+        sqlx::query_scalar(sql).fetch_all(conn).await.unwrap()
+    }
+    async fn count(conn: &mut PgConnection, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(conn).await.unwrap()
+    }
+
+    // The event log: the newest 10,000, in the table's order.
+    let recent = ids(
+        &mut conn,
+        "SELECT id FROM ng_events_recent ORDER BY \"timestamp\" DESC, id DESC",
+    )
+    .await;
+    let table = ids(
+        &mut conn,
+        "SELECT id FROM ng_events ORDER BY \"timestamp\" DESC, id DESC LIMIT 10000",
+    )
+    .await;
+    assert_eq!(recent, table);
+    assert_eq!(
+        count(&mut conn, "SELECT count(*) FROM ng_events_recent").await,
+        10_000
+    );
+
+    // One device: all of a quiet one, the newest 10,000 of a busy one.
+    for (device, expected) in [(quiet, 4_i64), (busy, 10_000)] {
+        let viewed = ids(
+            &mut conn,
+            &format!(
+                "SELECT id FROM ng_device_events WHERE device_id = {device} \
+                 ORDER BY \"timestamp\" DESC, id DESC"
+            ),
+        )
+        .await;
+        let table = ids(
+            &mut conn,
+            &format!(
+                "SELECT id FROM ng_events WHERE device_id = {device} \
+                 ORDER BY \"timestamp\" DESC, id DESC LIMIT 10000"
+            ),
+        )
+        .await;
+        assert_eq!(viewed, table);
+        assert_eq!(viewed.len() as i64, expected);
+    }
+
+    // Security: every one, whatever device or none, and the overview agrees.
+    let types = netgrasp_core::model::SECURITY_EVENT_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let viewed = ids(
+        &mut conn,
+        "SELECT id FROM ng_security_events ORDER BY \"timestamp\" DESC, id DESC",
+    )
+    .await;
+    let table = ids(
+        &mut conn,
+        &format!(
+            "SELECT id FROM ng_events WHERE event_type IN ({types}) \
+             ORDER BY \"timestamp\" DESC, id DESC"
+        ),
+    )
+    .await;
+    assert_eq!(viewed, table);
+    assert_eq!(viewed.len(), 4);
+    let (total, day): (i64, i64) =
+        sqlx::query_as("SELECT security_events, security_events_24h FROM ng_overview")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(total, 4, "the overview's total is the page's");
+    assert_eq!(day, 3, "the identity change was more than a day ago");
+}

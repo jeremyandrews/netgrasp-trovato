@@ -151,7 +151,10 @@ jobs:
             one_person_per_name_is_enforced_by_the_index \
             an_existing_duplicate_stops_the_migration_and_is_named \
             the_prune_finds_expired_events_through_the_daemons_time_index \
-            movements_read_the_daemons_person_index_and_return_the_same_rows
+            movements_read_the_daemons_person_index_and_return_the_same_rows \
+            the_assistants_event_reads_are_bounded_by_the_daemons_indexes \
+            the_event_views_read_the_daemons_indexes \
+            the_event_views_list_what_the_table_does_up_to_their_bound
           do
             grep -q "$t ... ok" test.log \
               || { echo "::error::$t did not pass"; exit 1; }
@@ -169,6 +172,8 @@ jobs:
           echo "$passed tests passed"
           grep -q "the_write_back_leaves_every_daemon_owned_column_untouched ... ok" test.log \
             || { echo "::error::the column-discipline test did not pass"; exit 1; }
+          grep -q "the_event_pages_as_the_kernel_runs_them_read_the_daemons_indexes ... ok" test.log \
+            || { echo "::error::the event pages' index test did not pass"; exit 1; }
 
       # The row menu's forms are the plugin's only write path that a person
       # reaches without the assistant, and the three things that matter about

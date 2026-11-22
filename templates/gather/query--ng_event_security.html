@@ -2,8 +2,9 @@
     Scans, spoofs, rogue DHCP, address conflicts and identity changes.
     /events/security
 
-    Every row on this page is a security event by construction — the gather's
-    `in` filter is the whole point of the route — so the flagging that marks one
+    Every row on this page is a security event by construction — the gather
+    reads the `ng_security_events` view (020_netgrasp_event_views.sql), which
+    the overview counts too — so the flagging that marks one
     row out of many in the main log marks every row here. What makes the page
     read as security is the page-level treatment in netgrasp.css
     (`.ng-page--ng_event_security`) plus the count line below, which is a
