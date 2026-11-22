@@ -14,6 +14,20 @@
 
 {% block tabs %}{% set ng_tabs = "activity" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
 
+{#
+    The total is exact: every security event on record, counted by
+    `SELECT count(*) FROM ng_security_events`, the statement the overview's
+    `security_events` runs, so the two numbers are one number.
+
+    The list is not. Past the newest 10000 the pager stops (the `pager` block
+    below), for the reason /events stops there: a page is `ORDER BY "timestamp"
+    DESC LIMIT 50 OFFSET n`, and the daemon has no index that gives security
+    events in time order. The planner walks the time index past every other
+    event to find them, or reads them all and sorts them, and either costs more
+    the deeper the page; the last page of 3,400 sorted 170,000 rows on the live
+    network. The newest 10000 are 200 pages. 10000 is the number /events and
+    /events/device stop at (020), and a test holds the three together.
+#}
 {% block summary %}
 <div class="ng-summary">
     <span class="ng-summary__item">
@@ -21,7 +35,9 @@
         <span class="ng-summary__label">security event{{ total | pluralize }} on record</span>
     </span>
     <span class="ng-summary__scope">
-        showing {{ rows | length }}, page {{ page }} of {{ total_pages }}
+        {%- set ng_last = (10000 / per_page) | round(method="ceil") | int %}
+        {%- if total_pages < ng_last %}{% set ng_last = total_pages %}{% endif %}
+        showing {{ rows | length }}{% if total > 10000 %} of the newest 10000{% endif %}, page {{ page }} of {{ ng_last }}
         &middot; <a href="/events">full event log</a>
     </span>
 </div>
@@ -34,4 +50,53 @@
     No scan, spoof, rogue DHCP server, address conflict or identity change has
     been recorded. This is the good state.
 </span>
+{% endblock %}
+
+{#
+    The kernel's pager (gather/pager.html), drawn to the last page of the newest
+    10000 rather than to the last of `total`: the same links, the same window of
+    two pages either side, the same first and last, with `ng_last` where the
+    kernel would put `total_pages`. A page past it, typed by hand, still loads,
+    and offers Previous.
+#}
+{% block pager %}
+{% if pager %}
+{%- set ng_last = (10000 / per_page) | round(method="ceil") | int %}
+{%- if pager.total_pages < ng_last %}{% set ng_last = pager.total_pages %}{% endif %}
+{%- set ng_current = pager.current_page %}
+{%- set ng_lo = ng_current - 2 %}{% if ng_lo < 2 %}{% set ng_lo = 2 %}{% endif %}
+{%- set ng_hi = ng_current + 2 %}{% if ng_hi > ng_last - 1 %}{% set ng_hi = ng_last - 1 %}{% endif %}
+{%- if ng_lo > ng_hi %}{% set ng_lo = ng_hi + 1 %}{% set ng_shown = 1 %}{% else %}{% set ng_shown = ng_hi %}{% endif %}
+<nav class="pager" aria-label="Pagination">
+    <ul class="pager__items">
+        {% if ng_current > 1 %}
+        <li class="pager__item pager__item--previous">
+            <a href="{{ pager.page_url_prefix }}page={{ ng_current - 1 }}">Previous</a>
+        </li>
+        {% endif %}
+        <li class="pager__item{% if ng_current == 1 %} pager__item--active{% endif %}">
+            {% if ng_current == 1 %}<span aria-current="page">1</span>{% else %}<a href="{{ pager.page_url_prefix }}page=1">1</a>{% endif %}
+        </li>
+        {% if ng_lo > 2 and ng_lo <= ng_hi %}
+        <li class="pager__item"><span class="pager__ellipsis">...</span></li>
+        {% endif %}
+        {% for p in range(start=ng_lo, end=ng_hi + 1) %}
+        <li class="pager__item{% if p == ng_current %} pager__item--active{% endif %}">
+            {% if p == ng_current %}<span aria-current="page">{{ p }}</span>{% else %}<a href="{{ pager.page_url_prefix }}page={{ p }}">{{ p }}</a>{% endif %}
+        </li>
+        {% endfor %}
+        {% if ng_shown < ng_last - 1 %}
+        <li class="pager__item"><span class="pager__ellipsis">...</span></li>
+        {% endif %}
+        <li class="pager__item{% if ng_current == ng_last %} pager__item--active{% endif %}">
+            {% if ng_current == ng_last %}<span aria-current="page">{{ ng_last }}</span>{% else %}<a href="{{ pager.page_url_prefix }}page={{ ng_last }}">{{ ng_last }}</a>{% endif %}
+        </li>
+        {% if ng_current < ng_last %}
+        <li class="pager__item pager__item--next">
+            <a href="{{ pager.page_url_prefix }}page={{ ng_current + 1 }}">Next</a>
+        </li>
+        {% endif %}
+    </ul>
+</nav>
+{% endif %}
 {% endblock %}

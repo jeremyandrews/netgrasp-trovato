@@ -1307,7 +1307,8 @@ mod tests {
     /// /events and /events/device count at most 10000 rows, and say so. The
     /// bound is the views' `LIMIT` in 020 and the number the two templates
     /// print, which must be the same number or a page would say "10000+" of a
-    /// list that stops somewhere else.
+    /// list that stops somewhere else. /events/security's pager stops at the
+    /// same number.
     #[test]
     fn the_event_pages_print_the_bound_their_views_count_to() {
         let views = include_str!("../migrations/020_netgrasp_event_views.sql");
@@ -1325,6 +1326,17 @@ mod tests {
             assert!(template.contains(">10000+</span>"));
             assert!(template.contains("of the newest 10000"));
         }
+        // /events/security counts every security event but pages through the
+        // newest 10000 only, so its template carries the bound itself, in its
+        // wording and in both places it works out the last page.
+        let security = include_str!("../../../templates/gather/query--ng_event_security.html");
+        assert!(security.contains("total > 10000 %} of the newest 10000"));
+        assert_eq!(
+            security
+                .matches("set ng_last = (10000 / per_page) | round(method=\"ceil\") | int")
+                .count(),
+            2
+        );
     }
 
     /// The overview counts security events itself, in SQL, so the list is
