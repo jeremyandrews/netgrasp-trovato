@@ -27,6 +27,15 @@
 {% endblock %}
 
 {% block results %}
+{#
+    The install's switch, from any card's presence row (they all carry the same
+    value). Only `false` says so; null is a daemon that has not said.
+#}
+{% set ng_presence_off = false %}
+{% for row in rows %}{% if row.presence is defined and row.presence and row.presence.presence_tracking is defined and row.presence.presence_tracking == false %}{% set_global ng_presence_off = true %}{% endif %}{% endfor %}
+{% if ng_presence_off %}
+<p class="ng-notice ng-notice--presence">Presence tracking is off. Set <code>presence_tracking = true</code> in netgraspd's config to see who is home.</p>
+{% endif %}
 <ul class="ng-people">
     {% for row in rows %}
     <li class="ng-person">
@@ -88,6 +97,21 @@
             {%- if ng_depart %} leave{% endif -%}
         </p>
         {% endif %}
+        {#
+            Presence, three states and never more: Home, Away, or Not tracked.
+            `row.presence` is the person's ng_people_presence row (023's
+            include); a person whose row the daemon has not seen, or whose
+            own switch is off, reads Not tracked, never Away.
+        #}
+        {% set ng_track_raw = row.fields.field_track_presence | default(value=false) %}
+        {% set ng_track = ng_track_raw.value | default(value=ng_track_raw) %}
+        {% if row.presence is defined and row.presence and row.presence.state == "home" and ng_track %}
+        <p class="ng-person__meta ng-person__state ng-person__state--home">Home</p>
+        {% elif row.presence is defined and row.presence and row.presence.state == "away" and ng_track %}
+        <p class="ng-person__meta ng-person__state ng-person__state--away">Away</p>
+        {% else %}
+        <p class="ng-person__meta ng-person__state ng-person__state--untracked">Not tracked</p>
+        {% endif %}
         {% set ng_notes_raw = row.fields.field_notes | default(value="") %}
         {% set ng_notes = ng_notes_raw.value | default(value=ng_notes_raw) %}
         {% if ng_notes %}
@@ -104,7 +128,8 @@
 
 {% block empty %}
 <span class="ng-empty__hint">
-    No people yet. A person is home when any device they own is online.
+    No people yet. Once you add someone and switch on "Track whether they are
+    home", their phones and wearables decide whether they are home.
     <a href="/people/add">Add person</a>.
 </span>
 {% endblock %}

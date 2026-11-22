@@ -51,7 +51,7 @@ pub const SELECT_DIRTY_DEVICES: &str = "SELECT id, mac, resolved_name, hostname,
      vendor, device_type, os_family, state, last_ip, current_location, \
      first_seen_at_epoch AS first_seen, last_seen_at_epoch AS last_seen, \
      display_name, notes, hidden, notify, owner_item_id::text AS owner_item_id, \
-     trovato_item_id \
+     counts_for_presence, trovato_item_id \
      FROM ng_devices WHERE sync_state = 'dirty' ORDER BY last_seen_at DESC LIMIT $1";
 
 /// Point a device row at its Item. `$1` is the Item id, `$2` the device id.
@@ -109,7 +109,7 @@ pub const DELETE_EXPIRED_EVENTS: &str = "DELETE FROM ng_events WHERE id IN (\
 /// The daemon's row for a device Item. `$1` is the Item id.
 pub const SELECT_DEVICE_STATE: &str = "SELECT id, mac, hostname, vendor, device_type, os_family, \
      state, last_ip, current_location, current_ap, first_seen_at_epoch AS first_seen, \
-     last_seen_at_epoch AS last_seen \
+     last_seen_at_epoch AS last_seen, counts_for_presence \
      FROM ng_devices WHERE trovato_item_id = $1::uuid LIMIT 1";
 
 /// A device's presence sessions, newest first. `$1` is the device id, `$2` the
@@ -551,9 +551,13 @@ pub const SELECT_DEVICES_TO_SORT: &str = device_read!(
 /// Read from the overview's view rather than from `ng_people`, because the view
 /// carries the epoch twins of the two arrival times the mirror stores only as
 /// `timestamptz`, which the `db` host decodes as null.
+///
+/// `track_presence` and `presence_tracking` come from 023's view over it, so the
+/// page can say why somebody is not tracked.
 pub const SELECT_PERSON_PRESENCE: &str = "SELECT state, current_location, \
-     last_arrived_at_epoch AS arrived, last_departed_at_epoch AS departed, devices_online \
-     FROM ng_people_presence WHERE item_id = $1::uuid";
+     last_arrived_at_epoch AS arrived, last_departed_at_epoch AS departed, devices_online, \
+     track_presence, presence_tracking \
+     FROM ng_people_presence_status WHERE item_id = $1::uuid";
 
 /// One person's comings and goings, newest first. `$1` is their Item id, `$2`
 /// the row limit.
@@ -717,9 +721,37 @@ pub const SELECT_DEVICES_FOR_ALERTS: &str = device_read!(
      LIMIT $1::bigint"
 );
 
+// ---------------------------------------------------------------------------
+// Presence settings (netgraspd V7)
+// ---------------------------------------------------------------------------
+
+/// What decides whether one device counts for its owner's presence: the
+/// person's choice and the daemon's classified type. `$1` is the device id.
+pub const SELECT_DEVICE_PRESENCE: &str = "SELECT id, counts_for_presence, device_type \
+     FROM ng_devices WHERE id = $1::bigint";
+
+/// One person's presence: their switch, the daemon's state and where they are,
+/// and the install's switch. `$1` is their Item id.
+///
+/// `presence_tracking` comes from `ng_presence_tracking()` (migration 023),
+/// which is `NULL` when no daemon has published it.
+pub const SELECT_PERSON_PRESENCE_SETTINGS: &str = "SELECT item_id::text AS item_id, name, state, \
+     track_presence, current_location, ng_presence_tracking() AS presence_tracking \
+     FROM ng_people WHERE item_id = $1::uuid";
+
+/// The install's presence switch as the daemon published it: `true`, `false`,
+/// or `NULL` when no daemon has said.
+pub const SELECT_PRESENCE_TRACKING: &str = "SELECT ng_presence_tracking() AS presence_tracking";
+
 /// Every statement above, for the tests that check them as a set.
 pub const ALL: &[(&str, &str)] = &[
     ("SELECT_DIRTY_DEVICES", SELECT_DIRTY_DEVICES),
+    ("SELECT_DEVICE_PRESENCE", SELECT_DEVICE_PRESENCE),
+    (
+        "SELECT_PERSON_PRESENCE_SETTINGS",
+        SELECT_PERSON_PRESENCE_SETTINGS,
+    ),
+    ("SELECT_PRESENCE_TRACKING", SELECT_PRESENCE_TRACKING),
     ("UPDATE_LINK_ITEM", UPDATE_LINK_ITEM),
     ("UPDATE_MARK_CLEAN", UPDATE_MARK_CLEAN),
     ("SELECT_DAEMON_TITLE_FIELDS", SELECT_DAEMON_TITLE_FIELDS),

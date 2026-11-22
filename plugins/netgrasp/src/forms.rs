@@ -65,6 +65,8 @@
 
 use netgrasp_core::assist::{self, DeviceFacts, PersonFacts};
 use netgrasp_core::model::DeviceEdit;
+use netgrasp_core::presence::{self, PresenceChoice};
+use netgrasp_core::writeback::FIELD_TRACK_PRESENCE;
 use trovato_sdk::types::{ApiRequest, ApiResponse, MenuRoute};
 
 use crate::{PERM_ADMINISTER, alerts, assist_host, people_forms};
@@ -76,6 +78,8 @@ const DEVICE_HIDDEN: &str = "/netgrasp/device/hidden";
 pub(crate) const DEVICE_NOTIFY: &str = "/netgrasp/device/notify";
 const PERSON_RENAME: &str = "/netgrasp/person/rename";
 pub(crate) const PERSON_NOTIFY: &str = "/netgrasp/person/notify";
+pub(crate) const DEVICE_PRESENCE: &str = "/netgrasp/device/presence";
+pub(crate) const PERSON_PRESENCE: &str = "/netgrasp/person/presence";
 
 /// The script that makes the owner select searchable. Progressive: every form
 /// it touches posts the same fields with scripting off, and the filter box it
@@ -113,6 +117,8 @@ pub fn routes() -> Vec<MenuRoute> {
         (DEVICE_NOTIFY, "device_notify"),
         (PERSON_RENAME, "person_rename"),
         (PERSON_NOTIFY, "person_notify"),
+        (DEVICE_PRESENCE, "device_presence"),
+        (PERSON_PRESENCE, "person_presence"),
         (people_forms::PERSON_ADD, "person_add"),
         (people_forms::DEVICES_ASSIGN, "devices_assign"),
         (people_forms::PERSON_MERGE, "person_merge"),
@@ -154,6 +160,10 @@ pub fn serve(request: &ApiRequest) -> ApiResponse {
         "person_rename_save" => person_rename_save(request),
         "person_notify_form" => person_notify_form(request),
         "person_notify_save" => person_notify_save(request),
+        "device_presence_form" => device_presence_form(request),
+        "device_presence_save" => device_presence_save(request),
+        "person_presence_form" => person_presence_form(request),
+        "person_presence_save" => person_presence_save(request),
         "person_add_form" => people_forms::person_add_form(request),
         "person_add_save" => people_forms::person_add_save(request),
         "devices_assign_form" => people_forms::devices_assign_form(request),
@@ -689,6 +699,201 @@ fn person_notify_save(request: &ApiRequest) -> ApiResponse {
     }
 }
 
+// ===========================================================================
+// Presence: which devices count, and whether a person is tracked
+// ===========================================================================
+
+/// One device's presence setting as the daemon's table holds it.
+#[derive(serde::Deserialize)]
+struct DevicePresenceRow {
+    #[serde(default)]
+    counts_for_presence: Option<bool>,
+    #[serde(default)]
+    device_type: Option<String>,
+}
+
+fn device_presence_row(id: i64) -> Result<DevicePresenceRow, String> {
+    crate::db::query_rows::<DevicePresenceRow>(
+        netgrasp_core::queries::SELECT_DEVICE_PRESENCE,
+        &[serde_json::json!(id)],
+    )
+    .map_err(|e| format!("could not read the device: {e}"))?
+    .into_iter()
+    .next()
+    .ok_or_else(|| format!("no device with the id {id}"))
+}
+
+/// The device's three choices and its effective value, as form HTML.
+///
+/// Separate from the handler so a test can read it without a database.
+pub(crate) fn device_presence_fields(
+    counts_override: Option<bool>,
+    device_type: Option<&str>,
+) -> String {
+    let current = PresenceChoice::from_override(counts_override);
+    let options: String = PresenceChoice::ALL
+        .iter()
+        .map(|choice| {
+            format!(
+                r#"<option value="{value}"{selected}>{label}</option>"#,
+                value = choice.as_value(),
+                label = choice.label(),
+                selected = if *choice == current { " selected" } else { "" },
+            )
+        })
+        .collect();
+    format!(
+        r#"<p><label for="ng-value">Counts for who is home</label>
+<select id="ng-value" name="value">{options}</select></p>
+<p class="ng-form__effective">Now: <strong>{effective}</strong></p>
+<p class="ng-form__hint">By device type, a phone or a wearable counts and anything else does not. Only devices that count decide whether their owner is home.</p>"#,
+        effective = escape_html(&presence::effective_description(
+            counts_override,
+            device_type
+        )),
+    )
+}
+
+fn device_presence_form(request: &ApiRequest) -> ApiResponse {
+    let (target, back) = target_and_back(request);
+    let facts = match resolve_device(&target) {
+        Ok(facts) => facts,
+        Err(message) => return problem(&back, &message),
+    };
+    let row = match device_presence_row(facts.id) {
+        Ok(row) => row,
+        Err(message) => return problem(&back, &message),
+    };
+    let field = device_presence_fields(row.counts_for_presence, row.device_type.as_deref());
+    form_page(
+        request,
+        DEVICE_PRESENCE,
+        &target,
+        &back,
+        "Counts for who is home",
+        &device_subject(&facts),
+        &field,
+        "Save",
+    )
+}
+
+fn device_presence_save(request: &ApiRequest) -> ApiResponse {
+    let (target, back) = posted_target_and_back(request);
+    let facts = match resolve_device(&target) {
+        Ok(facts) => facts,
+        Err(message) => return problem(&back, &message),
+    };
+    let choice = PresenceChoice::parse(&field(&request.body, "value"));
+    // Sparse, like every other form here: this names one column.
+    let edit = DeviceEdit {
+        counts_for_presence: Some(choice.to_override()),
+        ..DeviceEdit::default()
+    };
+    match assist_host::apply_device_edit(&facts, &edit) {
+        Ok(_) => {
+            let effective =
+                presence::effective_description(choice.to_override(), facts.device_type.as_deref());
+            done(
+                &back,
+                &format!(
+                    "{subject}: {effective}.",
+                    subject = escape_html(&facts.phrase()),
+                    effective = escape_html(&effective),
+                ),
+            )
+        }
+        Err(message) => problem(&back, &message),
+    }
+}
+
+/// The person's switch and what it means right now, as form HTML.
+pub(crate) fn person_presence_fields(track: bool, global: Option<bool>) -> String {
+    // Only a daemon that has said `false`: NULL is no daemon, or one older
+    // than V7, which tracks everybody. The same rule Home and People follow.
+    let notice = if global != Some(false) {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="ng-form__hint">Presence tracking is off for this install, so nobody is tracked until <code>{line}</code> is set in the daemon's config.</p>"#,
+            line = presence::GLOBAL_SWITCH,
+        )
+    };
+    format!(
+        r#"<p><label><input type="checkbox" name="track" value="1"{checked}> Track whether they are home</label></p>
+<p class="ng-form__hint">Off by default. When it is on, their phones and wearables (and any device chosen to count) decide whether they are home.</p>
+{notice}"#,
+        checked = if track { " checked" } else { "" },
+    )
+}
+
+/// One person's presence settings as the mirror row holds them.
+#[derive(serde::Deserialize)]
+struct PersonPresenceRow {
+    #[serde(default)]
+    track_presence: Option<bool>,
+    #[serde(default)]
+    presence_tracking: Option<bool>,
+}
+
+fn person_presence_form(request: &ApiRequest) -> ApiResponse {
+    let (target, back) = target_and_back(request);
+    let person = match assist_host::load_person(&target) {
+        Ok(person) => person,
+        Err(message) => return problem(&back, &message),
+    };
+    // The Item's field is the person's own word; the mirror row is what the
+    // daemon reads, and the install's switch is only in the daemon's status.
+    let item = assist_host::load_person_item(&person.item_id).ok();
+    let row = crate::db::query_rows::<PersonPresenceRow>(
+        netgrasp_core::queries::SELECT_PERSON_PRESENCE_SETTINGS,
+        &[serde_json::json!(person.item_id)],
+    )
+    .ok()
+    .and_then(|rows| rows.into_iter().next());
+    let track = item
+        .as_ref()
+        .map(|item| netgrasp_core::writeback::field_bool(item, FIELD_TRACK_PRESENCE))
+        .or_else(|| row.as_ref().and_then(|r| r.track_presence))
+        .unwrap_or(false);
+    let global = row.and_then(|r| r.presence_tracking);
+
+    form_page(
+        request,
+        PERSON_PRESENCE,
+        &target,
+        &back,
+        "Track whether they are home",
+        &person_subject(&person),
+        &person_presence_fields(track, global),
+        "Save",
+    )
+}
+
+fn person_presence_save(request: &ApiRequest) -> ApiResponse {
+    let (target, back) = posted_target_and_back(request);
+    let track = field(&request.body, "track") == "1";
+
+    let existing = match assist_host::load_person_item(&target) {
+        Ok(item) => item,
+        Err(message) => return problem(&back, &message),
+    };
+    let mut payload = assist_host::person_payload(&target, &existing, None, None, None);
+    if let Some(fields) = payload.get_mut("fields").and_then(|f| f.as_object_mut()) {
+        fields.insert(FIELD_TRACK_PRESENCE.into(), serde_json::json!(track));
+    }
+    match assist_host::apply_person_save(&payload) {
+        Ok(_) => done(
+            &back,
+            if track {
+                "Their phones and wearables now decide whether they are home."
+            } else {
+                "They are not tracked. Nobody will see them as home or away."
+            },
+        ),
+        Err(message) => problem(&back, &message),
+    }
+}
+
 pub(crate) fn alerts_sentence(arrive: bool, depart: bool) -> String {
     match (arrive, depart) {
         (true, true) => "They will be announced when they arrive and when they leave.".into(),
@@ -930,7 +1135,7 @@ mod tests {
     #[test]
     fn every_route_is_gated_on_the_administer_permission() {
         let routes = routes();
-        assert_eq!(routes.len(), 26, "thirteen forms, two methods each");
+        assert_eq!(routes.len(), 30, "fifteen forms, two methods each");
         for route in &routes {
             assert_eq!(
                 route.permission, PERM_ADMINISTER,
@@ -964,6 +1169,8 @@ mod tests {
             DEVICE_NOTIFY,
             PERSON_RENAME,
             PERSON_NOTIFY,
+            DEVICE_PRESENCE,
+            PERSON_PRESENCE,
             people_forms::PERSON_ADD,
             people_forms::DEVICES_ASSIGN,
             people_forms::PERSON_MERGE,
@@ -1001,6 +1208,77 @@ mod tests {
                 route.callback
             );
         }
+    }
+
+    /// The device form offers the three choices, marks the current one, and
+    /// says what the device's effective value is and why.
+    #[test]
+    fn the_device_presence_form_offers_three_choices_and_the_effective_value() {
+        let html = device_presence_fields(None, Some("phone"));
+        assert!(
+            html.contains(r#"<option value="by_type" selected>By device type</option>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<option value="counts">Counts</option>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<option value="does_not_count">Does not count</option>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("Now: <strong>Counts: phone</strong>"),
+            "{html}"
+        );
+
+        let html = device_presence_fields(Some(false), Some("phone"));
+        assert!(
+            html.contains(r#"<option value="does_not_count" selected>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("Now: <strong>Does not count: chosen for this device</strong>"),
+            "{html}"
+        );
+
+        let html = device_presence_fields(Some(true), Some("computer"));
+        assert!(
+            html.contains(r#"<option value="counts" selected>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("Now: <strong>Counts: chosen for this device</strong>"),
+            "{html}"
+        );
+
+        // Each choice posts a value that reads back as itself.
+        for choice in PresenceChoice::ALL {
+            assert_eq!(PresenceChoice::parse(choice.as_value()), choice);
+        }
+    }
+
+    /// The person form is one switch, off unless they are tracked, and it says
+    /// when the install's own switch is what keeps them untracked.
+    #[test]
+    fn the_person_presence_form_is_one_switch_and_names_the_global_one() {
+        let off = person_presence_fields(false, Some(true));
+        assert!(
+            off.contains(r#"name="track" value="1"> Track whether they are home"#),
+            "{off}"
+        );
+        assert!(!off.contains("presence_tracking = true"), "{off}");
+
+        let on = person_presence_fields(true, Some(true));
+        assert!(on.contains(r#"value="1" checked> Track"#), "{on}");
+
+        let html = person_presence_fields(true, Some(false));
+        assert!(
+            html.contains("<code>presence_tracking = true</code>"),
+            "{html}"
+        );
+        // No daemon has said: nothing to say.
+        assert!(!person_presence_fields(true, None).contains("presence_tracking"));
     }
 
     #[test]

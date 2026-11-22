@@ -173,6 +173,20 @@ fn render_identity(out: &mut String, state: &DeviceState, owner_name: Option<&st
     if let Some(v) = present(owner_name) {
         row(out, "Owner", &escape(v));
     }
+    // What the daemon will make of this device when it decides whether its
+    // owner is home, and why, with the way to change it.
+    row(
+        out,
+        "Counts for who is home",
+        &format!(
+            "{} <a href='/netgrasp/device/presence?target={}'>Change</a>",
+            escape(&netgrasp_core::presence::effective_description(
+                state.counts_for_presence,
+                present(state.device_type.as_deref()),
+            )),
+            state.id,
+        ),
+    );
     row(
         out,
         "First seen",
@@ -339,6 +353,7 @@ mod tests {
             current_ap: Some("living-room-ap".to_string()),
             first_seen: Some(NOW - 900_000),
             last_seen: Some(NOW - 30),
+            counts_for_presence: None,
         }
     }
 
@@ -474,6 +489,29 @@ mod tests {
         ] {
             assert!(html.contains(expected), "missing {expected}");
         }
+    }
+
+    /// The page says whether the device decides if its owner is home, why, and
+    /// links to the form that changes it.
+    #[test]
+    fn the_identity_block_says_whether_the_device_counts_for_who_is_home() {
+        let html = render(Some(&state()), &history(), None, NOW);
+        assert!(
+            html.contains("<dt>Counts for who is home</dt><dd>Counts: phone <a href='/netgrasp/device/presence?target=4444'>"),
+            "{html}"
+        );
+
+        let mut laptop = state();
+        laptop.device_type = Some("computer".to_string());
+        let html = render(Some(&laptop), &history(), None, NOW);
+        assert!(html.contains("<dd>Does not count: computer "), "{html}");
+
+        laptop.counts_for_presence = Some(true);
+        let html = render(Some(&laptop), &history(), None, NOW);
+        assert!(
+            html.contains("<dd>Counts: chosen for this device "),
+            "{html}"
+        );
     }
 
     /// The place and the access point are two rows: the place is what a person

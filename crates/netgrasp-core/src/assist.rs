@@ -707,6 +707,7 @@ pub fn describe_change_set(columns: &[&str]) -> String {
             "notes" => "the notes",
             "hidden" => "whether it is hidden",
             "notify" => "the arrival and departure alerts",
+            "counts_for_presence" => "whether it counts for who is home",
             // A column outside the user-owned set cannot reach here from a
             // `DeviceEdit`, and if one ever does the card says so rather than
             // quietly leaving it off the list.
@@ -1151,6 +1152,9 @@ impl DeviceFacts {
             notes: Some(self.notes.clone().unwrap_or_default()),
             hidden: Some(self.hidden),
             notify: Some(self.notify),
+            // Not read by the assistant's device projection; left unnamed so
+            // nothing is inferred for it.
+            counts_for_presence: None,
         }
     }
 

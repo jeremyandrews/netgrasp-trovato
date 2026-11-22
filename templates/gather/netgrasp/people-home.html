@@ -1,5 +1,9 @@
 {#
-    People who are home, one card each. Shared by /people/home and the overview.
+    People and whether they are home, one card each. Used by /people/home.
+
+    Three states and only three: home, away, and not tracked. Anything that is
+    not `home` or `away` (the daemon writes `untracked`) reads "Not tracked",
+    never "Away": nobody is watching whether that person is in.
 
     The caller sets `ng_people` to a list of `ng_person_presence` rows: flat,
     keyed by the columns of the `ng_people_presence` view. The two times are
@@ -12,13 +16,15 @@
 #}
 <ul class="ng-people">
     {% for person in ng_people %}
-    <li class="ng-person">
+    {% if person.state == "home" %}{% set ng_state = "home" %}{% elif person.state == "away" %}{% set ng_state = "away" %}{% else %}{% set ng_state = "untracked" %}{% endif %}
+    <li class="ng-person ng-person--{{ ng_state }}">
         <h3 class="ng-person__name">
             <a href="/devices/owner?owner={{ person.item_id }}">
                 {%- if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif -%}
             </a>
         </h3>
         <p class="ng-person__meta">
+            {%- if ng_state == "home" -%}
             {%- if person.last_arrived_at_epoch -%}
             Home since <span class="ng-mono ng-nowrap" data-ng-epoch="{{ person.last_arrived_at_epoch }}">
                 {{- person.last_arrived_at_epoch | date(format="%Y-%m-%d %H:%M") -}}
@@ -27,7 +33,19 @@
             Home
             {%- endif -%}
             {%- if person.current_location %}, in {{ person.current_location }}{% endif -%}
+            {%- elif ng_state == "away" -%}
+            {%- if person.last_departed_at_epoch -%}
+            Away since <span class="ng-mono ng-nowrap" data-ng-epoch="{{ person.last_departed_at_epoch }}">
+                {{- person.last_departed_at_epoch | date(format="%Y-%m-%d %H:%M") -}}
+            </span>
+            {%- else -%}
+            Away
+            {%- endif -%}
+            {%- else -%}
+            <span class="ng-person__state--untracked">Not tracked</span>
+            {%- endif -%}
         </p>
+        {% if ng_state != "untracked" %}
         <p class="ng-person__meta">
             {%- if person.devices_online -%}
             {{ person.devices_online }} device{{ person.devices_online | pluralize }} online
@@ -35,6 +53,7 @@
             No device of theirs is online right now
             {%- endif -%}
         </p>
+        {% endif %}
     </li>
     {% endfor %}
 </ul>

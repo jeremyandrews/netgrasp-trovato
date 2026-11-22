@@ -92,6 +92,12 @@ pub struct DeviceRow {
     /// Item id of the owning `ng_person`. `None` for unowned or unread.
     #[serde(default)]
     pub owner_item_id: Option<String>,
+    /// Whether the device decides if its owner is home (netgraspd V7). `None`
+    /// is both "by device type" and "unread"; a mint writes it to the Item
+    /// either way, and the Item field is a mirror that writes nothing back on
+    /// its own.
+    #[serde(default)]
+    pub counts_for_presence: Option<bool>,
 }
 
 impl DeviceRow {
@@ -118,6 +124,7 @@ impl DeviceRow {
             hidden: None,
             notify: None,
             owner_item_id: None,
+            counts_for_presence: None,
         }
     }
 
@@ -136,6 +143,10 @@ impl DeviceRow {
             notes: self.notes.clone(),
             hidden: self.hidden,
             notify: self.notify,
+            // NULL is "by device type", the default, and is indistinguishable
+            // from a projection that did not read the column; either way the
+            // overlay says nothing and a minted Item reads as by type.
+            counts_for_presence: self.counts_for_presence.map(Some),
         }
     }
 }
@@ -157,6 +168,9 @@ pub struct DeviceOverlay {
     pub hidden: bool,
     /// Whether arrival/departure of this device is worth telling someone about.
     pub notify: bool,
+    /// Whether the device decides if its owner is home: `None` by device type,
+    /// `Some(true)` counts, `Some(false)` does not.
+    pub counts_for_presence: Option<bool>,
 }
 
 /// A **sparse** device overlay: the user-owned columns one edit names, and no
@@ -202,6 +216,10 @@ pub struct DeviceEdit {
     /// Arrival and departure alerts.
     #[serde(default)]
     pub notify: Option<bool>,
+    /// Whether the device counts for its owner's presence. `Some(None)` sets it
+    /// back to "by device type"; the outer `None` leaves it alone.
+    #[serde(default)]
+    pub counts_for_presence: Option<Option<bool>>,
 }
 
 impl DeviceEdit {
@@ -216,6 +234,7 @@ impl DeviceEdit {
             notes: Some(overlay.notes.clone().unwrap_or_default()),
             hidden: Some(overlay.hidden),
             notify: Some(overlay.notify),
+            counts_for_presence: Some(overlay.counts_for_presence),
         }
     }
 
@@ -232,6 +251,7 @@ impl DeviceEdit {
             "notes" => self.notes.is_some(),
             "hidden" => self.hidden.is_some(),
             "notify" => self.notify.is_some(),
+            "counts_for_presence" => self.counts_for_presence.is_some(),
             _ => false,
         }
     }
@@ -270,6 +290,9 @@ pub struct PersonFields {
     pub notify_arrive: bool,
     /// Tell someone when the last of this person's devices disappears.
     pub notify_depart: bool,
+    /// Keep track of whether they are home (netgraspd V7). Off by default.
+    #[serde(default)]
+    pub track_presence: bool,
 }
 
 /// A row of `ng_events`, as the event log and the device page read it.
@@ -422,6 +445,10 @@ pub struct DeviceState {
     /// Most recent observation, unix seconds — `last_seen_at_epoch`, aliased.
     #[serde(default)]
     pub last_seen: Option<i64>,
+    /// The person's choice of whether this device decides if its owner is
+    /// home: `None` by device type (daemon schema V7).
+    #[serde(default)]
+    pub counts_for_presence: Option<bool>,
 }
 
 /// Row shape shared by the three timeline queries, so one decode serves all.

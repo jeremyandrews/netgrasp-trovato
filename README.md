@@ -192,8 +192,14 @@ The daemon owns that schema and its migrations are the canonical DDL. This
 repository carries the tables it reads twice: `crates/netgrasp-core/tests/
 fixtures/daemon_schema.sql` reproduces the daemon's DDL and is what the plugin's
 queries are tested against, and `plugins/netgrasp/migrations/001_netgrasp_schema.sql`
-(with `015_netgrasp_notify_schema.sql` for version 4's notify tables)
-is a guarded copy so the plugin can be enabled with no daemon.
+(with `015_netgrasp_notify_schema.sql` for version 4's notify tables and
+`022_netgrasp_presence_schema.sql` for the columns versions 5 and 7 added)
+is a guarded copy so the plugin can be enabled with no daemon. The fixture is
+the daemon's schema as of version 7.
+
+The next plugin release pairs with the netgraspd release that carries schema
+version 7 (`V7__presence_opt_in.sql`): presence is opt in, and the plugin's
+presence settings write the two columns that version adds.
 `the_plugin_migration_is_a_faithful_copy_of_the_daemons_schema` checks the
 second against the first column by column, and CI fails if it does not run.
 

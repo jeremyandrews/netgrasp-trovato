@@ -1,26 +1,34 @@
 {#
     Who is home, as people. /people/home
 
-    One card per person the daemon counts as home, with the time they arrived.
-    /who-is-home is the device-shaped version of the same question and says
-    which devices make somebody home; this is the daemon's own answer, from
-    ng_people, which is the one that knows since when.
+    One card per person: home first (with the time they arrived), then away,
+    then the people nobody is tracking, which read "Not tracked" and are never
+    counted as home or away. /who-is-home is the device-shaped version of the
+    same question and says which devices make somebody home; this is the
+    daemon's own answer, from ng_people, which is the one that knows since when.
 
-    The cards are gather/netgrasp/people-home.html, which the overview shares.
+    When the install's switch is off (`presence_tracking` in netgraspd's config,
+    published in ng_daemon_status and read by 023), the page says so in one
+    line above the cards. Null, a daemon that has not said, says nothing.
+
+    The cards are gather/netgrasp/people-home.html.
 #}
 {% extends "gather/netgrasp/page.html" %}
 
 {% block tabs %}{% set ng_tabs = "people" %}{% include "gather/netgrasp/tabs.html" %}{% endblock %}
 
 {% block results %}
+{% if rows | length > 0 and rows[0].presence_tracking is defined and rows[0].presence_tracking == false %}
+<p class="ng-notice ng-notice--presence">Presence tracking is off. Set <code>presence_tracking = true</code> in netgraspd's config to see who is home.</p>
+{% endif %}
 {% set ng_people = rows %}
 {% include "gather/netgrasp/people-home.html" %}
 {% endblock %}
 
 {% block empty %}
 <span class="ng-empty__hint">
-    A person is home when any device they own is online, so nobody here can also
-    mean nobody's devices have an owner yet. <a href="/people">People</a>,
-    <a href="/overview">overview</a>.
+    <a href="/people/add">Add the people in your home</a>, then switch on
+    "Track whether they are home" for each one to be tracked.
+    <a href="/overview">Overview</a>.
 </span>
 {% endblock %}

@@ -104,6 +104,18 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
                     .label("Hide from device lists"),
                 FieldDefinition::new("field_notify", FieldType::Boolean)
                     .label("Notify on arrival and departure"),
+                // Three choices, so not a Boolean: the SDK has no select type,
+                // and the admin form shows this as a text box that takes
+                // `by_type`, `counts` or `does_not_count`. The device's own
+                // Presence form (`/netgrasp/device/presence`) offers the three as
+                // a choice and says what the device's effective value is.
+                FieldDefinition::new(
+                    "field_counts_for_presence",
+                    FieldType::Text {
+                        max_length: Some(32),
+                    },
+                )
+                .label("Counts for who is home (by_type, counts or does_not_count)"),
             ],
         },
         ContentTypeDefinition {
@@ -117,6 +129,8 @@ pub fn tap_item_info() -> Vec<ContentTypeDefinition> {
                     .label("Notify when they arrive"),
                 FieldDefinition::new("field_notify_depart", FieldType::Boolean)
                     .label("Notify when they leave"),
+                FieldDefinition::new("field_track_presence", FieldType::Boolean)
+                    .label("Track whether they are home"),
             ],
         },
     ]
@@ -496,6 +510,16 @@ pub fn tap_item_presave(input: serde_json::Value) -> serde_json::Value {
         }
         None => {}
     }
+    // Whatever was typed into the admin form's text box becomes one of the
+    // three values, so the Item and the column always agree on what it means.
+    if netgrasp_core::writeback::field(&input, netgrasp_core::writeback::FIELD_COUNTS_FOR_PRESENCE)
+        .is_some()
+    {
+        fields.insert(
+            netgrasp_core::writeback::FIELD_COUNTS_FOR_PRESENCE.into(),
+            serde_json::json!(netgrasp_core::writeback::field_presence(&input).as_value()),
+        );
+    }
 
     if fields.is_empty() {
         return serde_json::json!({});
@@ -783,7 +807,8 @@ mod tests {
                 "field_owner",
                 "field_notes",
                 "field_hidden",
-                "field_notify"
+                "field_notify",
+                "field_counts_for_presence"
             ]
         );
         for volatile in [
@@ -3005,19 +3030,29 @@ mod tests {
         let manifest = include_str!("../netgrasp.info.toml");
         let view = include_str!("../migrations/006_netgrasp_owner_names.sql");
         let listed = include_str!("../migrations/012_netgrasp_device_tabs_search.sql");
+        let presence = include_str!("../migrations/023_netgrasp_presence_views.sql");
 
         // The record type's backing relation is a view over the owner view, not
-        // the daemon's table: 012's `ng_devices_listed`, which is every column
-        // of `ng_devices_with_owner` plus the search column.
+        // the daemon's table: 023's `ng_devices_listed_presence`, which is 012's
+        // `ng_devices_listed` (every column of `ng_devices_with_owner` plus the
+        // search column) plus the owner's presence state.
         assert!(
-            manifest.contains("table = \"ng_devices_listed\""),
-            "ng_device_state is no longer declared over the listed view"
+            manifest.contains("table = \"ng_devices_listed_presence\""),
+            "ng_device_state is no longer declared over the listed presence view"
         );
         assert!(
             listed.contains("v.*,") && listed.contains("FROM ng_devices_with_owner v;"),
             "ng_devices_listed is no longer the owner view plus a column"
         );
-        for relation in ["\"ng_devices_with_owner\"", "\"ng_devices_listed\""] {
+        assert!(
+            presence.contains("l.*,") && presence.contains("FROM ng_devices_listed l"),
+            "ng_devices_listed_presence is no longer the listed view plus a column"
+        );
+        for relation in [
+            "\"ng_devices_with_owner\"",
+            "\"ng_devices_listed\"",
+            "\"ng_devices_listed_presence\"",
+        ] {
             assert!(
                 manifest.contains(relation),
                 "{relation} is not in db_tables, so the kernel will refuse the record type"
@@ -3049,7 +3084,8 @@ mod tests {
             }
             assert!(
                 view.contains(&format!("d.{column},"))
-                    || column == "owner_name"
+                    || (column == "owner_name" && view.contains("p.name AS owner_name"))
+                    || (column == "owner_state" && presence.contains("p.state AS owner_state"))
                     || (column == "search_text" && listed.contains("AS search_text")),
                 "the view does not select {column}, which ng_device_state maps"
             );

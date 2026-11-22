@@ -6,7 +6,8 @@
     and answers at its own /gather/ path, so nothing that read it breaks.
 
     A device gather read as a people page. The rows are online devices that
-    belong to somebody — with no grouping in QueryDefinition, a person with
+    belong to somebody the daemon has as home (023 filters on `owner_state`, so
+    an untracked or away owner's online laptop does not make them home) — with no grouping in QueryDefinition, a person with
     three devices arrives as three rows (G-NO-GATHER-AGGREGATION), which is why
     the gather sorts by owner: the repetition at least arrives adjacent.
 
@@ -103,8 +104,9 @@
 
 {% block empty %}
 <span class="ng-empty__hint">
-    A device counts as somebody being home once it has an owner. Nothing here
-    means no owned device is online — or that no device has been given an owner
-    yet. <a href="/people">People</a>, <a href="/devices">online devices</a>.
+    Only people the daemon has as home are listed: a tracked person whose phone
+    or wearable (or a device chosen to count) is online. Nothing here means
+    nobody is home, or nobody is tracked yet. <a href="/people">People</a>,
+    <a href="/devices">online devices</a>.
 </span>
 {% endblock %}

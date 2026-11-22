@@ -10,7 +10,8 @@
 
     One gather over `ng_overview`, whose record type reads the `ng_home` view
     (013): one row of counts, with the lists attached as includes the kernel
-    ran after it. `home` (people in), `away` (people out), `movements` (today's
+    ran after it. `home` (people in), `away` (people out), `untracked` (people
+    nobody is tracking, 023, never counted as either), `movements` (today's
     arrivals and departures, oldest first) and `attention` (new this week and
     not sorted, at most six). 008 explains why a page of several lists is built
     this way. `new_devices` is still attached and not drawn: it is the
@@ -45,7 +46,14 @@
 {% else %}
 <section class="ng-section ng-section--home" aria-labelledby="ng-section-home">
     <h2 class="ng-section__title" id="ng-section-home">Home now</h2>
-    {% if ov.home | length > 0 %}
+    {#
+        The install's switch, as the daemon published it (023). Only `false`
+        says so: null is a daemon that has not said, and one older than its
+        schema V7 tracks everybody.
+    #}
+    {% if ov.presence_tracking is defined and ov.presence_tracking == false %}
+    <p class="ng-notice ng-notice--presence">Presence tracking is off. Set <code>presence_tracking = true</code> in netgraspd's config to see who is home.</p>
+    {% elif ov.home | length > 0 %}
     <ul class="ng-lines">
         {% for person in ov.home %}
         <li class="ng-line">
@@ -65,12 +73,24 @@
     </ul>
     {% else %}
     <p class="ng-empty">Nobody is home.
-        <span class="ng-empty__hint">A person is home when any device they own is online.</span>
+        <span class="ng-empty__hint">A tracked person is home when a phone or wearable they own is online.</span>
     </p>
     {% endif %}
     {% if ov.away is defined and ov.away | length > 0 %}
     <p class="ng-away">Away:
         {% for person in ov.away -%}
+        <a href="/devices/owner?owner={{ person.item_id }}">{% if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif %}</a>
+        {%- if not loop.last %}, {% endif %}
+        {%- endfor %}
+    </p>
+    {% endif %}
+    {#
+        Not tracked is its own line and never part of Away: nobody is
+        watching whether these people are in, so they are neither.
+    #}
+    {% if ov.untracked is defined and ov.untracked | length > 0 %}
+    <p class="ng-away ng-away--untracked">Not tracked:
+        {% for person in ov.untracked -%}
         <a href="/devices/owner?owner={{ person.item_id }}">{% if person.name %}{{ person.name }}{% else %}{{ person.item_id }}{% endif %}</a>
         {%- if not loop.last %}, {% endif %}
         {%- endfor %}

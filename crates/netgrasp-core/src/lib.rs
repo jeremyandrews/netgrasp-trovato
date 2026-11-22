@@ -22,6 +22,8 @@
 //! - [`sync`] — the daemon→kernel plan: create, relink, refresh or skip.
 //! - [`writeback`] — the kernel→daemon direction, including the loop-termination
 //!   argument and the statement builder that cannot name a foreign column.
+//! - [`presence`] — which devices count for who is home, and how a person's
+//!   presence reads, explained the way the daemon decides it.
 //! - [`retention`] — the event-pruning window.
 //! - [`timeline`] — presence/location/IP spans collapsed into what a device page
 //!   shows.
@@ -39,6 +41,7 @@ pub mod assist;
 pub mod columns;
 pub mod error;
 pub mod model;
+pub mod presence;
 pub mod queries;
 pub mod retention;
 pub mod sync;
