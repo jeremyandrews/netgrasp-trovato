@@ -23,6 +23,45 @@ Compatibility section has the table.
 
 ### Fixed
 
+**The network assistant counts from the database, so "how many are offline"
+and "which vendor has the most" match SQL on any size of network (#33).**
+`list_devices` was capped at `assist::RESULT_MAX_BYTES` (12,000 bytes), about
+100 device lines, but headed its result with the full count, so on a
+171-device network the model counted the first 109 rows as all of them: 79
+offline where there were 78, Ubiquiti 40 where there were 41. Its lines had no
+vendor, so vendor counts came from MAC prefixes, and it had no filter for idle
+or offline. It now opens with counts by state, vendor, type and owner, computed
+in SQL over every matching device and never cut; takes `offline`, `idle`,
+`vendor:<name>` and `type:<name>` beside the old filters, and a `limit` (default
+40, 0 for counts only); puts the vendor on every line; and, when rows are cut,
+says "showing N of M" and how to narrow in both the result and the chat line.
+
+**Relative times round, and `new_devices` takes a window, so "joined in the
+last 24 hours" is answered right (#32).** `assist::relative` truncated: a device
+first seen 37 hours earlier read "1 day ago" and was reported as new in the
+last day, and 1 hour 56 minutes read "1 hour ago". It now rounds to the nearest
+unit and keeps the hours past a day ("1 day 13 hours ago", "about 2 hours
+ago"). `new_devices` takes `hours` (default 168, as before) and states its
+window with its start in UTC.
+
+**The assistant can say what happened.** No tool read the event log, so "how
+many gratuitous_arp events yesterday" or "what is scanning" had no answer. A
+new read-only `events` tool takes a window (`hours`, default 24, or `from` and
+`to`, at most seven days) and filters by type, security class, device and
+"sent as an alert", and returns counts by type and by device over every
+matching event before the newest rows.
+
+**A three-question network conversation fits the 60k token cap.** The network
+scope's context listed every person and every device grouped by owner on every
+model call: on a 171-device network about 9,800 bytes, roughly 4,700 of the
+6,700 tokens each call started with, so two of three field-run conversations
+went over the cap. The context now carries the clock, when the data starts, the
+device totals by state and owner, and the people (about 900 bytes on the same
+network), and the scope's prompt says which tool answers the rest. Replaying
+the field run's conversations against the new tools measures 40k to 48k tokens
+each, from 59k to 70k.
+
+
 **Two people whose names differ only in case or surrounding spaces can no
 longer both exist, even when the two creates race.** The rule that "jamie " is
 Jamie (`assist::same_name`) was enforced only in the plugin:

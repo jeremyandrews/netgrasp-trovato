@@ -385,6 +385,24 @@ before the first observation and an empty window over a monitored period are the
 same zero rows and different answers, and the context is the only place that
 difference can be stated.
 
+**A count comes from the database, never from rows a model reads.** Every
+listing tool caps its result in bytes, and a model handed a capped list headed
+"171 devices" counts the rows it got as if they were all of them (issue #33).
+So `list_devices` puts the database's counts over every matching device, by
+state, vendor, type and owner (`SELECT_DEVICE_COUNTS`, one `WHERE` clause shared
+with the rows), above any row; the rows that follow say "showing N of M" and how
+to narrow when they are cut, and so does the line the chat shows. `events` does
+the same for the event log (counts by type and by device, then the newest rows).
+The network scope's context, sent with every model call, carries only what no
+tool returns unasked: the clock, where the data starts, the totals and the
+people. Listing every device in it cost about 4,700 tokens a call on a
+171-device network and was cut at the snapshot cap anyway.
+
+**Relative times round.** The model reasons from "3 hours ago" rather than from
+the UTC time beside it, so `assist::relative` rounds to the nearest unit and,
+above a day, keeps the hours: 37 hours is "1 day 13 hours ago", never "1 day
+ago" (issue #32).
+
 **Nothing an assistant does writes `sync_state`.** The two statements that write
 it are both in `sync_host.rs` and neither is reachable from a tool, so Decision
 4's termination argument is untouched: an applied proposal produces a `clean` row
