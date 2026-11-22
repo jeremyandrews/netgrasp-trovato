@@ -38,6 +38,8 @@
                    the empty state below covers the other case, so no child
                    repeats it.
     - `empty`    — an optional extra hint under the gather's own empty text.
+    - `pager`    — the kernel's pager, by default. /events/security replaces it
+                   with one that stops at the newest 10000 events.
 #}
 {#
     ===========================================================================
@@ -132,9 +134,11 @@
     {% block results %}{% endblock %}
     {% endif %}
 
+    {% block pager %}
     {% if pager %}
     {% include "gather/pager.html" %}
     {% endif %}
+    {% endblock %}
 
     {#
         Written by the script, not by Tera, and hidden until it is.
