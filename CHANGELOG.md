@@ -23,6 +23,44 @@ Compatibility section has the table.
 
 ### Fixed
 
+**The two requests the site serves every minute no longer scan the whole
+event log, so they finish under the 100 ms slow threshold instead of logging a
+WARN or ERROR each time.** A 78-hour field run logged about 120 slow-request
+lines an hour (2,922 of them ERROR). Matched by timestamp against the cron
+log and the status checker's log, they were almost all two requests, one each
+a minute: the cron POST (about 450 ms) and the status check's GET of
+`/overview` (about 290 ms). In both the time went into sequential scans of
+`ng_events`, which on that site holds 4.1 million rows (1.1 GB, mostly
+`ip_changed`). The database had done 406,000 sequential scans of it and read
+530 billion rows. The database pool was never short of connections. Its
+"100% (2/2)" warnings count only the connections open at that moment, out of
+a maximum of 10.
+
+- *Cron: the retention prune.* `DELETE_EXPIRED_EVENTS` compared the cutoff
+  against `timestamp_epoch`, the daemon's generated epoch column, which has no
+  index. It runs on every tick, and nearly every tick has nothing to delete,
+  so each minute a full scan of the table found that out. It now compares
+  `"timestamp" < to_timestamp($1)`, which the daemon's `ng_events_time_idx`
+  answers. On the live table an empty prune went from 396 ms to 0.015 ms.
+  On a synthetic copy with the live row counts it went from 724 ms to
+  0.05 ms, and a prune that does delete 1,000 rows takes the same 1.7 ms as
+  before.
+- *`/overview`: arrivals and departures.* `ng_person_movements` filters on
+  `event_type` and on `day`, and `day` is `to_char("timestamp", …)`. No index
+  serves either, so the overview's `movements_today` count and its movements
+  include each scanned the whole log, about 140 ms apiece. Migration 019
+  adds `e.person_item_id IS NOT NULL` to the view where `ng_events` has
+  netgraspd V5's `person_item_id` column. The daemon sets that column on
+  every person event and indexes it (`ng_events_person_idx`), so the view now
+  reads only the person events. Its columns and rows are unchanged: on the
+  synthetic copy (4.12 million events, 3,000 of them person events) the full
+  view hashes the same before and after. The include went from 88 ms to
+  1.8 ms and the overview view from 136 ms to 13 ms. On the live database the
+  include went from 145 ms to 0.08 ms and the overview view from about
+  210 ms to about 20 ms. With no V5 column (an older daemon, or tables the
+  plugin created itself) 019 does nothing. Running it again picks up a daemon
+  upgraded later.
+
 **The network assistant counts from the database, so "how many are offline"
 and "which vendor has the most" match SQL on any size of network (#33).**
 `list_devices` was capped at `assist::RESULT_MAX_BYTES` (12,000 bytes), about

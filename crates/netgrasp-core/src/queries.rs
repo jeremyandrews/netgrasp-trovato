@@ -91,11 +91,20 @@ pub const UPDATE_UNLINK_DEVICE: &str = "UPDATE ng_devices SET trovato_item_id = 
 /// Delete a bounded batch of expired events. `$1` is the cutoff in unix
 /// seconds, `$2` the batch size.
 ///
-/// Compares `timestamp_epoch`, not `"timestamp"`: the cutoff is computed in unix
-/// seconds by [`crate::retention::cutoff`], and binding an integer against a
-/// `timestamptz` column would have to go through `to_timestamp` on every row.
+/// Compares `"timestamp"`, not its epoch twin, because `"timestamp"` is the
+/// column the daemon indexes (`ng_events_time_idx`, since its V1) and
+/// `timestamp_epoch` is a `GENERATED … STORED` column it does not. The cutoff is
+/// in unix seconds ([`crate::retention::cutoff`]) and is converted **once**:
+/// `to_timestamp($1)` is a stable expression over a parameter, so it becomes the
+/// index condition rather than a per-row computation.
+///
+/// This runs on every cron tick, and nearly every tick has nothing to delete.
+/// Written against the twin it was a sequential scan of the whole table to
+/// prove that: about 400 ms a minute on a 4-million-row log, which made the
+/// cron request itself the site's most frequent slow request. Against the
+/// index, an empty prune reads three buffers.
 pub const DELETE_EXPIRED_EVENTS: &str = "DELETE FROM ng_events WHERE id IN (\
-     SELECT id FROM ng_events WHERE timestamp_epoch < $1::bigint LIMIT $2::bigint)";
+     SELECT id FROM ng_events WHERE \"timestamp\" < to_timestamp($1::bigint) LIMIT $2::bigint)";
 
 /// The daemon's row for a device Item. `$1` is the Item id.
 pub const SELECT_DEVICE_STATE: &str = "SELECT id, mac, hostname, vendor, device_type, os_family, \

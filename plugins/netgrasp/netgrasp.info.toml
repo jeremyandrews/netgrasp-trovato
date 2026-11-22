@@ -91,6 +91,7 @@ files = [
     "migrations/016_netgrasp_alerts.sql",
     "migrations/017_netgrasp_drop_duplicate_open_indexes.sql",
     "migrations/018_netgrasp_one_person_per_name.sql",
+    "migrations/019_netgrasp_movements_by_person_index.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
