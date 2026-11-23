@@ -1,0 +1,34 @@
+-- A Netgrasp site is private: an anonymous visitor gets the login page and no
+-- device data on any path. Forward-only; no rollback. Safe to run twice.
+--
+-- 013 took `view netgrasp devices` from the anonymous role and relied on
+-- tap_field_access to empty every netgrasp row for a visitor without it. That
+-- covers the fields the plugin declares and nothing else, and the kernel
+-- serves device data on paths the field tap never sees. Measured with no
+-- session, against kernel 0.104.0 with plugin 1.2.0 and again against kernel
+-- 0.107 (Trovato main 81290cc), every one of these answered 200 with MAC
+-- addresses, addresses or device names in it:
+--
+--   /item/{device}, /api/item/{id}, /api/v1/item/{id}
+--                      a published Item is viewable by anyone holding
+--                      `access content` (ItemService's fast path, before any
+--                      tap_item_access is asked), and the device page is
+--                      tap_item_view's output;
+--   /api/items, /api/items/ng_device, /api/v1/items, /api/v1/items/ng_device,
+--   /api/v1/items/autocomplete, /api/v1/search
+--                      the same decision over lists, titles and search text;
+--   /api/query/{ng_devices_new,ng_person_movements}/execute (and /api/v1/...)
+--                      the views behind them carry columns the record types do
+--                      not declare, which no field decision reaches.
+--
+-- So the anonymous role loses `access content`. Every one of those paths, and
+-- every netgrasp gather (a record gather requires `access content` unless it
+-- names a permission of its own, kernel B56), then answers a visitor with no
+-- session with the login redirect or 401/403/404, and a signed-in user is
+-- unaffected: `authenticated user` keeps `access content`.
+--
+-- A site that wants an open wall screen grants both back, two statements; this
+-- runs once, so it will not take them away again.
+DELETE FROM role_permissions
+WHERE role_id = '00000000-0000-0000-0000-000000000001'
+  AND permission = 'access content';

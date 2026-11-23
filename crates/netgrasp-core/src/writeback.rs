@@ -357,8 +357,9 @@ pub fn device_item_fields(mac: &str, overlay: &DeviceEdit) -> Value {
 ///
 /// The values are normalised on the way through — a MAC to its canonical form
 /// is the caller's job, but a checkbox's `"1"` becomes a real `true` here —
-/// because this path writes through `save-item` and fires no
-/// `tap_item_presave` to do it (`DESIGN.md` Drift 3).
+/// because this path must not depend on `tap_item_presave` to do it: before
+/// kernel 0.107 `save-item` fired no taps at all (`DESIGN.md` Drift 3), and
+/// the fields written must be right whichever kernel saves them.
 #[must_use]
 pub fn merged_device_fields(
     mac: &str,
@@ -959,8 +960,8 @@ mod tests {
     }
 
     /// A checkbox's `"1"` and a plugin's `true` mean the same thing, and this
-    /// path is the one that has to say so: it writes through `save-item`, which
-    /// fires no presave to normalise anything.
+    /// path is the one that has to say so: it writes through `save-item`, and
+    /// must not depend on a presave to normalise anything.
     #[test]
     fn an_edit_normalises_the_spellings_a_form_round_trip_leaves_behind() {
         let from_a_form = json!({"id": ITEM, "title": "printer",

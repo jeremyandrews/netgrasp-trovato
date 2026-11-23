@@ -2,12 +2,12 @@ name = "netgrasp"
 description = "Network monitoring: devices, people, events and presence from the netgrasp daemon"
 # `version` is the plugin's own, and equals the workspace version.
 #
-# `api_version` must equal the kernel's `KERNEL_API_VERSION`, which is (0, 102) at
-# the Trovato revision pinned in the workspace Cargo.toml. The kernel refuses to
+# `api_version` must equal the kernel's `KERNEL_API_VERSION`, which is the
+# major and minor of the Trovato version in kernel-release.toml. The kernel refuses to
 # load a module that disagrees, so this string and that `rev` move together; a
 # test in src/lib.rs asserts both against the workspace.
 version = "1.2.0"
-api_version = "0.102"
+api_version = "0.107"
 default_enabled = false
 dependencies = []
 
@@ -96,6 +96,8 @@ files = [
     "migrations/021_netgrasp_event_gathers_read_the_views.sql",
     "migrations/022_netgrasp_presence_schema.sql",
     "migrations/023_netgrasp_presence_views.sql",
+    "migrations/024_netgrasp_publish_content.sql",
+    "migrations/025_netgrasp_private_site.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
@@ -109,6 +111,12 @@ files = [
 #               tool at the moment of the change. The kernel checks the scope's
 #               permission when a conversation opens; a conversation outlives
 #               that request, so the tool checks again.
+#
+# item_background — kernel 0.107 runs `item-api` as the requesting user, and a
+#               call with no user (a cron or queue tap) is refused with
+#               ERR_ITEM_BACKGROUND_DENIED (-61) unless this is declared. tap_cron
+#               is exactly that caller: it mints a device Item for each dirty
+#               ng_devices row and refreshes derived titles, in the background.
 #
 # No http, no ai-api, no queue: Netgrasp reaches nothing outside the database and
 # makes no AI calls of its own. The daemon does the network I/O, and the model
@@ -127,6 +135,7 @@ host_interfaces = [
     "variables",
 ]
 raw_sql = true
+item_background = true
 
 # The daemon owns these tables at runtime; 001_netgrasp_schema.sql creates them
 # idempotently so the plugin is installable without a daemon. They are named here

@@ -328,7 +328,7 @@ within seconds. The restart limitation in `docs/JOINT-RUN.md` no longer holds.
 | Bulk assign | yes | `tap_api` page; repeated keys parsed from the POST body |
 | Flash message after a write | no | the confirmation page names what changed |
 | Person page | yes | `tap_item_view` for `ng_person` |
-| Keep anonymous visitors out of device data | partly | `tap_field_access` denies every `ng_*` record field to a viewer without `view netgrasp devices`. Rows still render, but blank. Full fix is a kernel follow-up |
+| Keep anonymous visitors out of device data | yes | `tap_field_access` denies every `ng_*` record field to a viewer without `view netgrasp devices`, and 025 takes `access content` from the anonymous role, so a visitor with no session gets the login page on every page and API |
 | Show ntfy status, send a test, change alert wording | no kernel change | netgraspd V4: a status row the daemon writes, a request table the plugin inserts into, and the new wording |
 | Cards on a phone instead of tables | yes | the plugin owns the table templates and `netgrasp.css` |
 

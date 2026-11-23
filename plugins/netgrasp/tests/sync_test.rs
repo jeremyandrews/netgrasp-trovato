@@ -182,6 +182,7 @@ fn dispatcher() -> Arc<TapDispatcher> {
 }
 
 async fn fresh_pool() -> PgPool {
+    KEEP_ITEMS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_dotenv();
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://trovato:trovato@localhost:5432/trovato".to_string());
@@ -197,12 +198,12 @@ async fn fresh_pool() -> PgPool {
     for migration in migrations {
         let sql = std::fs::read_to_string(plugin_source_dir().join(&migration))
             .unwrap_or_else(|e| panic!("read {migration}: {e}"));
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("apply {migration}: {e}"));
     }
-    ContentTypeRegistry::new(pool.clone(), Duration::from_secs(60))
+    ContentTypeRegistry::new(pool.clone(), Duration::from_secs(60), metrics())
         .sync_from_plugins(&dispatcher())
         .await
         .expect("register netgrasp content types");
@@ -230,6 +231,12 @@ async fn reset(pool: &PgPool) {
     }
 }
 
+/// The kernel's metrics registry, which its services now take. A fresh one per
+/// service is what the kernel's own tests do; nothing here reads it.
+fn metrics() -> Arc<trovato_kernel::metrics::Metrics> {
+    Arc::new(trovato_kernel::metrics::Metrics::default())
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,13 +245,43 @@ fn now() -> i64 {
 }
 
 fn background(pool: &PgPool) -> RequestState {
-    let disp = dispatcher();
-    RequestState::new(
-        UserContext::background(),
-        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
-            .with_plugin_runtime(disp.runtime().clone()),
-    )
+    RequestState::new(UserContext::background(), services(pool))
 }
+
+/// Request services wired the way `AppState` wires them: the plugin runtime,
+/// and an `ItemService` bound late for the `item-api` host calls. Without that
+/// binding every `save-item` answers `ERR_NO_SERVICES` (-10).
+///
+/// The services hold the item service weakly (it holds them in turn), so the
+/// strong reference is kept in [`KEEP_ITEMS`] for the life of the test binary.
+fn services(pool: &PgPool) -> RequestServices {
+    let disp = dispatcher();
+    let services =
+        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
+            .with_plugin_runtime(disp.runtime().clone());
+    let items = Arc::new(ItemService::new(
+        pool.clone(),
+        disp,
+        services.clone(),
+        Duration::from_secs(60),
+        None,
+        None,
+        metrics(),
+    ));
+    services.set_item_service(&items);
+    KEEP_ITEMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(items);
+    services
+}
+
+/// The strong ends of the item services [`services`] binds. Emptied by
+/// [`fresh_pool`], which every test calls first and which runs one test at a
+/// time, so each test's pool is released when the next test starts rather than
+/// held open for the life of the binary.
+static KEEP_ITEMS: LazyLock<Mutex<Vec<Arc<ItemService>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// An `ItemService` wired to the real dispatcher, so `update` fires
 /// `tap_item_update` exactly as the admin content route does.
@@ -253,14 +290,17 @@ fn items(pool: &PgPool) -> Arc<ItemService> {
     let services =
         RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
             .with_plugin_runtime(disp.runtime().clone());
-    Arc::new(ItemService::new(
+    let items = Arc::new(ItemService::new(
         pool.clone(),
         disp,
-        services,
+        services.clone(),
         Duration::from_secs(60),
         None,
         None,
-    ))
+        metrics(),
+    ));
+    services.set_item_service(&items);
+    items
 }
 
 /// Run one cron cycle and return the plugin's report.
@@ -313,11 +353,13 @@ async fn daemon_snapshot(pool: &PgPool, device_id: i64) -> Vec<(String, Option<S
         .map(|c| format!("{c}::text AS {c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let row = sqlx::query(&format!("SELECT {cols} FROM ng_devices WHERE id = $1"))
-        .bind(device_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {cols} FROM ng_devices WHERE id = $1"
+    )))
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
     DAEMON_COLUMNS
         .iter()
         .map(|c| {
@@ -614,6 +656,9 @@ fn an_admin_edit_reaches_the_daemons_user_owned_columns() {
                         "field_notify": true,
                     })),
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &UserContext::authenticated(author, vec!["edit ng_device content".into()]),
             )
@@ -677,6 +722,9 @@ fn the_write_back_leaves_every_daemon_owned_column_untouched() {
                         "sync_state": "dirty",
                     })),
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &UserContext::authenticated(author, vec!["edit ng_device content".into()]),
             )
@@ -714,6 +762,9 @@ fn an_admin_edit_does_not_re_trigger_the_sync_so_the_loop_terminates() {
                     sticky: None,
                     fields: Some(serde_json::json!({"field_mac": "aa:bb:cc:00:00:06"})),
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &UserContext::authenticated(author, vec!["edit ng_device content".into()]),
             )
@@ -812,6 +863,9 @@ fn a_sync_pass_does_not_clobber_the_admins_fields() {
                         "field_notify": true,
                     })),
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &UserContext::authenticated(author, vec!["edit ng_device content".into()]),
             )
@@ -873,6 +927,9 @@ fn a_title_refresh_leaves_the_items_fields_intact() {
                         "field_notes": "unidentified, watch this one",
                     })),
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &UserContext::authenticated(author, vec!["edit ng_device content".into()]),
             )
@@ -919,6 +976,7 @@ fn a_person_item_is_mirrored_into_ng_people_and_retired_on_delete() {
                 "create ng_person content".into(),
                 "edit ng_person content".into(),
                 "delete ng_person content".into(),
+                "publish content".into(),
             ],
         );
 
@@ -1366,10 +1424,10 @@ async fn seed_house(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
             r#"{"via": "Gate"}"#,
         ),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ng_events (device_id, event_type, \"timestamp\", details, person_item_id) \
              VALUES ($1, $2, {at}, $3::jsonb || jsonb_build_object('person', $4::text, 'person_item_id', $5::text, 'device', 'aa:bb:cc:00:01:01'), $5::uuid)"
-        ))
+        )))
         .bind(phone)
         .bind(event_type)
         .bind(details)
@@ -1388,10 +1446,10 @@ async fn seed_house(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
         ("arp_scan", "7 days"),
         ("name_updated", "1 hour"),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ng_events (device_id, event_type, \"timestamp\") \
              VALUES ($1, $2, now() - interval '{ago}')"
-        ))
+        )))
         .bind(fresh)
         .bind(event_type)
         .execute(pool)
@@ -1833,7 +1891,10 @@ fn the_front_page_moves_to_the_overview_only_from_the_old_default() {
                 .await
                 .unwrap();
             }
-            sqlx::raw_sql(&migration).execute(&pool).await.unwrap();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.as_str()))
+                .execute(&pool)
+                .await
+                .unwrap();
             assert_eq!(
                 front(pool.clone()).await,
                 Some(serde_json::json!(after)),
@@ -2412,7 +2473,7 @@ async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {
     );
     assert!(errors.is_empty(), "record types rejected: {errors:?}");
 
-    let categories = CategoryService::new(pool.clone(), Duration::from_secs(60));
+    let categories = CategoryService::new(pool.clone(), Duration::from_secs(60), metrics());
     let gather = GatherService::new(
         pool.clone(),
         categories,
@@ -2424,6 +2485,7 @@ async fn wire_gather(pool: &PgPool) -> Arc<GatherService> {
         },
         None,
         None,
+        metrics(),
     );
     gather.set_item_service(items(pool));
     gather.set_record_types(Arc::new(registry));
@@ -2534,6 +2596,9 @@ fn a_viewer_cannot_edit_a_device_and_therefore_cannot_reach_the_write_back() {
                     sticky: None,
                     fields: None,
                     log: None,
+                    stage_id: None,
+                    author_id: None,
+                    created: None,
                 },
                 &viewer,
             )
@@ -2767,7 +2832,10 @@ fn a_device_item_with_no_daemon_row_says_so() {
                     language: None,
                     log: None,
                 },
-                &UserContext::authenticated(author, vec!["create ng_device content".into()]),
+                &UserContext::authenticated(
+                    author,
+                    vec!["create ng_device content".into(), "publish content".into()],
+                ),
             )
             .await
             .unwrap();
@@ -2823,9 +2891,20 @@ async fn ng_admin(pool: &PgPool) -> UserContext {
     UserContext::authenticated(
         any_user(pool).await,
         vec![
+            // What 003 gives network_admin, plus the two every signed-in
+            // user and, since kernel 0.107, every creator holds (024).
             PERM_ADMINISTER.to_string(),
+            "view netgrasp devices".to_string(),
+            "view ng_device content".to_string(),
+            "create ng_device content".to_string(),
             "edit ng_device content".to_string(),
+            "delete ng_device content".to_string(),
+            "view ng_person content".to_string(),
+            "create ng_person content".to_string(),
             "edit ng_person content".to_string(),
+            "delete ng_person content".to_string(),
+            "access content".to_string(),
+            "publish content".to_string(),
         ],
     )
 }
@@ -2843,11 +2922,7 @@ async fn dispatch_as(
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let disp = dispatcher();
-    let state = RequestState::new(
-        user.clone(),
-        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
-            .with_plugin_runtime(disp.runtime().clone()),
-    );
+    let state = RequestState::new(user.clone(), services(pool));
     let results = disp.dispatch(tap, &payload.to_string(), state).await;
     assert_eq!(results.len(), 1, "expected exactly one {tap} result");
     serde_json::from_str(&results[0].output)
@@ -2940,7 +3015,10 @@ async fn seed_person_item(pool: &PgPool, name: &str) -> Uuid {
                 language: None,
                 log: None,
             },
-            &UserContext::authenticated(author, vec!["create ng_person content".into()]),
+            &UserContext::authenticated(
+                author,
+                vec!["create ng_person content".into(), "publish content".into()],
+            ),
         )
         .await
         .expect("create the person item")
@@ -5194,7 +5272,7 @@ async fn seed_arrival(pool: &PgPool, device: i64, person: Uuid, name: &str) {
 /// Raised only on that change, so putting the owner back is still allowed —
 /// which is the undo the forms are meant to perform.
 async fn fail_owner_change(pool: &PgPool, mac: &str, to: Uuid) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION u2_fail_device() RETURNS trigger AS $$ \
          BEGIN \
            IF NEW.mac = '{mac}' AND NEW.owner_item_id IS NOT DISTINCT FROM '{to}'::uuid \
@@ -5206,7 +5284,7 @@ async fn fail_owner_change(pool: &PgPool, mac: &str, to: Uuid) {
          DROP TRIGGER IF EXISTS u2_fail_device ON ng_devices; \
          CREATE TRIGGER u2_fail_device BEFORE UPDATE ON ng_devices \
            FOR EACH ROW EXECUTE FUNCTION u2_fail_device();"
-    ))
+    )))
     .execute(pool)
     .await
     .unwrap();
@@ -5215,7 +5293,7 @@ async fn fail_owner_change(pool: &PgPool, mac: &str, to: Uuid) {
 /// Make the kernel refuse to delete one Item: the last step of a merge and of
 /// a delete, and the one with no undo of its own.
 async fn fail_item_delete(pool: &PgPool, id: Uuid) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION u2_fail_item() RETURNS trigger AS $$ \
          BEGIN \
            IF OLD.id = '{id}'::uuid THEN RAISE EXCEPTION 'injected failure deleting {id}'; END IF; \
@@ -5224,7 +5302,7 @@ async fn fail_item_delete(pool: &PgPool, id: Uuid) {
          DROP TRIGGER IF EXISTS u2_fail_item ON item; \
          CREATE TRIGGER u2_fail_item BEFORE DELETE ON item \
            FOR EACH ROW EXECUTE FUNCTION u2_fail_item();"
-    ))
+    )))
     .execute(pool)
     .await
     .unwrap();
@@ -6301,11 +6379,7 @@ async fn dispatch_as_raw(
     payload: &serde_json::Value,
 ) -> String {
     let disp = dispatcher();
-    let state = RequestState::new(
-        user.clone(),
-        RequestServices::for_background(pool.clone(), None, None, reqwest::Client::new())
-            .with_plugin_runtime(disp.runtime().clone()),
-    );
+    let state = RequestState::new(user.clone(), services(pool));
     let results = disp.dispatch(tap, &payload.to_string(), state).await;
     assert_eq!(results.len(), 1, "expected exactly one {tap} result");
     results[0].output.clone()
@@ -6890,7 +6964,7 @@ async fn plan_with_indexes_preferred(pool: &PgPool, sql: &str) -> String {
     ] {
         sqlx::query(set).execute(&mut *tx).await.unwrap();
     }
-    let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
+    let lines: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
         .fetch_all(&mut *tx)
         .await
         .unwrap_or_else(|e| panic!("EXPLAIN {sql}: {e}"));
@@ -6915,7 +6989,7 @@ fn the_event_pages_as_the_kernel_runs_them_read_the_daemons_indexes() {
         let pool = fresh_pool().await;
         reset(&pool).await;
         for ddl in DAEMON_EVENT_INDEXES {
-            sqlx::query(ddl).execute(&pool).await.unwrap();
+            sqlx::query(*ddl).execute(&pool).await.unwrap();
         }
         let device = seed_device(&pool, "aa:bb:cc:00:24:01", None, "online").await;
         for (event_type, ago) in [
@@ -7149,11 +7223,12 @@ async fn rows_under_the_limit(pool: &PgPool, sql: &str) -> u64 {
         }
         node["Plans"].as_array()?.iter().find_map(find)
     }
-    let plan: serde_json::Value =
-        sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let plan: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {sql}"
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
     find(&plan[0]["Plan"]).unwrap_or_else(|| panic!("no Limit in {plan}"))
 }
 
@@ -7173,7 +7248,7 @@ fn the_security_pages_deepest_page_reads_at_most_the_newest_10000() {
         let pool = fresh_pool().await;
         reset(&pool).await;
         for ddl in DAEMON_EVENT_INDEXES {
-            sqlx::query(ddl).execute(&pool).await.unwrap();
+            sqlx::query(*ddl).execute(&pool).await.unwrap();
         }
         // No statistics: the assertion below is on the rows a page reads, which
         // no plan changes, and statistics for 72,000 rows would outlive the
@@ -7690,7 +7765,10 @@ fn activity_and_new_devices_as_the_kernel_runs_them_read_the_daemons_type_index(
         let mut pages = HashMap::new();
         for with_index in [true, false] {
             if with_index {
-                sqlx::query(&index).execute(&pool).await.unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(index.as_str()))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             } else {
                 sqlx::query("DROP INDEX ng_events_type_time_idx")
                     .execute(&pool)

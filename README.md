@@ -44,28 +44,27 @@ on first run.
 
 ### Who sees device data
 
-Signing in is required. A visitor who is not signed in still gets the menu and
-every page's frame, but every row arrives empty and the page says "Sign in to see
-the devices on this network." The plugin's `tap_field_access` denies every field
-of every netgrasp record type, and of its two Item types, to a viewer without
-`view netgrasp devices`, and the kernel strips denied fields from each row of a
-gather, includes too. `013_netgrasp_home.sql` takes that permission back from
-the anonymous role, which `005` had granted it for a localhost dashboard. In the
-demo, sign in as `admin` with the password in `docker-compose.demo.yml`. The
-`network_viewer` role holds the permission for everyone else.
+Signing in is required. A visitor who is not signed in gets the login page, on
+every netgrasp page, every Item page and every item, search and gather API.
+Two migrations make it so. `013_netgrasp_home.sql` takes `view netgrasp devices`
+from the anonymous role (which `005` had granted it for a localhost dashboard),
+and the plugin's `tap_field_access` denies every field of every netgrasp record
+type, and of its two Item types, to a viewer without it.
+`025_netgrasp_private_site.sql` takes `access content` from the anonymous role
+too, because the kernel serves Item pages, item lists, search and the JSON of
+two gathers on paths no field decision reaches. In the demo, sign in as `admin`
+with the password in `docker-compose.demo.yml`. The `network_viewer` role holds
+the permission for everyone else.
 
-A wall screen or a trusted LAN that wants the old open view grants it back. Run
-it once; the migration never runs a second time, so it will not be undone:
+A wall screen or a trusted LAN that wants the old open view grants both back.
+Run it once; the migrations never run a second time, so it will not be undone:
 
 ```sql
 INSERT INTO role_permissions (role_id, permission)
-VALUES ('00000000-0000-0000-0000-000000000001', 'view netgrasp devices')
+VALUES ('00000000-0000-0000-0000-000000000001', 'access content'),
+       ('00000000-0000-0000-0000-000000000001', 'view netgrasp devices')
 ON CONFLICT DO NOTHING;
 ```
-
-What a visitor still sees: the four menu entries (the kernel does not filter
-`menu_link` rows by permission) and, on `/people`, people's names, which are
-Item titles and not fields, so the field tap cannot reach them.
 
 ## The one architectural rule
 
@@ -148,18 +147,21 @@ copy drifts.
 <!-- kernel-release:begin -->
 | | |
 |---|---|
-| pinned `rev` | `ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74` |
-| Trovato version | 0.102.0 |
-| `KERNEL_API_VERSION` | (0, 102) |
-| manifest `api_version` | `0.102` |
-| demo kernel image | `ghcr.io/jeremyandrews/trovato:0.102.0` |
+| pinned `rev` | `81290cc862b2c8302bc0a99d270f2571405c51ef` |
+| Trovato version | 0.107.0 |
+| `KERNEL_API_VERSION` | (0, 107) |
+| manifest `api_version` | `0.107` |
+| demo kernel image | `ghcr.io/jeremyandrews/trovato:nightly-81290cc@sha256:fca4070e75885aa91fa8cd9bae4e79d492e7ded2b7f86c2f7a5c3383392f729b` |
 <!-- kernel-release:end -->
 
 `api_version` is not chosen: it is the pinned version's major and minor, so it
 cannot disagree with the kernel it is built against. The plugin's own `version`
-is separate and is not the kernel's. To move the pin, run
+is separate and is not the kernel's. To move the pin to a release, run
 `scripts/sync-kernel-release.sh --set-version X.Y.Z`, which resolves the tag to
-its commit and rewrites every location.
+its commit and rewrites every location. Between releases,
+`scripts/sync-kernel-release.sh --set-commit <sha>` pins a commit on Trovato's
+`main` and the `nightly-<short sha>` image by digest, and refuses an image whose
+build provenance names any other commit.
 
 ### And which Trovato release it runs on
 

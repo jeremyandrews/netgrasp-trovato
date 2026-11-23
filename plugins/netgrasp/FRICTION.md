@@ -18,6 +18,29 @@ Verified against the kernel API this repository pins, `(0, 102)`
 kernel-migration change** in the build session. The design decisions these
 findings forced are argued in `DESIGN.md`.
 
+## Status at kernel 0.107 (`81290cc`)
+
+Re-checked when the pin moved from 0.102.0 to Trovato `main` at `81290cc`
+(plugin API `(0, 107)`). The entries below are kept as written, as the record of
+what was met; this is what has changed since.
+
+- **Resolved in the kernel:** `G-SAVE-ITEM-BYPASSES-SERVICE` (`item-api` now
+  writes through `ItemService` and fires the item taps; `DESIGN.md` Drift 3 is
+  updated), `G-ASSISTANT-TEMPERATURE-ALWAYS-SENT` (temperature is unset unless a
+  site sets one, so current Claude models work), `G-PROVIDER-ERROR-BODY-DISCARDED`
+  and `G-PROVIDER-TEST-ACCEPTS-404` (the same kernel change).
+- **Resolved, binding kept:** the SDK now binds `get_item`, `save_item` and
+  `delete_item` (`G-SDK-NO-ITEM`, `G-ITEM-API-NO-DELETE-BINDING`). The import
+  signatures did not change, so `item_host.rs` is left as it is.
+- **NEW, `G-DB-NO-MULTI-STATEMENT-WRITE` [Medium]:** the raw SQL gate
+  (`crates/kernel/src/host/sql_guard.rs`, `check_execute_raw`) admits exactly
+  one INSERT, UPDATE or DELETE, and `check_query_raw` refuses a writable `WITH`.
+  That was the only way a plugin could make several row changes commit
+  together: the `db` host runs each call in its own transaction and has no way
+  to hold one open. The person merge's record is now four statements with
+  compensating undo (`assist_host.rs`, `record_merge`). **Decidable item:** a
+  `db` host call that runs a short list of gated statements in one transaction.
+
 Seven findings are grouped under their own heading below: they were met during
 the first joint run of the daemon and the plugin against a live LAN
 (`docs/JOINT-RUN.md`), and every one of them is in the kernel rather than in

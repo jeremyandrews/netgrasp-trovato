@@ -577,56 +577,55 @@ pub const SELECT_PERSON_MOVEMENTS: &str = "SELECT event_type, timestamp_epoch AS
 pub const SELECT_PERSON_MOVEMENT_COUNT: &str = "SELECT count(*) AS movements \
      FROM ng_person_movements WHERE $1::uuid::text = person_item_id";
 
-/// Record a merge, in one statement. `$1` is the person merged away, `$2` the
-/// person kept, `$3` the merged person's name.
-///
-/// Three changes that must happen together or not at all, which is why they are
-/// one statement: the `db` host runs each call in a transaction of its own, so
-/// this is the only way three writes share one. Every data-modifying `WITH`
-/// clause of a statement commits or rolls back with it.
-///
-/// - Earlier merges into the person going away are re-pointed at the person
-///   kept, so the record stays one hop deep and the movements view needs one
-///   join, however many merges came before.
-/// - The merge itself is recorded, with the name the person had: the daemon's
-///   events carry the old id, and this row is what attributes them.
-/// - The merged person's mirror row is dropped, so the daemon stops counting
-///   them on its next reconcile.
-///
-/// It returns the people whose earlier merges were re-pointed, as JSON text, so
-/// a merge that fails later can put them back ([`UNDO_PERSON_MERGE`]).
-///
-/// `ng_events` is not in it. The daemon owns that table and its `details`
-/// (`docs/UI.md`, People model), so a past arrival keeps the id and name it was
-/// recorded with, and the view does the attributing.
-pub const MERGE_PERSON_RECORD: &str = "WITH repointed AS (\
-       UPDATE ng_person_merge SET into_item_id = $2::uuid \
-       WHERE into_item_id = $1::uuid RETURNING from_item_id), \
-     recorded AS (\
-       INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name, merged_at) \
-       VALUES ($1::uuid, $2::uuid, $3::text, now()) \
-       ON CONFLICT (from_item_id) DO UPDATE SET into_item_id = EXCLUDED.into_item_id, \
-         from_name = EXCLUDED.from_name, merged_at = EXCLUDED.merged_at \
-       RETURNING from_item_id), \
-     retired AS (DELETE FROM ng_people WHERE item_id = $1::uuid RETURNING item_id) \
-     SELECT COALESCE((SELECT json_agg(from_item_id::text) FROM repointed), '[]'::json)::text \
-       AS repointed, \
-       (SELECT count(*) FROM recorded) AS recorded, \
-       (SELECT count(*) FROM retired) AS retired";
+// A merge's record is four single statements, each with its own undo.
+//
+// It was one statement, `MERGE_PERSON_RECORD` (the name migration 014's
+// comment still gives it, since a migration is never edited),  with data-modifying `WITH` clauses, so Postgres
+// committed or rolled back all of it together. Kernel 0.107 parses every raw
+// statement a plugin sends (`host/sql_guard.rs`): `execute-raw` takes exactly
+// one INSERT, UPDATE or DELETE, `query-raw` only a read, and a `WITH` around a
+// write is neither. The `db` host still runs each call in a transaction of its
+// own and offers no way to hold one open across calls, so the record is now
+// written step by step and taken back step by step, newest first, exactly as
+// the rest of a merge already is (`assist_host.rs`, "A person is two stores").
+//
+// `ng_events` is in none of them. The daemon owns that table and its `details`
+// (`docs/UI.md`, People model), so a past arrival keeps the id and name it was
+// recorded with, and the movements view does the attributing.
 
-/// Take a merge record back, in one statement. `$1` is the person who was
-/// merged away, `$2` the person kept, `$3` the JSON list
-/// [`MERGE_PERSON_RECORD`] returned.
+/// The people earlier merged into a person. `$1` is that person's Item id.
 ///
-/// Only for a merge whose last step failed: the earlier merges it re-pointed go
-/// back to the person they named, and its own row goes. The mirror row it
-/// dropped is written again by the person mirror, from the Item that still
-/// exists, because that is the one statement that writes a mirror row.
-pub const UNDO_PERSON_MERGE: &str = "WITH restored AS (\
-       UPDATE ng_person_merge SET into_item_id = $1::uuid \
-       WHERE from_item_id::text IN (SELECT jsonb_array_elements_text($3::text::jsonb)) \
-       RETURNING from_item_id) \
-     DELETE FROM ng_person_merge WHERE from_item_id = $1::uuid AND into_item_id = $2::uuid";
+/// Read before a merge re-points them, so the re-point names exactly these rows
+/// and its undo can name the same ones.
+pub const SELECT_MERGED_INTO: &str = "SELECT from_item_id::text AS from_item_id \
+     FROM ng_person_merge WHERE into_item_id = $1::uuid ORDER BY from_item_id";
+
+/// Re-point earlier merges from one person to another. `$1` is the person they
+/// name now, `$2` the person they will name, `$3` a JSON list of the merged
+/// people's Item ids ([`SELECT_MERGED_INTO`]).
+///
+/// A merge calls it with (merged away, kept), so the record stays one hop deep
+/// and the movements view needs one join however many merges came before. Its
+/// undo is the same statement with `$1` and `$2` swapped.
+pub const REPOINT_PERSON_MERGES: &str = "UPDATE ng_person_merge SET into_item_id = $2::uuid \
+     WHERE into_item_id = $1::uuid \
+     AND from_item_id::text IN (SELECT jsonb_array_elements_text($3::text::jsonb))";
+
+/// Record that one person was merged into another. `$1` is the person merged
+/// away, `$2` the person kept, `$3` the merged person's name.
+///
+/// The daemon's events carry the old id, and this row is what attributes them.
+/// Undone by [`FORGET_PERSON_MERGE`].
+pub const RECORD_PERSON_MERGE: &str = "INSERT INTO ng_person_merge \
+     (from_item_id, into_item_id, from_name, merged_at) \
+     VALUES ($1::uuid, $2::uuid, $3::text, now()) \
+     ON CONFLICT (from_item_id) DO UPDATE SET into_item_id = EXCLUDED.into_item_id, \
+       from_name = EXCLUDED.from_name, merged_at = EXCLUDED.merged_at";
+
+/// Take back [`RECORD_PERSON_MERGE`]. `$1` is the person merged away, `$2` the
+/// person kept.
+pub const FORGET_PERSON_MERGE: &str = "DELETE FROM ng_person_merge \
+     WHERE from_item_id = $1::uuid AND into_item_id = $2::uuid";
 
 // ===========================================================================
 // Alerts (U3)
@@ -799,8 +798,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_PERSON_PRESENCE", SELECT_PERSON_PRESENCE),
     ("SELECT_PERSON_MOVEMENTS", SELECT_PERSON_MOVEMENTS),
     ("SELECT_PERSON_MOVEMENT_COUNT", SELECT_PERSON_MOVEMENT_COUNT),
-    ("MERGE_PERSON_RECORD", MERGE_PERSON_RECORD),
-    ("UNDO_PERSON_MERGE", UNDO_PERSON_MERGE),
+    ("SELECT_MERGED_INTO", SELECT_MERGED_INTO),
+    ("REPOINT_PERSON_MERGES", REPOINT_PERSON_MERGES),
+    ("RECORD_PERSON_MERGE", RECORD_PERSON_MERGE),
+    ("FORGET_PERSON_MERGE", FORGET_PERSON_MERGE),
     // Alerts (U3).
     ("SELECT_NOTIFY_STATUS", SELECT_NOTIFY_STATUS),
     ("SELECT_LATEST_TEST_REQUEST", SELECT_LATEST_TEST_REQUEST),

@@ -23,6 +23,50 @@ Compatibility section has the table.
 
 ### Changed
 
+**Built and tested against Trovato `main` at `81290cc` (0.107.0, plugin API
+`(0, 107)`), not 0.102.0.** No Trovato release after 0.104.0 has been tagged,
+so `kernel-release.toml` can now pin a commit: `scripts/sync-kernel-release.sh
+--set-commit <sha>` reads the version that commit declares and pins the
+`nightly-<short sha>` image by digest, refusing an image whose build
+provenance names any other commit. The SDK, the `trovato-kernel` dev
+dependency, `api_version` and the demo image all name the one revision, and
+the drift guard tests now check the image as well. The test suite moved to
+sqlx 0.9, the kernel's.
+
+**Everything the kernel changed underneath the plugin, met at the plugin's
+layer.**
+- `item-api` now acts as the requesting user and refuses a background caller
+  (-61) unless the manifest declares `item_background = true`, which it now
+  does, for `tap_cron`'s sync.
+- Raw SQL passes the kernel's parser gate: `execute-raw` takes exactly one
+  INSERT, UPDATE or DELETE. The person merge recorded itself with one
+  statement of writable `WITH` clauses, which the gate refuses; it is now four
+  single statements, each undone in reverse if a later step fails. A new test
+  runs every statement in `queries::ALL`, and every generated write-back,
+  through the pinned kernel's own gate.
+- A write that sets `status` needs `publish content`. The kernel grants it to
+  existing creator roles; `024` grants it to `network_admin` on a new install,
+  where the kernel migrates before the role exists.
+- `save-item` and `delete-item` now fire the item taps, the plugin's own
+  included. `DESIGN.md` Drift 3 and the comments that relied on the old
+  behaviour say so; the sync still cannot loop, because the write-back never
+  raises `sync_state`.
+- The front page renders `/overview` in place rather than redirecting to it
+  (kernel B122), and the theme ends the menu at a new element;
+  `verify-demo.sh` accepts both.
+
+**Anonymous visitors get the login page, and no device data on any path.**
+Probed with no session against kernel 0.104.0 with plugin 1.2.0, and again on
+0.107: device Item pages, `/api/items`, `/api/v1/items`, item autocomplete,
+search, and the JSON of the new-devices and movements gathers all answered 200
+with MAC addresses, addresses or device names in them. `tap_field_access` only
+reaches declared fields, and a published Item is viewable by anyone holding
+`access content` before any plugin is asked. `025` takes `access content` from
+the anonymous role. Every netgrasp page then redirects a visitor with no
+session to the login page, every API answers 401, 403 or 404 or an empty list,
+and signed-in users see exactly what they did. The README gives the two
+statements that restore the old open view.
+
 **The plugin's tests know netgraspd V8's three event indexes, and prove the
 pages that need them read them.** Activity, /events/new-devices, the Alerts
 page's "Recently sent" and the deep pages of /events/security read the whole

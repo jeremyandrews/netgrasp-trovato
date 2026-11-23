@@ -8,6 +8,16 @@
 #   scripts/sync-kernel-release.sh                  rewrite from the current pin
 #   scripts/sync-kernel-release.sh --set-version X.Y.Z
 #                                                   resolve the tag, then rewrite
+#   scripts/sync-kernel-release.sh --set-commit SHA
+#                                                   pin a commit on Trovato's main
+#                                                   and the nightly image built
+#                                                   from it, then rewrite
+#
+# A release pin runs the image tagged with the version. A commit pin is for the
+# stretch between releases: the version is the one that commit's workspace
+# declares (it is what KERNEL_API_VERSION is derived from), and the image is
+# the `nightly-<short sha>` build, pinned by digest, which this script refuses
+# unless its build provenance names exactly that commit.
 #
 # This does NOT touch the plugin's own version ([workspace.package] version),
 # which is semantic from 1.0.0 on and moves independently of the kernel.
@@ -78,6 +88,9 @@ write_block() {
 
 [ -f "$contract" ] || die "$contract is missing"
 
+trovato_repo="https://github.com/jeremyandrews/trovato.git"
+image_repo="ghcr.io/jeremyandrews/trovato"
+
 if [ "${1:-}" = "--set-version" ]; then
     new="${2:-}"
     echo "$new" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
@@ -85,21 +98,68 @@ if [ "${1:-}" = "--set-version" ]; then
     echo "resolving v${new} ..."
     # `^{}` asks for the commit a tag points at, so an annotated tag resolves to
     # the commit rather than to the tag object.
-    resolved="$(git ls-remote https://github.com/jeremyandrews/trovato.git \
-        "refs/tags/v${new}^{}" | cut -f 1)"
+    resolved="$(git ls-remote "$trovato_repo" "refs/tags/v${new}^{}" | cut -f 1)"
     [ -n "$resolved" ] ||
         die "v${new} does not resolve to a commit in jeremyandrews/trovato"
     rewrite "$contract" \
         -e "s/^version = \".*\"\$/version = \"${new}\"/" \
-        -e "s/^rev = \".*\"\$/rev = \"${resolved}\"/"
+        -e "s/^rev = \".*\"\$/rev = \"${resolved}\"/" \
+        -e "s/^image = \".*\"\$/image = \"${new}\"/"
+elif [ "${1:-}" = "--set-commit" ]; then
+    sha="${2:-}"
+    echo "$sha" | grep -Eq '^[0-9a-f]{40}$' ||
+        die "--set-commit wants a full 40-character commit, got '${sha}'"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    echo "fetching main from jeremyandrews/trovato ..."
+    git -C "$work" init -q
+    git -C "$work" remote add origin "$trovato_repo"
+    # Trees and blobs arrive on demand; only history is fetched up front.
+    git -C "$work" fetch -q --filter=blob:none origin main ||
+        die "cannot fetch main from jeremyandrews/trovato"
+    # A nightly is published only from main, so a commit that is not on it has
+    # no image to run.
+    git -C "$work" merge-base --is-ancestor "$sha" origin/main 2>/dev/null ||
+        die "${sha} is not on jeremyandrews/trovato main"
+    new="$(git -C "$work" show "${sha}:Cargo.toml" |
+        sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' | head -n 1)"
+    echo "$new" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+        die "${sha} declares no [workspace.package] version"
+    tag="nightly-${sha:0:7}"
+    echo "checking ${image_repo}:${tag} ..."
+    digest="$(docker buildx imagetools inspect "${image_repo}:${tag}" |
+        sed -n 's/^Digest: *\(sha256:[0-9a-f]*\)$/\1/p' | head -n 1)"
+    [ -n "$digest" ] || die "${image_repo}:${tag} is not published"
+    # Every platform's provenance must name the commit; a tag is mutable, the
+    # provenance of the digest is not.
+    provenance="$(docker buildx imagetools inspect "${image_repo}@${digest}" \
+        --format '{{json .Provenance}}')"
+    # Read into a variable first: `grep -q` stops reading at its first match,
+    # and under pipefail the writer's SIGPIPE would fail the pipeline.
+    platforms="$(docker buildx imagetools inspect "${image_repo}@${digest}")"
+    for platform in linux/amd64 linux/arm64; do
+        printf '%s\n' "$platforms" |
+            grep -Eq "^[[:space:]]*Platform:[[:space:]]+${platform}[[:space:]]*$" ||
+            die "${image_repo}@${digest} carries no ${platform} image"
+    done
+    built="$(printf '%s' "$provenance" | grep -o '"vcs:revision": *"[0-9a-f]*"' |
+        sed 's/.*"\([0-9a-f]*\)"$/\1/' | sort -u)"
+    [ "$built" = "$sha" ] ||
+        die "${image_repo}@${digest} was built from '${built}', not ${sha}"
+    rewrite "$contract" \
+        -e "s/^version = \".*\"\$/version = \"${new}\"/" \
+        -e "s/^rev = \".*\"\$/rev = \"${sha}\"/" \
+        -e "s/^image = \".*\"\$/image = \"${tag}@${digest}\"/"
 elif [ -n "${1:-}" ]; then
     die "unknown argument '$1'"
 fi
 
 version="$(field version)"
 rev="$(field rev)"
+image="$(field image)"
 [ -n "$version" ] || die "kernel-release.toml has no version"
 [ -n "$rev" ] || die "kernel-release.toml has no rev"
+[ -n "$image" ] || die "kernel-release.toml has no image"
 
 api="${version%.*}"
 major="${version%%.*}"
@@ -120,7 +180,7 @@ rewrite "$root/plugins/netgrasp/netgrasp.info.toml" \
 
 # The published kernel image the demo runs.
 rewrite "$root/docker-compose.demo.yml" \
-    -e "s|image: ghcr.io/jeremyandrews/trovato:.*|image: ghcr.io/jeremyandrews/trovato:${version}|"
+    -e "s|image: ghcr.io/jeremyandrews/trovato:.*|image: ${image_repo}:${image}|"
 
 readme_block="$(mktemp)"
 cat > "$readme_block" <<BLOCK
@@ -130,7 +190,7 @@ cat > "$readme_block" <<BLOCK
 | Trovato version | ${version} |
 | \`KERNEL_API_VERSION\` | (${major}, ${minor}) |
 | manifest \`api_version\` | \`${api}\` |
-| demo kernel image | \`ghcr.io/jeremyandrews/trovato:${version}\` |
+| demo kernel image | \`${image_repo}:${image}\` |
 BLOCK
 write_block "$root/README.md" "$readme_block"
 rm -f "$readme_block"

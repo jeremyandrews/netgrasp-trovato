@@ -60,15 +60,18 @@ curl -fsS -o /dev/null \
     "$BASE/install/site"
 echo "    site name: $SITE_NAME"
 
-# The check the health check cannot make. /overview is a netgrasp gather behind
-# a netgrasp permission, and the last one the migrations add, so a 200 here
-# means the wizard is done, the plugin is enabled, every migration ran, its
-# gather is registered and the anonymous role can see it. Any one of those
-# missing is a redirect or a 403.
-code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/overview")"
-if [ "$code" != "200" ]; then
-    echo "error: $BASE/overview answered $code, not 200" >&2
-    exit 1
-fi
+# The check the health check cannot make. Until the wizard is done every page
+# redirects to /install; after it, /overview is a netgrasp gather on a private
+# site (025), so a visitor with no session is sent to the login page. A
+# redirect anywhere else, or any other answer, means the wizard, the plugin or
+# its migrations did not finish.
+answer="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/overview")"
+case "$answer" in
+    30[0-9]" "*/user/login*) ;;
+    *)
+        echo "error: $BASE/overview answered '$answer', not the login redirect" >&2
+        exit 1
+        ;;
+esac
 
-echo "==> ready: $BASE/ redirects to $BASE/overview"
+echo "==> ready: $BASE/ is the overview, after signing in"

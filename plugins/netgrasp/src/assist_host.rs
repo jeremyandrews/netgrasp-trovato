@@ -340,9 +340,8 @@ pub(crate) fn apply_person_save(payload: &Value) -> Result<Value, String> {
 //
 // What each one does instead:
 //
-// - every change that is only rows, and must happen together, is **one
-//   statement** (`MERGE_PERSON_RECORD`), which Postgres commits or rolls back
-//   whole;
+// - every row change is one statement the kernel's raw SQL gate admits (one
+//   INSERT, UPDATE or DELETE, or one read), with an undo of its own;
 // - every step that can be undone is done first, and the one that cannot —
 //   deleting an Item — is done last;
 // - when a step fails, the steps already done are **undone, newest first**,
@@ -626,49 +625,24 @@ pub(crate) fn merge_people(
         return Err(e);
     }
 
-    // 3. The record, in one statement.
-    #[derive(serde::Deserialize)]
-    struct Recorded {
-        repointed: String,
-    }
-    let recorded: Result<Vec<Recorded>, String> = query_rows(
-        queries::MERGE_PERSON_RECORD,
-        &[json!(from.item_id), json!(into.item_id), json!(from.name)],
-    )
-    .map_err(|e| format!("could not record the merge: {e}"));
-    let repointed = match recorded {
-        Ok(rows) => rows
-            .into_iter()
-            .next()
-            .map_or_else(|| "[]".to_string(), |r| r.repointed),
+    // 3. The record: re-point earlier merges, record this one, drop the mirror
+    //    row. Each is one statement, undone newest first if a later step fails.
+    let undo_owners_and_alerts = || {
+        restore_owners(&devices);
+        undo_alerts();
+    };
+    let record = match record_merge(from, into, &from_item) {
+        Ok(record) => record,
         Err(e) => {
-            restore_owners(&devices);
-            undo_alerts();
+            undo_owners_and_alerts();
             return Err(e);
         }
     };
 
     // 4. The merged person's Item.
     if let Err(code) = item_host::delete_item(&from.item_id) {
-        if let Err(e) = crate::db::exec(
-            queries::UNDO_PERSON_MERGE,
-            &[json!(from.item_id), json!(into.item_id), json!(repointed)],
-        ) {
-            host::log(
-                "error",
-                "netgrasp",
-                &format!("could not take back the merge record: {e}"),
-            );
-        }
-        if let Err(e) = sync_host::mirror_person(&from_item) {
-            host::log(
-                "error",
-                "netgrasp",
-                &format!("could not restore {}'s mirror row: {e}", from.name),
-            );
-        }
-        restore_owners(&devices);
-        undo_alerts();
+        record.undo(from, into, &from_item);
+        undo_owners_and_alerts();
         return Err(format!(
             "could not delete {} (host error {code})",
             from.name
@@ -676,6 +650,121 @@ pub(crate) fn merge_people(
     }
 
     Ok(devices)
+}
+
+/// What [`record_merge`] did, so a failure after it can take it back.
+struct MergeRecord {
+    /// The people earlier merged into the one going away, now re-pointed at the
+    /// one kept, as the JSON list [`queries::REPOINT_PERSON_MERGES`] takes.
+    repointed: String,
+    /// Whether this merge's own row was written.
+    recorded: bool,
+    /// Whether the merged person's mirror row was dropped.
+    retired: bool,
+}
+
+impl MergeRecord {
+    /// Take the record back, newest step first. Best effort: each failure is
+    /// logged and the rest still run, because the caller is already reporting
+    /// the failure that brought it here.
+    fn undo(&self, from: &PersonFacts, into: &PersonFacts, from_item: &Value) {
+        if self.retired
+            && let Err(e) = sync_host::mirror_person(from_item)
+        {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not restore {}'s mirror row: {e}", from.name),
+            );
+        }
+        if self.recorded
+            && let Err(e) = crate::db::exec(
+                queries::FORGET_PERSON_MERGE,
+                &[json!(from.item_id), json!(into.item_id)],
+            )
+        {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!("could not take back the merge record: {e}"),
+            );
+        }
+        if self.repointed != "[]"
+            && let Err(e) = crate::db::exec(
+                queries::REPOINT_PERSON_MERGES,
+                &[
+                    json!(into.item_id),
+                    json!(from.item_id),
+                    json!(self.repointed),
+                ],
+            )
+        {
+            host::log(
+                "error",
+                "netgrasp",
+                &format!(
+                    "could not put back the earlier merges into {}: {e}",
+                    from.name
+                ),
+            );
+        }
+    }
+}
+
+/// Write a merge's record: re-point the merges into `from` at `into`, record
+/// `from` as merged into `into`, and drop `from`'s mirror row so the daemon
+/// stops counting them on its next reconcile.
+///
+/// One statement per step, because that is what the kernel's raw SQL gate
+/// admits; a step that fails takes back the ones before it and says so.
+fn record_merge(
+    from: &PersonFacts,
+    into: &PersonFacts,
+    from_item: &Value,
+) -> Result<MergeRecord, String> {
+    #[derive(serde::Deserialize)]
+    struct Merged {
+        from_item_id: String,
+    }
+    let earlier: Vec<Merged> = query_rows(queries::SELECT_MERGED_INTO, &[json!(from.item_id)])
+        .map_err(|e| format!("could not read the earlier merges: {e}"))?;
+    let ids: Vec<String> = earlier.into_iter().map(|m| m.from_item_id).collect();
+    let mut record = MergeRecord {
+        repointed: serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()),
+        recorded: false,
+        retired: false,
+    };
+    let fail = |record: &MergeRecord, message: String| {
+        record.undo(from, into, from_item);
+        Err(message)
+    };
+
+    if !ids.is_empty() {
+        crate::db::exec(
+            queries::REPOINT_PERSON_MERGES,
+            &[
+                json!(from.item_id),
+                json!(into.item_id),
+                json!(record.repointed),
+            ],
+        )
+        .map_err(|e| format!("could not record the merge: {e}"))?;
+    }
+
+    if let Err(e) = crate::db::exec(
+        queries::RECORD_PERSON_MERGE,
+        &[json!(from.item_id), json!(into.item_id), json!(from.name)],
+    ) {
+        return fail(&record, format!("could not record the merge: {e}"));
+    }
+    record.recorded = true;
+
+    if let Err(e) = crate::db::exec(queries::DELETE_PERSON_MIRROR, &[json!(from.item_id)]) {
+        return fail(&record, format!("could not record the merge: {e}"));
+    }
+    record.retired = true;
+
+    Ok(record)
 }
 
 /// Remove a person: their devices become nobody's, their mirror row goes, and
@@ -687,8 +776,9 @@ pub(crate) fn merge_people(
 ///
 /// In order, each step undone if a later one fails: the devices
 /// ([`move_devices`]), then `retire_person` (the mirror row), then the Item —
-/// last, because it is the one step with no undo. `delete-item` fires no
-/// `tap_item_delete`, which is why the retire is called here.
+/// last, because it is the one step with no undo. `delete-item` fires
+/// `tap_item_delete` since kernel 0.107, which retires again; the retire is
+/// still called here so it happens before the step that cannot be undone.
 pub(crate) fn remove_person(person: &PersonFacts) -> Result<Vec<DeviceFacts>, String> {
     let item = load_person_item(&person.item_id)?;
     let devices = every_owned_device(person)?;
