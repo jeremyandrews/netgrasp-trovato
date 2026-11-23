@@ -6103,8 +6103,8 @@ fn a_merge_whose_item_delete_fails_is_undone_completely() {
         reset(&pool).await;
         let admin = ng_admin(&pool).await;
         let (from, into, d1, d2) = two_jamies(&pool, &admin).await;
-        // An earlier merge into the person going away, which the record
-        // statement re-points and the undo must point back.
+        // An earlier merge into the person going away, which must still name
+        // them once the merge is undone.
         let earlier = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name) VALUES ($1, $2, 'J')",
@@ -6136,6 +6136,106 @@ fn a_merge_whose_item_delete_fails_is_undone_completely() {
                 .await
                 .unwrap();
         assert_eq!(pointed, from, "the earlier merge was not pointed back");
+    });
+}
+
+/// The merge record, written by the statements a merge sends, in the order
+/// two overlapping merges can interleave them: A into B records its row while
+/// B into C is under way, after B into C would have read the merges into B.
+/// The collapse that ends each merge points A at C, so A's past movements are
+/// C's and not those of a person who no longer exists.
+#[test]
+fn overlapping_merges_leave_no_merge_naming_a_person_merged_away() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let record = |from: Uuid, into: Uuid| {
+            sqlx::query(netgrasp_core::queries::RECORD_PERSON_MERGE)
+                .bind(from.to_string())
+                .bind(into.to_string())
+                .bind("Someone")
+                .execute(&pool)
+        };
+        record(a, b).await.unwrap();
+        record(b, c).await.unwrap();
+        // One pass of each merge's collapse; the second finds nothing left.
+        let first = sqlx::query(netgrasp_core::queries::COLLAPSE_PERSON_MERGES)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(first, 1);
+        let second = sqlx::query(netgrasp_core::queries::COLLAPSE_PERSON_MERGES)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(second, 0);
+        let into_of = |from: Uuid| {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT into_item_id FROM ng_person_merge WHERE from_item_id = $1",
+            )
+            .bind(from)
+            .fetch_one(&pool)
+        };
+        assert_eq!(into_of(a).await.unwrap(), c);
+        assert_eq!(into_of(b).await.unwrap(), c);
+
+        // Two people merged into each other at the same moment: no row is
+        // pointed at itself, and the collapse stops.
+        sqlx::query("TRUNCATE ng_person_merge")
+            .execute(&pool)
+            .await
+            .unwrap();
+        record(a, b).await.unwrap();
+        record(b, a).await.unwrap();
+        for _ in 0..3 {
+            sqlx::query(netgrasp_core::queries::COLLAPSE_PERSON_MERGES)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let selfish: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ng_person_merge WHERE from_item_id = into_item_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(selfish, 0);
+    });
+}
+
+/// A merge chain left behind (a merge stopped after its record, or two merges
+/// overlapping) is repaired by the next cron run, through the plugin, and the
+/// chained person's movements are the kept person's again.
+#[test]
+fn cron_points_a_merge_chain_at_the_person_kept() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (from, into) in [(a, b), (b, c)] {
+            sqlx::query(
+                "INSERT INTO ng_person_merge (from_item_id, into_item_id, from_name) \
+                 VALUES ($1, $2, 'Someone')",
+            )
+            .bind(from)
+            .bind(into)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(run_cron(&pool).await["collapsed"], 1);
+        let pointed: Uuid =
+            sqlx::query_scalar("SELECT into_item_id FROM ng_person_merge WHERE from_item_id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pointed, c);
+        assert_eq!(run_cron(&pool).await["collapsed"], 0);
     });
 }
 

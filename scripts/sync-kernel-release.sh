@@ -130,22 +130,9 @@ elif [ "${1:-}" = "--set-commit" ]; then
     digest="$(docker buildx imagetools inspect "${image_repo}:${tag}" |
         sed -n 's/^Digest: *\(sha256:[0-9a-f]*\)$/\1/p' | head -n 1)"
     [ -n "$digest" ] || die "${image_repo}:${tag} is not published"
-    # Every platform's provenance must name the commit; a tag is mutable, the
+    # Each platform's provenance must name the commit; a tag is mutable, the
     # provenance of the digest is not.
-    provenance="$(docker buildx imagetools inspect "${image_repo}@${digest}" \
-        --format '{{json .Provenance}}')"
-    # Read into a variable first: `grep -q` stops reading at its first match,
-    # and under pipefail the writer's SIGPIPE would fail the pipeline.
-    platforms="$(docker buildx imagetools inspect "${image_repo}@${digest}")"
-    for platform in linux/amd64 linux/arm64; do
-        printf '%s\n' "$platforms" |
-            grep -Eq "^[[:space:]]*Platform:[[:space:]]+${platform}[[:space:]]*$" ||
-            die "${image_repo}@${digest} carries no ${platform} image"
-    done
-    built="$(printf '%s' "$provenance" | grep -o '"vcs:revision": *"[0-9a-f]*"' |
-        sed 's/.*"\([0-9a-f]*\)"$/\1/' | sort -u)"
-    [ "$built" = "$sha" ] ||
-        die "${image_repo}@${digest} was built from '${built}', not ${sha}"
+    "$root/scripts/check-image-provenance.sh" "${image_repo}@${digest}" "$sha"
     rewrite "$contract" \
         -e "s/^version = \".*\"\$/version = \"${new}\"/" \
         -e "s/^rev = \".*\"\$/rev = \"${sha}\"/" \

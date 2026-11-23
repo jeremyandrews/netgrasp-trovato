@@ -387,6 +387,30 @@ pub fn retire_person(item_id: &str) -> CoreResult<()> {
     Ok(())
 }
 
+/// How many collapse passes one call makes at most. A chain is one hop longer
+/// than it should be only when two merges overlap, so two passes is the
+/// expected worst case; the cap keeps a cycle from looping.
+const COLLAPSE_PASSES: usize = 8;
+
+/// Point every merge record at a person who still exists, one hop deep:
+/// [`queries::COLLAPSE_PERSON_MERGES`], a pass at a time until a pass changes
+/// nothing. Returns how many rows were re-pointed.
+///
+/// # Errors
+///
+/// [`CoreError::Store`] when a pass fails; the passes before it stay done.
+pub fn collapse_person_merges() -> CoreResult<u64> {
+    let mut total = 0;
+    for _ in 0..COLLAPSE_PASSES {
+        let changed = exec(queries::COLLAPSE_PERSON_MERGES, &[])?;
+        if changed == 0 {
+            break;
+        }
+        total += changed;
+    }
+    Ok(total)
+}
+
 /// Unlink a device row whose Item an admin deleted.
 ///
 /// The row is left alone otherwise: the device is still on the network and the

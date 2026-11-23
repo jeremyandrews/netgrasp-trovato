@@ -37,9 +37,15 @@ what was met; this is what has changed since.
   one INSERT, UPDATE or DELETE, and `check_query_raw` refuses a writable `WITH`.
   That was the only way a plugin could make several row changes commit
   together: the `db` host runs each call in its own transaction and has no way
-  to hold one open. The person merge's record is now four statements with
-  compensating undo (`assist_host.rs`, `record_merge`). **Decidable item:** a
-  `db` host call that runs a short list of gated statements in one transaction.
+  to hold one open. The person merge's record is now separate statements with
+  compensating undo (`assist_host.rs`, `record_merge`), and the re-point of
+  earlier merges moved after the merge's last step into an idempotent collapse
+  that `tap_cron` repeats (`queries::COLLAPSE_PERSON_MERGES`), because a
+  statement-at-a-time re-point can neither see a merge finishing alongside it
+  nor be undone if the request stops between statements. The cost is a window
+  in which a chain exists and the movements view attributes the chained
+  person's history to someone already merged away. **Decidable item:** a `db`
+  host call that runs a short list of gated statements in one transaction.
 
 Seven findings are grouped under their own heading below: they were met during
 the first joint run of the daemon and the plugin against a live LAN

@@ -27,6 +27,11 @@
 -- session with the login redirect or 401/403/404, and a signed-in user is
 -- unaffected: `authenticated user` keeps `access content`.
 --
+-- `access content` is site-wide: anything else published on the same Trovato
+-- site stops being public too. The kernel offers no narrower lever for a
+-- published Item, and Netgrasp runs on a site of its own (README, "Who sees
+-- device data").
+--
 -- A site that wants an open wall screen grants both back, two statements; this
 -- runs once, so it will not take them away again.
 DELETE FROM role_permissions

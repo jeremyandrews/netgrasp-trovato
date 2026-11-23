@@ -56,6 +56,13 @@ two gathers on paths no field decision reaches. In the demo, sign in as `admin`
 with the password in `docker-compose.demo.yml`. The `network_viewer` role holds
 the permission for everyone else.
 
+`access content` is the kernel's site-wide permission to read published
+content, so 025 makes the whole site private, not only Netgrasp's part of it:
+an article or a gather of another plugin on the same Trovato site stops being
+public too. The kernel offers nothing narrower (a published Item is viewable by
+anyone holding `access content` before any plugin is asked), so run Netgrasp on
+a site of its own, as the overlay image and the demo do.
+
 A wall screen or a trusted LAN that wants the old open view grants both back.
 Run it once; the migrations never run a second time, so it will not be undone:
 
@@ -160,8 +167,9 @@ is separate and is not the kernel's. To move the pin to a release, run
 `scripts/sync-kernel-release.sh --set-version X.Y.Z`, which resolves the tag to
 its commit and rewrites every location. Between releases,
 `scripts/sync-kernel-release.sh --set-commit <sha>` pins a commit on Trovato's
-`main` and the `nightly-<short sha>` image by digest, and refuses an image whose
-build provenance names any other commit.
+`main` and the `nightly-<short sha>` image by digest, and refuses the image
+unless the build provenance of both its linux/amd64 and its linux/arm64 image
+names that commit (`scripts/check-image-provenance.sh`).
 
 ### And which Trovato release it runs on
 

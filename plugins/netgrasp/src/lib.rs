@@ -377,7 +377,31 @@ pub fn tap_cron(input: CronInput) -> serde_json::Value {
         }
     };
 
-    serde_json::json!({ "sync": sync, "pruned": pruned })
+    // A merge re-points the merges into the person it removes as its last step;
+    // a merge stopped before that, or two merges overlapping, leave a chain this
+    // repairs. Nothing to do on almost every run.
+    let collapsed = match sync_host::collapse_person_merges() {
+        Ok(n) => {
+            if n > 0 {
+                host::log(
+                    "info",
+                    "netgrasp",
+                    &format!("re-pointed {n} merge records at the person kept"),
+                );
+            }
+            serde_json::json!(n)
+        }
+        Err(e) => {
+            host::log(
+                "warning",
+                "netgrasp",
+                &format!("tap_cron: merge collapse failed: {e}"),
+            );
+            serde_json::json!({ "error": e.to_string() })
+        }
+    };
+
+    serde_json::json!({ "sync": sync, "pruned": pruned, "collapsed": collapsed })
 }
 
 // ===========================================================================
@@ -389,11 +413,9 @@ pub fn tap_cron(input: CronInput) -> serde_json::Value {
 /// This is the write-back channel, and it is worth being precise about when it
 /// fires, because the sync loop's termination depends on it: `tap_item_update` is
 /// dispatched by `ItemService::update`, whose callers are the admin content
-/// routes and the JSON item routes. The `save-item` host function the sync pass
-/// uses calls `Item::update` **directly**, so a plugin's own write does not
-/// arrive here (`DESIGN.md` Drift 3). The loop therefore has no edge to traverse.
-///
-/// It would still terminate if that changed, because
+/// routes, the JSON item routes and, since kernel 0.107, the `save-item` host
+/// function the sync pass uses (`DESIGN.md` Drift 3). So the plugin's own write
+/// arrives here too, and the loop still terminates, because
 /// [`netgrasp_core::writeback::build_update`] cannot emit `sync_state` and so
 /// cannot mark a row for re-sync.
 #[plugin_tap]

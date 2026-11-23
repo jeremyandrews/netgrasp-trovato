@@ -49,12 +49,22 @@ echo "==> verifying the demo at $BASE"
 # `view netgrasp devices`; 025 takes `access content` from the anonymous role,
 # because Item pages, the item and search APIs and two gathers' JSON served
 # device data that no field decision reaches.
+#
+# A refusal may be a redirect, 401, 403 or 404, and a search may answer 200
+# with nothing in it, so the status alone proves nothing either way; what it
+# must never be is a server error, which would hide whatever the page would
+# have shown. The body must name none of the seeded people or devices and
+# carry no MAC address.
+SEEDED='([0-9a-f]{2}:){5}[0-9a-f]{2}|Jamie|Aurora|Hallway smart plug|Chromecast|Arlo|motivo'
 for path in / /devices/online /item/5eed0000-0000-4000-8000-0000000000d1 \
     /api/items/ng_device /api/v1/items/ng_device "/api/v1/search?q=motivo" \
     "/api/v1/items/autocomplete?type=ng_device&q=a" \
     /api/v1/query/ng_devices_new/execute /api/v1/query/ng_person_movements/execute; do
-    answer="$(curl -s -o "$PAGE" -w '%{http_code} %{redirect_url}' "$BASE$path")"
-    if grep -Eiq '([0-9a-f]{2}:){5}[0-9a-f]{2}|motivo' "$PAGE"; then
+    answer="$(curl -s -o "$PAGE" -w '%{http_code} %{redirect_url}' "$BASE$path" || true)"
+    case "$answer" in
+        5*|000*) fail "$path answered '$answer' to an anonymous visitor" ;;
+    esac
+    if grep -Eiq "$SEEDED" "$PAGE"; then
         fail "an anonymous visitor can read device data on $path ($answer)"
     fi
 done

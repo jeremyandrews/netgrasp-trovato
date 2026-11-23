@@ -577,39 +577,29 @@ pub const SELECT_PERSON_MOVEMENTS: &str = "SELECT event_type, timestamp_epoch AS
 pub const SELECT_PERSON_MOVEMENT_COUNT: &str = "SELECT count(*) AS movements \
      FROM ng_person_movements WHERE $1::uuid::text = person_item_id";
 
-// A merge's record is four single statements, each with its own undo.
+// A merge's record is single statements, each with its own undo.
 //
 // It was one statement, `MERGE_PERSON_RECORD` (the name migration 014's
-// comment still gives it, since a migration is never edited),  with data-modifying `WITH` clauses, so Postgres
-// committed or rolled back all of it together. Kernel 0.107 parses every raw
-// statement a plugin sends (`host/sql_guard.rs`): `execute-raw` takes exactly
-// one INSERT, UPDATE or DELETE, `query-raw` only a read, and a `WITH` around a
-// write is neither. The `db` host still runs each call in a transaction of its
-// own and offers no way to hold one open across calls, so the record is now
-// written step by step and taken back step by step, newest first, exactly as
-// the rest of a merge already is (`assist_host.rs`, "A person is two stores").
+// comment still gives it, since a migration is never edited), with
+// data-modifying `WITH` clauses, so Postgres committed or rolled back all of it
+// together. Kernel 0.107 parses every raw statement a plugin sends
+// (`host/sql_guard.rs`): `execute-raw` takes exactly one INSERT, UPDATE or
+// DELETE, `query-raw` only a read, and a `WITH` around a write is neither. The
+// `db` host runs each call in a transaction of its own and offers no way to
+// hold one open across calls.
+//
+// So a merge records its own row and nothing else ([`RECORD_PERSON_MERGE`]),
+// and the earlier merges into the person going away are re-pointed afterwards,
+// by [`COLLAPSE_PERSON_MERGES`], once that person's Item is gone. Re-pointing
+// them first, from a list read beforehand, could not be made safe: a merge into
+// the same person finishing between the read and the update would be missed,
+// and a request stopped after the update would leave older movements moved for
+// a merge that never happened. A chain left behind by either is repaired by the
+// next collapse, which every merge and every cron run makes.
 //
 // `ng_events` is in none of them. The daemon owns that table and its `details`
 // (`docs/UI.md`, People model), so a past arrival keeps the id and name it was
 // recorded with, and the movements view does the attributing.
-
-/// The people earlier merged into a person. `$1` is that person's Item id.
-///
-/// Read before a merge re-points them, so the re-point names exactly these rows
-/// and its undo can name the same ones.
-pub const SELECT_MERGED_INTO: &str = "SELECT from_item_id::text AS from_item_id \
-     FROM ng_person_merge WHERE into_item_id = $1::uuid ORDER BY from_item_id";
-
-/// Re-point earlier merges from one person to another. `$1` is the person they
-/// name now, `$2` the person they will name, `$3` a JSON list of the merged
-/// people's Item ids ([`SELECT_MERGED_INTO`]).
-///
-/// A merge calls it with (merged away, kept), so the record stays one hop deep
-/// and the movements view needs one join however many merges came before. Its
-/// undo is the same statement with `$1` and `$2` swapped.
-pub const REPOINT_PERSON_MERGES: &str = "UPDATE ng_person_merge SET into_item_id = $2::uuid \
-     WHERE into_item_id = $1::uuid \
-     AND from_item_id::text IN (SELECT jsonb_array_elements_text($3::text::jsonb))";
 
 /// Record that one person was merged into another. `$1` is the person merged
 /// away, `$2` the person kept, `$3` the merged person's name.
@@ -626,6 +616,20 @@ pub const RECORD_PERSON_MERGE: &str = "INSERT INTO ng_person_merge \
 /// person kept.
 pub const FORGET_PERSON_MERGE: &str = "DELETE FROM ng_person_merge \
      WHERE from_item_id = $1::uuid AND into_item_id = $2::uuid";
+
+/// Shorten every merge chain by one hop: a merge into someone who was merged
+/// away themselves is pointed at the person they were merged into. No
+/// parameters; the number of rows changed says whether another pass is needed.
+///
+/// The record stays one hop deep, because `ng_person_movements` (014) follows
+/// one merge row. A merge runs it after its last step and `tap_cron` on every
+/// run, a pass at a time until a pass changes nothing.
+/// A row is never pointed at itself, so two people merged into each other at
+/// the same moment do not loop.
+pub const COLLAPSE_PERSON_MERGES: &str = "UPDATE ng_person_merge AS m \
+     SET into_item_id = n.into_item_id \
+     FROM ng_person_merge AS n \
+     WHERE m.into_item_id = n.from_item_id AND m.from_item_id <> n.into_item_id";
 
 // ===========================================================================
 // Alerts (U3)
@@ -798,10 +802,9 @@ pub const ALL: &[(&str, &str)] = &[
     ("SELECT_PERSON_PRESENCE", SELECT_PERSON_PRESENCE),
     ("SELECT_PERSON_MOVEMENTS", SELECT_PERSON_MOVEMENTS),
     ("SELECT_PERSON_MOVEMENT_COUNT", SELECT_PERSON_MOVEMENT_COUNT),
-    ("SELECT_MERGED_INTO", SELECT_MERGED_INTO),
-    ("REPOINT_PERSON_MERGES", REPOINT_PERSON_MERGES),
     ("RECORD_PERSON_MERGE", RECORD_PERSON_MERGE),
     ("FORGET_PERSON_MERGE", FORGET_PERSON_MERGE),
+    ("COLLAPSE_PERSON_MERGES", COLLAPSE_PERSON_MERGES),
     // Alerts (U3).
     ("SELECT_NOTIFY_STATUS", SELECT_NOTIFY_STATUS),
     ("SELECT_LATEST_TEST_REQUEST", SELECT_LATEST_TEST_REQUEST),

@@ -27,8 +27,10 @@ Compatibility section has the table.
 `(0, 107)`), not 0.102.0.** No Trovato release after 0.104.0 has been tagged,
 so `kernel-release.toml` can now pin a commit: `scripts/sync-kernel-release.sh
 --set-commit <sha>` reads the version that commit declares and pins the
-`nightly-<short sha>` image by digest, refusing an image whose build
-provenance names any other commit. The SDK, the `trovato-kernel` dev
+`nightly-<short sha>` image by digest, refusing it unless the build
+provenance of both its linux/amd64 and linux/arm64 images names that commit
+(`scripts/check-image-provenance.sh`, tested in CI against stand-in images
+that lack one platform's provenance or name another commit). The SDK, the `trovato-kernel` dev
 dependency, `api_version` and the demo image all name the one revision, and
 the drift guard tests now check the image as well. The test suite moved to
 sqlx 0.9, the kernel's.
@@ -40,10 +42,19 @@ layer.**
   does, for `tap_cron`'s sync.
 - Raw SQL passes the kernel's parser gate: `execute-raw` takes exactly one
   INSERT, UPDATE or DELETE. The person merge recorded itself with one
-  statement of writable `WITH` clauses, which the gate refuses; it is now four
-  single statements, each undone in reverse if a later step fails. A new test
-  runs every statement in `queries::ALL`, and every generated write-back,
-  through the pinned kernel's own gate.
+  statement of writable `WITH` clauses, which the gate refuses, and the `db`
+  host holds no transaction across calls. The merge now records its own row
+  and retires the merged person's mirror row (each undone if a later step
+  fails), and only after the merged person's Item is gone points the merges
+  earlier made into them at the person kept, with one collapse statement that
+  `tap_cron` also runs every time. Re-pointing them first, from a list read
+  beforehand, would have missed a merge into the same person finishing
+  meanwhile, and a request stopped part way would have moved older movements
+  for a merge that never happened; either now leaves at most a chain the next
+  collapse repairs. A new test runs every statement in `queries::ALL`, and
+  every generated write-back, through the pinned kernel's own gate, and
+  another holds every call site to the host call the gate checked it for: a
+  read sent through `exec` is refused at run time.
 - A write that sets `status` needs `publish content`. The kernel grants it to
   existing creator roles; `024` grants it to `network_admin` on a new install,
   where the kernel migrates before the role exists.
@@ -65,7 +76,12 @@ reaches declared fields, and a published Item is viewable by anyone holding
 the anonymous role. Every netgrasp page then redirects a visitor with no
 session to the login page, every API answers 401, 403 or 404 or an empty list,
 and signed-in users see exactly what they did. The README gives the two
-statements that restore the old open view.
+statements that restore the old open view. `access content` is site-wide, so
+anything else published on the same Trovato site stops being public too; the
+kernel offers no narrower lever for a published Item, and Netgrasp runs on a
+site of its own. `verify-demo.sh`'s anonymous check now also fails on a server
+error and on a seeded person's or device's name, not only on a MAC address,
+and is tested in CI against a stand-in site that leaks each way.
 
 **The plugin's tests know netgraspd V8's three event indexes, and prove the
 pages that need them read them.** Activity, /events/new-devices, the Alerts
