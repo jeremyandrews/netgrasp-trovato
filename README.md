@@ -46,7 +46,7 @@ on first run.
 
 Signing in is required. A visitor who is not signed in gets the login page, on
 every netgrasp page, every Item page and every item, search and gather API.
-Two migrations make it so. `013_netgrasp_home.sql` takes `view netgrasp devices`
+Three migrations make it so. `013_netgrasp_home.sql` takes `view netgrasp devices`
 from the anonymous role (which `005` had granted it for a localhost dashboard),
 and the plugin's `tap_field_access` denies every field of every netgrasp record
 type, and of its two Item types, to a viewer without it.
@@ -63,12 +63,19 @@ public too. The kernel offers nothing narrower (a published Item is viewable by
 anyone holding `access content` before any plugin is asked), so run Netgrasp on
 a site of its own, as the overlay image and the demo do.
 
-A wall screen or a trusted LAN that wants the old open view grants both back.
-Run it once; the migrations never run a second time, so it will not be undone:
+`026_netgrasp_private_search.sql` takes `search content` from the anonymous
+role as well. The kernel gave search that permission of its own in 0.107, and
+its migration grants it to every role holding `access content`, which runs
+before 025 has taken that away.
+
+A wall screen or a trusted LAN that wants the old open view grants all three
+back. Run it once; the migrations never run a second time, so it will not be
+undone:
 
 ```sql
 INSERT INTO role_permissions (role_id, permission)
 VALUES ('00000000-0000-0000-0000-000000000001', 'access content'),
+       ('00000000-0000-0000-0000-000000000001', 'search content'),
        ('00000000-0000-0000-0000-000000000001', 'view netgrasp devices')
 ON CONFLICT DO NOTHING;
 ```
@@ -154,11 +161,11 @@ copy drifts.
 <!-- kernel-release:begin -->
 | | |
 |---|---|
-| pinned `rev` | `81290cc862b2c8302bc0a99d270f2571405c51ef` |
+| pinned `rev` | `7815b39acbbac0e9f6d0c1fabfda961ad4e0658e` |
 | Trovato version | 0.107.0 |
 | `KERNEL_API_VERSION` | (0, 107) |
 | manifest `api_version` | `0.107` |
-| demo kernel image | `ghcr.io/jeremyandrews/trovato:nightly-81290cc@sha256:fca4070e75885aa91fa8cd9bae4e79d492e7ded2b7f86c2f7a5c3383392f729b` |
+| demo kernel image | `ghcr.io/jeremyandrews/trovato:nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd` |
 <!-- kernel-release:end -->
 
 `api_version` is not chosen: it is the pinned version's major and minor, so it

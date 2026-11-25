@@ -98,6 +98,7 @@ files = [
     "migrations/023_netgrasp_presence_views.sql",
     "migrations/024_netgrasp_publish_content.sql",
     "migrations/025_netgrasp_private_site.sql",
+    "migrations/026_netgrasp_private_search.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).

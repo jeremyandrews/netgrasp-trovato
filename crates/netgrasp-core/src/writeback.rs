@@ -262,10 +262,19 @@ pub fn build_partial_update(
             "hidden" => (json!(edit.hidden.unwrap_or_default()), "boolean"),
             "notify" => (json!(edit.notify.unwrap_or_default()), "boolean"),
             // Nullable on purpose: NULL is "by device type", not "no".
+            //
+            // Bound as text ('true', 'false' or NULL) and cast to boolean in
+            // the statement, never as a JSON boolean. The `db` host binds a
+            // JSON null as a text parameter and caches each statement by its
+            // SQL on the connection, so the same UPDATE sent once with NULL
+            // here and later with a boolean hands Postgres the boolean's
+            // binary form for a parameter it prepared as text:
+            // `invalid input syntax for type boolean: ""`. Text every time
+            // keeps the parameter's type the same on every call.
             "counts_for_presence" => (
                 edit.counts_for_presence
                     .flatten()
-                    .map_or(Value::Null, |v| json!(v)),
+                    .map_or(Value::Null, |v| json!(v.to_string())),
                 "boolean",
             ),
             // Unreachable while USER_OWNED and DeviceEdit agree — `names`
@@ -729,6 +738,31 @@ mod tests {
         assert_eq!(stmt.columns, ["notify"]);
         assert_eq!(stmt.params[0], json!(false));
         assert!(!stmt.sql.contains("hidden"), "{}", stmt.sql);
+    }
+
+    /// The presence choice is a text parameter whatever it is, so the one
+    /// statement never binds a boolean where another call bound NULL (which the
+    /// `db` host sends as text) for the same placeholder.
+    #[test]
+    fn the_presence_choice_is_bound_as_text_or_null_never_as_a_boolean() {
+        for (choice, bound) in [
+            (Some(true), json!("true")),
+            (Some(false), json!("false")),
+            (None, Value::Null),
+        ] {
+            let edit = DeviceEdit {
+                counts_for_presence: Some(choice),
+                ..DeviceEdit::default()
+            };
+            let stmt = build_partial_update(ITEM, &edit, None).unwrap();
+            assert_eq!(stmt.columns, ["counts_for_presence"]);
+            assert_eq!(stmt.params[0], bound, "{choice:?}");
+            assert!(
+                stmt.sql.contains("counts_for_presence = $1::boolean"),
+                "{}",
+                stmt.sql
+            );
+        }
     }
 
     /// Both flags at once is still exactly both flags.

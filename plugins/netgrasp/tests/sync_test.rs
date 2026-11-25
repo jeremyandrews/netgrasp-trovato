@@ -5077,6 +5077,105 @@ fn home_lists_at_most_six_devices_to_sort_and_counts_the_rest() {
     });
 }
 
+/// Two whole-device write-backs on one database connection, the first with
+/// the presence choice "by device type" (NULL) and the second "does not
+/// count", both go through. They are the same UPDATE text, and the `db` host
+/// caches a statement per connection by its text and binds a JSON null as a
+/// text parameter: a boolean bound for that placeholder on the second call
+/// reached Postgres as `invalid input syntax for type boolean: ""`, and the
+/// edit was not written back. Since kernel 0.107 the sync's own refreshes fire
+/// `tap_item_update` for every device in one pass, which is how it was found.
+/// One connection makes the reuse certain rather than a matter of which
+/// connection the pool hands out.
+#[test]
+fn whole_device_write_backs_with_and_without_a_presence_choice_share_a_connection() {
+    serial(async {
+        let pool = fresh_pool().await;
+        reset(&pool).await;
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://trovato:trovato@localhost:5432/trovato".to_string());
+        let one = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut devices = Vec::new();
+        for mac in ["aa:bb:cc:00:01:01", "aa:bb:cc:00:01:02"] {
+            let id = seed_device(&pool, mac, None, "online").await;
+            let item = Uuid::new_v4();
+            sqlx::query("UPDATE ng_devices SET trovato_item_id = $1 WHERE id = $2")
+                .bind(item)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            devices.push((id, item));
+        }
+
+        for ((_, item), choice) in devices.iter().zip(["", "does_not_count"]) {
+            let input = serde_json::json!({
+                "id": item.to_string(),
+                "type": "ng_device",
+                "title": format!("Device {item}"),
+                "fields": { "field_counts_for_presence": choice },
+            })
+            .to_string();
+            let results = dispatcher()
+                .dispatch("tap_item_update", &input, background(&one))
+                .await;
+            assert_eq!(results.len(), 1);
+            let output: serde_json::Value = serde_json::from_str(&results[0].output).unwrap();
+            assert_eq!(
+                output["wrote_back"], 1,
+                "write-back with {choice:?}: {output}"
+            );
+        }
+
+        let counts: Vec<Option<bool>> = sqlx::query_scalar(
+            "SELECT counts_for_presence FROM ng_devices WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(devices.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, [None, Some(false)]);
+        one.close().await;
+    });
+}
+
+/// After every kernel and plugin migration, in the order a new install and an
+/// upgrade run them, the anonymous role holds none of the three permissions
+/// that would let a visitor with no session read or search device data:
+/// `view netgrasp devices` (013), `access content` (025) and the kernel's
+/// `search content`, which its own migration grants to every role holding
+/// `access content` before 025 runs (026).
+#[test]
+fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
+    serial(async {
+        let pool = fresh_pool().await;
+        let held: Vec<String> = sqlx::query_scalar(
+            "SELECT permission FROM role_permissions \
+             WHERE role_id = '00000000-0000-0000-0000-000000000001' \
+             AND permission IN ('view netgrasp devices', 'access content', 'search content') \
+             ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(held.is_empty(), "the anonymous role still holds {held:?}");
+        // The signed-in role keeps all it had.
+        let authenticated: Vec<String> = sqlx::query_scalar(
+            "SELECT permission FROM role_permissions \
+             WHERE role_id = '00000000-0000-0000-0000-000000000002' \
+             AND permission IN ('access content', 'search content') ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(authenticated, ["access content", "search content"]);
+    });
+}
+
 /// **An anonymous visitor reads no device data** (docs/UI.md, U1 check 7):
 /// through the real kernel gather and the plugin's real `tap_field_access`,
 /// every device, event and Home row reaches an anonymous viewer with no MAC,
@@ -7037,7 +7136,12 @@ async fn kernel_gather_page_sql(
             sort.field = target.to_string();
         }
     }
-    let per_page = query.display.items_per_page;
+    // Optional since kernel B160 (absent is the site's page size); every
+    // netgrasp gather names its own, so the plan is of the page it serves.
+    let per_page = query
+        .display
+        .items_per_page
+        .unwrap_or_else(|| panic!("{query_id} names no items_per_page"));
     let builder = trovato_kernel::gather::GatherQueryBuilder::new(
         definition,
         Uuid::parse_str(LIVE_STAGE).unwrap(),

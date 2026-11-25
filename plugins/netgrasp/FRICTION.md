@@ -18,10 +18,12 @@ Verified against the kernel API this repository pins, `(0, 102)`
 kernel-migration change** in the build session. The design decisions these
 findings forced are argued in `DESIGN.md`.
 
-## Status at kernel 0.107 (`81290cc`)
+## Status at kernel 0.107 (`7815b39`)
 
 Re-checked when the pin moved from 0.102.0 to Trovato `main` at `81290cc`
-(plugin API `(0, 107)`). The entries below are kept as written, as the record of
+(plugin API `(0, 107)`), and again at `7815b39`, which binds the item service
+in background taps: at `81290cc` every `item-api` call from `tap_cron` answered
+`ERR_NO_SERVICES` (-10), so the sync minted no device Item. The entries below are kept as written, as the record of
 what was met; this is what has changed since.
 
 - **Resolved in the kernel:** `G-SAVE-ITEM-BYPASSES-SERVICE` (`item-api` now
@@ -46,6 +48,23 @@ what was met; this is what has changed since.
   in which a chain exists and the movements view attributes the chained
   person's history to someone already merged away. **Decidable item:** a `db`
   host call that runs a short list of gated statements in one transaction.
+- **NEW, `G-DB-NULL-BINDS-AS-TEXT` [Medium]:** the `db` host binds a JSON null
+  as a text parameter (`crates/kernel/src/host/db.rs`, `bind_json_params`,
+  `Value::Null => query.bind(Option::<String>::None)`), a boolean as a boolean
+  and a number as an integer or float, and sqlx caches each prepared statement
+  per connection by its SQL text alone. So one statement whose placeholder gets
+  NULL on one call and a boolean or number on a later call, on the same
+  connection, sends the value's binary form for a parameter Postgres prepared
+  as text. Measured: `$1::boolean` given NULL, then `false`, failed with
+  `invalid input syntax for type boolean: ""` (`-12`). A number given after
+  NULL would be read as text bytes, which may parse to a different value
+  rather than fail. Met when 0.107 made the sync's own refreshes fire
+  `tap_item_update`, so one pass sent the whole-device write-back for every
+  device in a row. The plugin now binds the one such column as text and casts
+  it (`writeback.rs`, `counts_for_presence`); every other parameter it sends
+  already keeps one JSON type per placeholder. **Decidable item:** bind a null
+  without fixing its type, or key the statement cache by the parameter types
+  as well as the text.
 
 Seven findings are grouped under their own heading below: they were met during
 the first joint run of the daemon and the plugin against a live LAN
