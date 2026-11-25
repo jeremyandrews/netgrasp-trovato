@@ -377,7 +377,31 @@ pub fn tap_cron(input: CronInput) -> serde_json::Value {
         }
     };
 
-    serde_json::json!({ "sync": sync, "pruned": pruned })
+    // A merge re-points the merges into the person it removes as its last step;
+    // a merge stopped before that, or two merges overlapping, leave a chain this
+    // repairs. Nothing to do on almost every run.
+    let collapsed = match sync_host::collapse_person_merges() {
+        Ok(n) => {
+            if n > 0 {
+                host::log(
+                    "info",
+                    "netgrasp",
+                    &format!("re-pointed {n} merge records at the person kept"),
+                );
+            }
+            serde_json::json!(n)
+        }
+        Err(e) => {
+            host::log(
+                "warning",
+                "netgrasp",
+                &format!("tap_cron: merge collapse failed: {e}"),
+            );
+            serde_json::json!({ "error": e.to_string() })
+        }
+    };
+
+    serde_json::json!({ "sync": sync, "pruned": pruned, "collapsed": collapsed })
 }
 
 // ===========================================================================
@@ -389,11 +413,9 @@ pub fn tap_cron(input: CronInput) -> serde_json::Value {
 /// This is the write-back channel, and it is worth being precise about when it
 /// fires, because the sync loop's termination depends on it: `tap_item_update` is
 /// dispatched by `ItemService::update`, whose callers are the admin content
-/// routes and the JSON item routes. The `save-item` host function the sync pass
-/// uses calls `Item::update` **directly**, so a plugin's own write does not
-/// arrive here (`DESIGN.md` Drift 3). The loop therefore has no edge to traverse.
-///
-/// It would still terminate if that changed, because
+/// routes, the JSON item routes and, since kernel 0.107, the `save-item` host
+/// function the sync pass uses (`DESIGN.md` Drift 3). So the plugin's own write
+/// arrives here too, and the loop still terminates, because
 /// [`netgrasp_core::writeback::build_update`] cannot emit `sync_state` and so
 /// cannot mark a row for re-sync.
 #[plugin_tap]
@@ -420,8 +442,9 @@ pub fn tap_item_update(input: serde_json::Value) -> serde_json::Value {
 
 /// Mirror a newly created person into `ng_people`.
 ///
-/// Devices are not handled here: a device Item is created by the sync pass
-/// through `save-item`, which fires no taps, and an admin creating one by hand
+/// Devices are not handled here: a device Item minted by the sync pass is
+/// linked to its row by the sync itself, after `save-item` returns its id (the
+/// tap fires before that, since kernel 0.107), and an admin creating one by hand
 /// has nothing to write back to (no daemon row carries its id yet). The next
 /// daemon sighting of that MAC creates the real row, and the pairing is the
 /// operator's to make.
@@ -2880,9 +2903,18 @@ mod tests {
         };
         let kernel = field("version");
         let rev = field("rev");
+        let image_tag = field("image");
         assert!(
-            !kernel.is_empty() && !rev.is_empty(),
-            "kernel-release.toml has no version and rev"
+            !kernel.is_empty() && !rev.is_empty() && !image_tag.is_empty(),
+            "kernel-release.toml has no version, rev and image"
+        );
+        // A release pin runs the image tagged with its version; a commit pin
+        // runs the nightly built from that commit, by digest, and nothing else.
+        let nightly = format!("nightly-{}@sha256:", rev.get(..7).unwrap_or_default());
+        assert!(
+            image_tag == kernel || image_tag.starts_with(&nightly),
+            "kernel-release.toml image `{image_tag}` is neither the release {kernel} \
+             nor the nightly of {rev} by digest; run scripts/sync-kernel-release.sh"
         );
 
         // Both dependency lines, and nothing else, carry the rev.
@@ -2904,7 +2936,7 @@ mod tests {
              run scripts/sync-kernel-release.sh"
         );
 
-        let image = format!("image: ghcr.io/jeremyandrews/trovato:{kernel}");
+        let image = format!("image: ghcr.io/jeremyandrews/trovato:{image_tag}");
         assert!(
             compose.contains(&image),
             "docker-compose.demo.yml does not run `{image}`; \
@@ -2922,7 +2954,7 @@ mod tests {
             rev.clone(),
             kernel.clone(),
             format!("({major}, {minor})"),
-            format!("ghcr.io/jeremyandrews/trovato:{kernel}"),
+            format!("ghcr.io/jeremyandrews/trovato:{image_tag}"),
         ] {
             assert!(
                 block.contains(&needed),
@@ -3317,18 +3349,20 @@ mod tests {
         }
     }
 
-    /// The kernel the demo runs is a PINNED published release, and the manifest
-    /// must be loadable by it.
+    /// The kernel the demo runs is PINNED, and the manifest must be loadable by
+    /// it.
     ///
     /// The kernel.s rule (`PluginInfo::check_api_compatibility`) is plugin major
     /// == kernel major and plugin minor <= kernel minor, so a manifest runs
     /// unchanged on any later `0.x` kernel. That is a fact worth pinning rather
     /// than rediscovering: the sibling test above ties `api_version` and the
-    /// demo image to the release authored in `kernel-release.toml`, and without
-    /// this one nothing says the released kernel in the demo can still load it.
+    /// demo image to the pin authored in `kernel-release.toml`, and without
+    /// this one nothing says the kernel in the demo can still load it.
     ///
-    /// `latest` is rejected on purpose. A demo whose kernel changes underneath
-    /// it is a demo that breaks with no commit to blame.
+    /// `latest` and a bare `nightly` are rejected on purpose, and so is a
+    /// nightly without a digest. A demo whose kernel changes underneath it is a
+    /// demo that breaks with no commit to blame. The kernel's version is read
+    /// from `kernel-release.toml`, because a nightly's tag does not carry it.
     #[test]
     fn the_demo_kernel_is_a_pinned_release_that_can_load_this_manifest() {
         let image = demo_compose()
@@ -3342,8 +3376,21 @@ mod tests {
             image != "latest" && image != "nightly",
             "the demo kernel must be a pinned version, not '{image}'"
         );
+        if image.starts_with("nightly") {
+            assert!(
+                image.contains("@sha256:"),
+                "a nightly demo kernel must be pinned by digest, not '{image}'"
+            );
+        }
 
-        let mut kernel = image.split('.');
+        let release = include_str!("../../../kernel-release.toml");
+        let version = release
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("version = "))
+            .expect("kernel-release.toml declares no version")
+            .trim()
+            .trim_matches('"');
+        let mut kernel = version.split('.');
         let kernel_major: u32 = kernel.next().unwrap().parse().expect("kernel major");
         let kernel_minor: u32 = kernel.next().unwrap().parse().expect("kernel minor");
 

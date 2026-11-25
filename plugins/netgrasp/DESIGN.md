@@ -54,6 +54,13 @@ and leaves the one that actually decides it.
 
 ### Drift 3 — `tap_item_update` does not fire on a plugin's own `save-item`
 
+> **Kernel 0.107 closed this drift.** `save-item` and `delete-item` now go
+> through `ItemService` and fire the item taps, this plugin's own included, so
+> the cron sync's title refresh reaches the write-back. The loop still
+> terminates, by Decision 4's second property alone: the write-back never sets
+> `sync_state = 'dirty'`, and the host-in-the-loop suite drives the sync through
+> the real kernel at the pinned revision. What follows is the 0.102 analysis.
+
 Same cause, and it is the most consequential of the three. `tap_item_update` is
 dispatched from exactly one place, `ItemService::update`
 (`item_service.rs:553`, plus the revision-revert path at `:1398`). Its callers are
@@ -219,8 +226,9 @@ SQL, so the two derivations cannot drift.
 
 Termination, twice over:
 
-1. *By contract* (Drift 3): the cron sync's `save-item` cannot dispatch
-   `tap_item_update`, so the loop has no edge to traverse.
+1. *By contract* (Drift 3), up to kernel 0.106: the cron sync's `save-item`
+   could not dispatch `tap_item_update`, so the loop had no edge to traverse.
+   Kernel 0.107 routes `save-item` through `ItemService`, so this one is gone.
 2. *By discipline*, which is what survives if (1) is ever fixed: the write-back
    never sets `sync_state = 'dirty'`, so even a firing tap produces a `clean` row
    that the next sync pass does not select. And the title the sync would then

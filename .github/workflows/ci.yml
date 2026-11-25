@@ -450,6 +450,14 @@ jobs:
       - name: Shellcheck
         run: shellcheck scripts/*.sh
 
+      # The pin's provenance check and verify-demo's anonymous check decide
+      # whether a broken image or a leaking site passes, so each is tested
+      # against stand-ins that should and should not pass.
+      - name: The image provenance check
+        run: scripts/test-check-image-provenance.sh
+      - name: verify-demo's anonymous check
+        run: scripts/test-verify-demo-anonymous.sh
+
       # The tests scan docker-compose.demo.yml as text, which catches a wrong
       # search path but not a mis-indented one. `config` is the parser itself,
       # and it also resolves the YAML anchors the file uses to keep the cron key

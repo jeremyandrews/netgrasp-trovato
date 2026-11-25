@@ -82,9 +82,14 @@ fn call_host(
 /// Two behaviours of this host function are load-bearing for Netgrasp and worth
 /// stating where the call is made:
 ///
-/// 1. It calls `Item::update` / `Item::create` **directly**, not through
-///    `ItemService`, so it fires **no taps** — including `tap_item_update`. That
-///    is why the sync pass cannot trigger the write-back (`DESIGN.md` Drift 3).
+/// 1. Since kernel 0.107 it goes through `ItemService`, as the requesting user
+///    (or, from `tap_cron`, with the kernel authority the manifest's
+///    `item_background = true` grants), so it **fires the item taps**, this
+///    plugin's own `tap_item_presave` and `tap_item_update` included. A sync
+///    pass's title refresh therefore reaches the write-back. It cannot loop:
+///    the write-back writes user-owned columns only and never raises
+///    `sync_state`, so the daemon's dirty flag, which is the only thing that
+///    starts a sync, is untouched (`DESIGN.md` Drift 3).
 /// 2. `Item::update` reads `fields` as `input.fields.unwrap_or(current.fields)`,
 ///    so a payload carrying **no `fields` key at all** leaves the Item's fields
 ///    untouched. The sync's title refresh relies on that: it sends `id` and
@@ -115,8 +120,8 @@ pub fn get_item(id: &str) -> Result<Value, i32> {
 
 /// Delete one Item by id.
 ///
-/// The kernel treats "no such Item" as success, so this cannot report whether
-/// anything was there — the caller checks first if it needs to know.
+/// Since kernel 0.107 "no such Item" is `ERR_ITEM_NOT_FOUND` (-62) rather
+/// than success; every caller here has just loaded the Item it deletes.
 ///
 /// The third `item-api` binding this file carries, and the one the assistant
 /// added: deleting a person is the only thing Netgrasp does that removes an
@@ -124,10 +129,11 @@ pub fn get_item(id: &str) -> Result<Value, i32> {
 /// **G-SDK-NO-ITEM** again — the SDK still ships no binding for this interface,
 /// so the extern is declared here beside the other two.
 ///
-/// Like `save-item`, it calls `Item::delete` **directly** rather than through
-/// `ItemService`, so it fires **no `tap_item_delete`**. That is why the person
-/// delete path calls [`crate::sync_host::retire_person`] itself: the tap that
-/// would normally clear the owners and drop the mirror row is never dispatched.
+/// Like `save-item`, it goes through `ItemService` since kernel 0.107, so it
+/// fires `tap_item_delete`, this plugin's own included. The person delete path
+/// still calls [`crate::sync_host::retire_person`] itself, first, so the owners
+/// are cleared and the mirror row is gone before the one step with no undo;
+/// the tap then repeats both, and both are idempotent.
 ///
 /// # Errors
 ///

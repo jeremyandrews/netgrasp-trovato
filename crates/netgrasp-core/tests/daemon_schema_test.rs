@@ -170,7 +170,7 @@ async fn query_rows<T: DeserializeOwned>(
     sql: &str,
     params: &[Value],
 ) -> Vec<T> {
-    let rows = bind_json(params, sqlx::query(sql))
+    let rows = bind_json(params, sqlx::query(sqlx::AssertSqlSafe(sql)))
         .fetch_all(&mut *conn)
         .await
         .unwrap_or_else(|e| panic!("query failed: {e}\n{sql}"));
@@ -181,7 +181,7 @@ async fn query_rows<T: DeserializeOwned>(
 
 /// The plugin's `db::exec`, over a real connection.
 async fn exec(conn: &mut PgConnection, sql: &str, params: &[Value]) -> u64 {
-    bind_json(params, sqlx::query(sql))
+    bind_json(params, sqlx::query(sqlx::AssertSqlSafe(sql)))
         .execute(&mut *conn)
         .await
         .unwrap_or_else(|e| panic!("statement failed: {e}\n{sql}"))
@@ -209,18 +209,22 @@ async fn scratch(test: &str, ddl: &str) -> PgConnection {
     let mut conn = PgConnection::connect(&url).await.expect("connect test DB");
 
     let schema = format!("ng_fx_{}_{test}", std::process::id());
-    conn.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .unwrap();
-    conn.execute(format!("CREATE SCHEMA {schema}").as_str())
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .await
+    .unwrap();
+    conn.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .await
         .unwrap();
     // Unqualified table names in the plugin's statements resolve here. `public`
     // stays on the path for extensions only.
-    conn.execute(format!("SET search_path TO {schema}, public").as_str())
-        .await
-        .unwrap();
-    sqlx::raw_sql(ddl)
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO {schema}, public"
+    )))
+    .await
+    .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
         .execute(&mut conn)
         .await
         .unwrap_or_else(|e| panic!("apply schema for {test}: {e}"));
@@ -788,9 +792,9 @@ async fn daemon_snapshot(conn: &mut PgConnection, id: i64) -> BTreeMap<String, O
         .map(|c| format!("{c}::text AS {c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {projection} FROM ng_devices WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(&mut *conn)
     .await
@@ -1231,10 +1235,10 @@ async fn the_name_search_looks_in_every_column_a_name_could_be_in() {
         ("aa:bb:cc:00:01:03", "hostname", "kitchen-pi.lan"),
         ("aa:bb:cc:00:01:04", "mdns_name", "LivingRoomTV"),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO ng_devices (mac, {column}, state, first_seen_at, last_seen_at) \
              VALUES ($1, $2, 'online', to_timestamp($3), to_timestamp($3))"
-        ))
+        )))
         .bind(mac)
         .bind(value)
         .bind(now as f64)
@@ -2274,23 +2278,27 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
     let mut conn = daemon_db(test).await;
     let schema = format!("ng_fx_{}_{test}", std::process::id());
     let role = format!("ng_fx_kernel_{}", std::process::id());
-    conn.execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+    conn.execute(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
         .await
         .ok();
-    conn.execute(format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER").as_str())
-        .await
-        .unwrap();
-    conn.execute(format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}").as_str())
-        .await
-        .unwrap();
-    conn.execute(format!("SET ROLE {role}").as_str())
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER"
+    )))
+    .await
+    .unwrap();
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}"
+    )))
+    .await
+    .unwrap();
+    conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
         .await
         .unwrap();
 
-    let applied = sqlx::raw_sql(&format!(
+    let applied = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "{PLUGIN_MIGRATION}\n{NOTIFY_MIGRATION}\n{DROP_DUPLICATE_INDEXES}\n{ONE_PERSON_PER_NAME}\n\
          {PRESENCE_SCHEMA}\n{PRESENCE_SCHEMA}"
-    ))
+    )))
     .execute(&mut conn)
     .await;
 
@@ -2298,10 +2306,10 @@ async fn the_schema_migrations_apply_as_a_role_that_owns_no_daemon_table() {
     let presence = unique_indexes_on(&mut conn, test, "ng_presence").await;
     let location = unique_indexes_on(&mut conn, test, "ng_location_history").await;
     let people = unique_indexes_on(&mut conn, test, "ng_people").await;
-    conn.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+    conn.execute(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .await
         .unwrap();
-    conn.execute(format!("DROP ROLE {role}").as_str())
+    conn.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
         .await
         .unwrap();
 
@@ -2330,7 +2338,7 @@ async fn mirror(conn: &mut PgConnection, item_id: &str, name: &str) -> Result<u6
         "fields": {},
     }))
     .unwrap();
-    bind_json(&params, sqlx::query(&sql))
+    bind_json(&params, sqlx::query(sqlx::AssertSqlSafe(sql.as_str())))
         .execute(&mut *conn)
         .await
         .map(|r| r.rows_affected())
@@ -2484,7 +2492,7 @@ const MOVEMENTS_BY_PERSON_INDEX: &str =
 async fn plan_without_seqscan(conn: &mut PgConnection, sql: &str, params: &[Value]) -> String {
     conn.execute("SET enable_seqscan = off").await.unwrap();
     let explain = format!("EXPLAIN {sql}");
-    let lines: Vec<String> = bind_json(params, sqlx::query(&explain))
+    let lines: Vec<String> = bind_json(params, sqlx::query(sqlx::AssertSqlSafe(explain.as_str())))
         .fetch_all(&mut *conn)
         .await
         .unwrap()
@@ -2971,10 +2979,16 @@ async fn the_event_views_list_what_the_table_does_up_to_their_bound() {
     .await;
 
     async fn ids(conn: &mut PgConnection, sql: &str) -> Vec<i64> {
-        sqlx::query_scalar(sql).fetch_all(conn).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(conn)
+            .await
+            .unwrap()
     }
     async fn count(conn: &mut PgConnection, sql: &str) -> i64 {
-        sqlx::query_scalar(sql).fetch_one(conn).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(conn)
+            .await
+            .unwrap()
     }
 
     // The event log: the newest 10,000, in the table's order.
@@ -3116,7 +3130,7 @@ async fn the_person_mirror_carries_track_presence() {
             },
         }))
         .unwrap();
-        bind_json(&params, sqlx::query(&sql))
+        bind_json(&params, sqlx::query(sqlx::AssertSqlSafe(sql.as_str())))
             .execute(&mut conn)
             .await
             .unwrap();
@@ -3130,7 +3144,7 @@ async fn the_person_mirror_carries_track_presence() {
         "fields": {"field_notify_arrive": true},
     }))
     .unwrap();
-    bind_json(&params, sqlx::query(&sql))
+    bind_json(&params, sqlx::query(sqlx::AssertSqlSafe(sql.as_str())))
         .execute(&mut conn)
         .await
         .unwrap();
@@ -3186,10 +3200,13 @@ async fn the_three_presence_choices_round_trip_through_the_device_column() {
         let mut item = device_item(ITEM_A, "Demo phone");
         item["fields"]["field_counts_for_presence"] = json!({"value": choice.as_value()});
         let stmt = build_update(ITEM_A, &overlay_from_item(&item).unwrap(), None).unwrap();
-        bind_json(&stmt.params, sqlx::query(&stmt.sql))
-            .execute(&mut conn)
-            .await
-            .unwrap();
+        bind_json(
+            &stmt.params,
+            sqlx::query(sqlx::AssertSqlSafe(stmt.sql.as_str())),
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
         let row = read(&mut conn, id).await;
         assert_eq!(
             PresenceChoice::from_override(row.counts_for_presence),
@@ -3213,10 +3230,13 @@ async fn the_three_presence_choices_round_trip_through_the_device_column() {
             ["counts_for_presence"],
             "the edit wrote more than its column"
         );
-        bind_json(&stmt.params, sqlx::query(&stmt.sql))
-            .execute(&mut conn)
-            .await
-            .unwrap();
+        bind_json(
+            &stmt.params,
+            sqlx::query(sqlx::AssertSqlSafe(stmt.sql.as_str())),
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
         let row = read(&mut conn, id).await;
         assert_eq!(
             PresenceChoice::from_override(row.counts_for_presence),

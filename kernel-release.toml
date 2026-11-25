@@ -2,9 +2,9 @@
 # Everything else that names the release is written from here by
 # scripts/sync-kernel-release.sh and checked by the test suite.
 #
-# Derived: the tag is "v" plus version, api_version in the plugin manifest is the
-# major and minor of version, KERNEL_API_VERSION is those two as a pair, and the
-# demo image is ghcr.io/jeremyandrews/trovato: plus version. The rev is written
+# Derived: api_version in the plugin manifest is the major and minor of version,
+# KERNEL_API_VERSION is those two as a pair, and the demo image is
+# ghcr.io/jeremyandrews/trovato: plus image. The rev is written
 # onto both dependency lines, trovato-sdk and the trovato-kernel dev dependency,
 # which cargo requires as literals and which must stay equal: a plugin compiled
 # against one kernel revision and tested against another is testing nothing.
@@ -12,8 +12,17 @@
 # This is NOT the plugin's own version. That is [workspace.package] version in
 # Cargo.toml, it is semantic from 1.0.0 on, and it moves independently.
 #
-# To move the pin: scripts/sync-kernel-release.sh --set-version X.Y.Z, which
-# resolves the tag to its commit and rewrites every location. Then rebuild for
-# wasm32-wasip1 and reinstall against a kernel built from the same revision.
-version = "0.102.0"
-rev = "ca76a9603d3a9f4c94bb284e9e9dd9ae52cc3f74"
+# Two kinds of pin:
+#
+#   a release   scripts/sync-kernel-release.sh --set-version X.Y.Z
+#               rev is the commit tag vX.Y.Z points at; image is X.Y.Z.
+#   a commit    scripts/sync-kernel-release.sh --set-commit <sha on main>
+#               version is the [workspace.package] version that commit declares;
+#               image is nightly-<short sha>@<digest>, refused unless the image's
+#               build provenance names exactly that commit on both platforms.
+#
+# Either rewrites every location. Then rebuild for wasm32-wasip1 and reinstall
+# against a kernel built from the same revision.
+version = "0.107.0"
+rev = "7815b39acbbac0e9f6d0c1fabfda961ad4e0658e"
+image = "nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd"

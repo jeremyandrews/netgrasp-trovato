@@ -23,6 +23,83 @@ Compatibility section has the table.
 
 ### Changed
 
+**Built and tested against Trovato `main` at `7815b39` (0.107.0, plugin API
+`(0, 107)`), not 0.102.0.** No Trovato release after 0.104.0 has been tagged,
+so `kernel-release.toml` can now pin a commit: `scripts/sync-kernel-release.sh
+--set-commit <sha>` reads the version that commit declares and pins the
+`nightly-<short sha>` image by digest, refusing it unless the build
+provenance of both its linux/amd64 and linux/arm64 images names that commit
+(`scripts/check-image-provenance.sh`, tested in CI against stand-in images
+that lack one platform's provenance or name another commit). The SDK, the `trovato-kernel` dev
+dependency, `api_version` and the demo image all name the one revision, and
+the drift guard tests now check the image as well. The test suite moved to
+sqlx 0.9, the kernel's.
+
+**Everything the kernel changed underneath the plugin, met at the plugin's
+layer.**
+- `item-api` now acts as the requesting user and refuses a background caller
+  (-61) unless the manifest declares `item_background = true`, which it now
+  does, for `tap_cron`'s sync. The pin is `7815b39` and not the earlier
+  `81290cc` because before it the kernel never bound the item service for
+  background taps, so every `save-item` from `tap_cron` answered -10 and the
+  sync minted no device Item.
+- `save-item` from the sync now fires `tap_item_update`, so one sync pass
+  sends the whole-device write-back for every device it refreshes, one after
+  another. The `db` host binds a JSON null as text and caches statements per
+  connection by their text, so the write-back's "counts towards presence"
+  column, NULL for one device and `false` for the next, failed on the second
+  with an invalid boolean (`-12`) and that edit was not written back. The
+  plugin now binds that column as text and casts it; a test sends both on one
+  connection. The kernel side is `FRICTION.md` `G-DB-NULL-BINDS-AS-TEXT`.
+- A gather's `items_per_page` is optional (absent is the site's setting).
+  Every netgrasp gather names its own, so pages are unchanged; the test that
+  plans each gather's query now says so if one ever leaves it out.
+- Raw SQL passes the kernel's parser gate: `execute-raw` takes exactly one
+  INSERT, UPDATE or DELETE. The person merge recorded itself with one
+  statement of writable `WITH` clauses, which the gate refuses, and the `db`
+  host holds no transaction across calls. The merge now records its own row
+  and retires the merged person's mirror row (each undone if a later step
+  fails), and only after the merged person's Item is gone points the merges
+  earlier made into them at the person kept, with one collapse statement that
+  `tap_cron` also runs every time. Re-pointing them first, from a list read
+  beforehand, would have missed a merge into the same person finishing
+  meanwhile, and a request stopped part way would have moved older movements
+  for a merge that never happened; either now leaves at most a chain the next
+  collapse repairs. A new test runs every statement in `queries::ALL`, and
+  every generated write-back, through the pinned kernel's own gate, and
+  another holds every call site to the host call the gate checked it for: a
+  read sent through `exec` is refused at run time.
+- A write that sets `status` needs `publish content`. The kernel grants it to
+  existing creator roles; `024` grants it to `network_admin` on a new install,
+  where the kernel migrates before the role exists.
+- `save-item` and `delete-item` now fire the item taps, the plugin's own
+  included. `DESIGN.md` Drift 3 and the comments that relied on the old
+  behaviour say so; the sync still cannot loop, because the write-back never
+  raises `sync_state`.
+- The front page renders `/overview` in place rather than redirecting to it
+  (kernel B122), and the theme ends the menu at a new element;
+  `verify-demo.sh` accepts both.
+
+**Anonymous visitors get the login page, and no device data on any path.**
+Probed with no session against kernel 0.104.0 with plugin 1.2.0, and again on
+0.107: device Item pages, `/api/items`, `/api/v1/items`, item autocomplete,
+search, and the JSON of the new-devices and movements gathers all answered 200
+with MAC addresses, addresses or device names in them. `tap_field_access` only
+reaches declared fields, and a published Item is viewable by anyone holding
+`access content` before any plugin is asked. `025` takes `access content` from
+the anonymous role. Every netgrasp page then redirects a visitor with no
+session to the login page, every API answers 401, 403 or 404 or an empty list,
+and signed-in users see exactly what they did. The kernel's new `search
+content` permission is granted by its own migration to every role holding
+`access content`, which on an upgrade or a new install still includes the
+anonymous role when it runs, so `026` takes that from the anonymous role too.
+The README gives the statement that restores the old open view. `access content` is site-wide, so
+anything else published on the same Trovato site stops being public too; the
+kernel offers no narrower lever for a published Item, and Netgrasp runs on a
+site of its own. `verify-demo.sh`'s anonymous check now also fails on a server
+error and on a seeded person's or device's name, not only on a MAC address,
+and is tested in CI against a stand-in site that leaks each way.
+
 **The plugin's tests know netgraspd V8's three event indexes, and prove the
 pages that need them read them.** Activity, /events/new-devices, the Alerts
 page's "Recently sent" and the deep pages of /events/security read the whole

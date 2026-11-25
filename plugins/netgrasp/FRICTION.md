@@ -18,6 +18,54 @@ Verified against the kernel API this repository pins, `(0, 102)`
 kernel-migration change** in the build session. The design decisions these
 findings forced are argued in `DESIGN.md`.
 
+## Status at kernel 0.107 (`7815b39`)
+
+Re-checked when the pin moved from 0.102.0 to Trovato `main` at `81290cc`
+(plugin API `(0, 107)`), and again at `7815b39`, which binds the item service
+in background taps: at `81290cc` every `item-api` call from `tap_cron` answered
+`ERR_NO_SERVICES` (-10), so the sync minted no device Item. The entries below are kept as written, as the record of
+what was met; this is what has changed since.
+
+- **Resolved in the kernel:** `G-SAVE-ITEM-BYPASSES-SERVICE` (`item-api` now
+  writes through `ItemService` and fires the item taps; `DESIGN.md` Drift 3 is
+  updated), `G-ASSISTANT-TEMPERATURE-ALWAYS-SENT` (temperature is unset unless a
+  site sets one, so current Claude models work), `G-PROVIDER-ERROR-BODY-DISCARDED`
+  and `G-PROVIDER-TEST-ACCEPTS-404` (the same kernel change).
+- **Resolved, binding kept:** the SDK now binds `get_item`, `save_item` and
+  `delete_item` (`G-SDK-NO-ITEM`, `G-ITEM-API-NO-DELETE-BINDING`). The import
+  signatures did not change, so `item_host.rs` is left as it is.
+- **NEW, `G-DB-NO-MULTI-STATEMENT-WRITE` [Medium]:** the raw SQL gate
+  (`crates/kernel/src/host/sql_guard.rs`, `check_execute_raw`) admits exactly
+  one INSERT, UPDATE or DELETE, and `check_query_raw` refuses a writable `WITH`.
+  That was the only way a plugin could make several row changes commit
+  together: the `db` host runs each call in its own transaction and has no way
+  to hold one open. The person merge's record is now separate statements with
+  compensating undo (`assist_host.rs`, `record_merge`), and the re-point of
+  earlier merges moved after the merge's last step into an idempotent collapse
+  that `tap_cron` repeats (`queries::COLLAPSE_PERSON_MERGES`), because a
+  statement-at-a-time re-point can neither see a merge finishing alongside it
+  nor be undone if the request stops between statements. The cost is a window
+  in which a chain exists and the movements view attributes the chained
+  person's history to someone already merged away. **Decidable item:** a `db`
+  host call that runs a short list of gated statements in one transaction.
+- **NEW, `G-DB-NULL-BINDS-AS-TEXT` [Medium]:** the `db` host binds a JSON null
+  as a text parameter (`crates/kernel/src/host/db.rs`, `bind_json_params`,
+  `Value::Null => query.bind(Option::<String>::None)`), a boolean as a boolean
+  and a number as an integer or float, and sqlx caches each prepared statement
+  per connection by its SQL text alone. So one statement whose placeholder gets
+  NULL on one call and a boolean or number on a later call, on the same
+  connection, sends the value's binary form for a parameter Postgres prepared
+  as text. Measured: `$1::boolean` given NULL, then `false`, failed with
+  `invalid input syntax for type boolean: ""` (`-12`). A number given after
+  NULL would be read as text bytes, which may parse to a different value
+  rather than fail. Met when 0.107 made the sync's own refreshes fire
+  `tap_item_update`, so one pass sent the whole-device write-back for every
+  device in a row. The plugin now binds the one such column as text and casts
+  it (`writeback.rs`, `counts_for_presence`); every other parameter it sends
+  already keeps one JSON type per placeholder. **Decidable item:** bind a null
+  without fixing its type, or key the statement cache by the parameter types
+  as well as the text.
+
 Seven findings are grouped under their own heading below: they were met during
 the first joint run of the daemon and the plugin against a live LAN
 (`docs/JOINT-RUN.md`), and every one of them is in the kernel rather than in

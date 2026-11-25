@@ -10,9 +10,10 @@
 # below check: the overview's own page element, its figures, and the seeded
 # people by name.
 #
-# It checks the redirect too. The kernel renders only an item front page inline
-# and redirects every other path, so `/` answering 307 to /overview is what
-# "the front page is the overview" means.
+# It checks the front page too. Since kernel 0.107 (B122) the configured front
+# page is rendered at `/` with no redirect, so "the front page is the overview"
+# means `/` answers 200 with the overview's own page element. Before that, `/`
+# answered 307 to /overview; either is accepted, so this runs against both.
 #
 # Run it against the Docker demo once `docker compose -f docker-compose.demo.yml
 # up` has finished its first run, or against scripts/serve-demo.sh --seed. It
@@ -43,24 +44,36 @@ fail() {
 
 echo "==> verifying the demo at $BASE"
 
-# The front page redirect.
-redirect="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/")"
-case "$redirect" in
-    "307 "*/overview) echo "    / redirects to /overview" ;;
-    *) fail "/ answered '$redirect', not a 307 to /overview" ;;
+# Anonymous: no device data on any page or API, and the login page instead.
+# 013 emptied the rows of every netgrasp gather for a visitor without
+# `view netgrasp devices`; 025 takes `access content` from the anonymous role,
+# because Item pages, the item and search APIs and two gathers' JSON served
+# device data that no field decision reaches.
+#
+# A refusal may be a redirect, 401, 403 or 404, and a search may answer 200
+# with nothing in it, so the status alone proves nothing either way; what it
+# must never be is a server error, which would hide whatever the page would
+# have shown. The body must name none of the seeded people or devices and
+# carry no MAC address.
+SEEDED='([0-9a-f]{2}:){5}[0-9a-f]{2}|Jamie|Aurora|Hallway smart plug|Chromecast|Arlo|motivo'
+for path in / /devices/online /item/5eed0000-0000-4000-8000-0000000000d1 \
+    /api/items/ng_device /api/v1/items/ng_device "/api/v1/search?q=motivo" \
+    "/api/v1/items/autocomplete?type=ng_device&q=a" \
+    /api/v1/query/ng_devices_new/execute /api/v1/query/ng_person_movements/execute; do
+    answer="$(curl -s -o "$PAGE" -w '%{http_code} %{redirect_url}' "$BASE$path" || true)"
+    case "$answer" in
+        5*|000*) fail "$path answered '$answer' to an anonymous visitor" ;;
+    esac
+    if grep -Eiq "$SEEDED" "$PAGE"; then
+        fail "an anonymous visitor can read device data on $path ($answer)"
+    fi
+done
+answer="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/devices/online")"
+case "$answer" in
+    30[0-9]" "*/user/login*) ;;
+    *) fail "/devices/online answered '$answer' to an anonymous visitor, not the login page" ;;
 esac
-
-# The overview itself, rendered by netgrasp's template.
-# Anonymous: the page answers, and carries no device data at all. A gather has
-# no permission of its own, so before 013 this returned every MAC on the network.
-code="$(curl -s -o "$PAGE" -w '%{http_code}' "$BASE/devices/online")"
-[ "$code" = "200" ] || fail "/devices/online answered $code to an anonymous visitor"
-if grep -Eiq '([0-9a-f]{2}:){5}[0-9a-f]{2}' "$PAGE"; then
-    fail "an anonymous visitor can read MAC addresses on /devices/online"
-fi
-grep -q 'Sign in to see the devices on this network.' "$PAGE" \
-    || fail "/devices/online does not ask an anonymous visitor to sign in"
-echo "    an anonymous visitor sees no MAC address, and is asked to sign in"
+echo "    an anonymous visitor reads no device data anywhere, and is sent to sign in"
 
 # Sign in, through the kernel's own form and its token.
 token="$(curl -s -c "$JAR" "$BASE/user/login" \
@@ -74,6 +87,19 @@ code="$(curl -s -b "$JAR" -c "$JAR" -o /dev/null -w '%{http_code}' \
 case "$code" in
     30*) echo "    signed in as $ADMIN_USER" ;;
     *) fail "signing in as $ADMIN_USER answered $code" ;;
+esac
+
+# The front page is the overview: rendered in place (kernel 0.107, B122) or,
+# on an older kernel, a redirect to it.
+redirect="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code} %{redirect_url}' "$BASE/")"
+case "$redirect" in
+    "307 "*/overview) echo "    / redirects to /overview" ;;
+    "200 ")
+        grep -q 'class="ng-page ng-page--ng_overview' "$PAGE" ||
+            fail "/ answered 200 but is not the overview"
+        echo "    / renders the overview"
+        ;;
+    *) fail "/ answered '$redirect', neither the overview nor a 307 to it" ;;
 esac
 
 code="$(curl -s -b "$JAR" -o "$PAGE" -w '%{http_code}' "$BASE/overview")"
@@ -105,9 +131,11 @@ echo "    /overview renders the overview, with the seeded people and devices"
 # The site menu: exactly Home, Devices, People, Alerts and Activity from netgrasp, in
 # that order, and none of the kernel's own entries (Translate, Post, Blog, Terms,
 # Media, a second Home). The menu is the `site-nav__link` anchors before the
-# divider; Login, Admin, Profile and Logout come after it and are the theme's.
+# account links (Login, Admin, Profile and Logout), which are the theme's: the
+# kernel's theme ends the menu at `site-nav__divider` up to 0.104 and at its own
+# `site-nav__account` list from 0.107, so either ends the range.
 curl -s -b "$JAR" -o "$PAGE" "$BASE/overview"
-menu="$(sed -n '/<nav class="site-nav"/,/site-nav__divider/p' "$PAGE" \
+menu="$(sed -En '/<nav class="site-nav"/,/site-nav__(divider|account)/p' "$PAGE" \
     | grep -o 'class="site-nav__link[^"]*"[^>]*>[^<]*' | sed 's/.*>//' | tr '\n' '|')"
 [ "$menu" = "Home|Devices|People|Alerts|Activity|" ] || fail "the site menu reads '$menu'"
 echo "    the menu reads Home, Devices, People, Alerts, Activity"

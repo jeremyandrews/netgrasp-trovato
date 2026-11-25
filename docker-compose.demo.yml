@@ -103,13 +103,14 @@ services:
   # ---------------------------------------------------------------------------
   # The kernel: published image, netgrasp mounted, install then serve.
   # ---------------------------------------------------------------------------
-  # The image tag is pinned rather than `latest` on purpose. A demo whose kernel
-  # moves underneath it breaks with no commit to blame. The plugin's manifest
-  # declares as api_version the major and minor of this image's version (0.102
-  # for 0.102.0). Both are written from kernel-release.toml by
+  # The image is pinned rather than `latest` on purpose: a release tag, or a
+  # nightly by digest between releases. A demo whose kernel moves underneath it
+  # breaks with no commit to blame. The plugin's manifest declares as
+  # api_version the major and minor of the pinned kernel version (0.107 for
+  # 0.107.0). Both are written from kernel-release.toml by
   # scripts/sync-kernel-release.sh, and a test asserts that pair.
   trovato:
-    image: ghcr.io/jeremyandrews/trovato:0.102.0
+    image: ghcr.io/jeremyandrews/trovato:nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd
     command:
       - /bin/sh
       - -c
