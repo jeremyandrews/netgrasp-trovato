@@ -21,6 +21,27 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-25
+
+Built against Trovato `main` at `7815b39` (0.107.0) instead of 0.102.0, with
+every kernel change underneath the plugin met at the plugin's layer, and a
+private site: a visitor who is not signed in gets the login page and no device
+data on any path.
+
+| | |
+|---|---|
+| Pairs with | netgraspd 1.2.0, `ng_` schema version 7 (unchanged) |
+| Built against | Trovato `main` `7815b39` (0.107.0), `trovato-sdk` revision `7815b39`, `KERNEL_API_VERSION` (0, 107) |
+| Manifest | `version = "1.3.0"`, `api_version = "0.107"` |
+| Runs on | Trovato `main` at `7815b39` or a later 0.x; 0.104.0 and earlier refuse the module |
+
+Deploy it with the kernel image it names (`kernel-release.toml`). The kernel
+migrates first, then migrations `024` to `026` run: `026` and `025` take
+`search content` and `access content` from the anonymous role, so check that
+nothing else on the site was meant to be public (the README's "Who sees device
+data" has the statement that opens it again). Kernel migrations are forward
+only; keep a database dump from before the upgrade to roll back.
+
 ### Changed
 
 **Built and tested against Trovato `main` at `7815b39` (0.107.0, plugin API
