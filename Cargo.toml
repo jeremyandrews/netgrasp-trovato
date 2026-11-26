@@ -46,7 +46,7 @@ repository = "https://github.com/jeremyandrews/netgrasp-trovato"
 #
 # Unlike the Ritrovo precedent, this points at the PUBLIC Trovato repository, so
 # no private-repository access is needed to build this repo.
-trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "7815b39acbbac0e9f6d0c1fabfda961ad4e0658e" }
+trovato-sdk = { git = "https://github.com/jeremyandrews/trovato.git", rev = "79258e8410771e2c09e4448ffaae44482a8ada1f" }
 
 netgrasp-core = { path = "crates/netgrasp-core" }
 
@@ -65,7 +65,7 @@ netgrasp-core = { path = "crates/netgrasp-core" }
 # The rev must equal the SDK's. A plugin tested against one kernel revision and
 # shipped against another is testing nothing; a test in src/lib.rs asserts the
 # two pins are the same string.
-trovato-kernel = { git = "https://github.com/jeremyandrews/trovato.git", rev = "7815b39acbbac0e9f6d0c1fabfda961ad4e0658e" }
+trovato-kernel = { git = "https://github.com/jeremyandrews/trovato.git", rev = "79258e8410771e2c09e4448ffaae44482a8ada1f" }
 
 # Required only because `RequestServices::for_background` takes a `reqwest::Client`
 # — the kernel's signature, not a choice this repo makes.

@@ -64,10 +64,26 @@ echo "    site name: $SITE_NAME"
 # redirects to /install; after it, /overview is a netgrasp gather on a private
 # site (025), so a visitor with no session is sent to the login page. A
 # redirect anywhere else, or any other answer, means the wizard, the plugin or
-# its migrations did not finish.
-answer="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/overview")"
+# its migrations did not finish. Up to kernel 0.104 the login page is a
+# redirect; from 0.105.0 (B156) a browser, asking with `Accept: text/html`, gets
+# a 403 "Access denied" page with the login form in it, so a 403 counts only
+# when that form is there.
+page="$(mktemp)"
+answer="$(curl -s -H 'Accept: text/html' -o "$page" -w '%{http_code} %{redirect_url}' \
+    "$BASE/overview")"
+login_form=no
+if grep -q 'action="/user/login"' "$page"; then
+    login_form=yes
+fi
+rm -f "$page"
 case "$answer" in
     30[0-9]" "*/user/login*) ;;
+    "403 ")
+        if [ "$login_form" != yes ]; then
+            echo "error: $BASE/overview answered 403 without the login form" >&2
+            exit 1
+        fi
+        ;;
     *)
         echo "error: $BASE/overview answered '$answer', not the login redirect" >&2
         exit 1

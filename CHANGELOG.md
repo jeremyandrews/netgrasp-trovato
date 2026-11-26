@@ -21,6 +21,10 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+- Built against Trovato `main` at `79258e8` (0.105.0, plugin API `(0, 105)`) instead of `7815b39` (numbered 0.107.0 before the 0.105.0 release renumbered it, so a manifest declaring `0.107` is refused by the new kernel). ([#PR])
+- `027_netgrasp_private_ai_search.sql` takes `use ai` from the anonymous role: the kernel's `20261130000001_grant_use_ai_to_searchers.sql` grants it to every role holding `search content`, which the anonymous role still holds on a new install until 026 runs. ([#PR])
+- The install check and `verify-demo.sh` accept the kernel's new answer to a visitor who is not signed in, a 403 page with the login form in it (a bare 401 to a caller not asking for HTML), as well as the old redirect to `/user/login`. ([#PR])
+
 ## [1.3.0] - 2026-11-25
 
 Built against Trovato `main` at `7815b39` (0.107.0) instead of 0.102.0, with

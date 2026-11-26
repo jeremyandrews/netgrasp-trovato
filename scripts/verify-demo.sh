@@ -68,9 +68,19 @@ for path in / /devices/online /item/5eed0000-0000-4000-8000-0000000000d1 \
         fail "an anonymous visitor can read device data on $path ($answer)"
     fi
 done
-answer="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/devices/online")"
+# A browser is shown the login page: up to kernel 0.104 as a redirect to it,
+# and from 0.105.0 (B156) as a 403 "Access denied" page that carries the login
+# form in place. Asked as a browser asks, with `Accept: text/html`; a caller
+# that does not ask for HTML gets a bare 401 from 0.105.0, which the loop above
+# already allows.
+answer="$(curl -s -H 'Accept: text/html' -o "$PAGE" -w '%{http_code} %{redirect_url}' \
+    "$BASE/devices/online")"
 case "$answer" in
     30[0-9]" "*/user/login*) ;;
+    "403 ")
+        grep -q 'action="/user/login"' "$PAGE" ||
+            fail "/devices/online answered 403 to an anonymous visitor without the login form"
+        ;;
     *) fail "/devices/online answered '$answer' to an anonymous visitor, not the login page" ;;
 esac
 echo "    an anonymous visitor reads no device data anywhere, and is sent to sign in"

@@ -7,7 +7,7 @@ description = "Network monitoring: devices, people, events and presence from the
 # load a module that disagrees, so this string and that `rev` move together; a
 # test in src/lib.rs asserts both against the workspace.
 version = "1.3.0"
-api_version = "0.107"
+api_version = "0.105"
 default_enabled = false
 dependencies = []
 
@@ -99,6 +99,7 @@ files = [
     "migrations/024_netgrasp_publish_content.sql",
     "migrations/025_netgrasp_private_site.sql",
     "migrations/026_netgrasp_private_search.sql",
+    "migrations/027_netgrasp_private_ai_search.sql",
 ]
 
 # Declared plugin capabilities (WASM-1, deny-unless-declared).
