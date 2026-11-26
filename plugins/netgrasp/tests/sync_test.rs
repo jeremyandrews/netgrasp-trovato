@@ -5144,11 +5144,13 @@ fn whole_device_write_backs_with_and_without_a_presence_choice_share_a_connectio
 }
 
 /// After every kernel and plugin migration, in the order a new install and an
-/// upgrade run them, the anonymous role holds none of the three permissions
-/// that would let a visitor with no session read or search device data:
-/// `view netgrasp devices` (013), `access content` (025) and the kernel's
-/// `search content`, which its own migration grants to every role holding
-/// `access content` before 025 runs (026).
+/// upgrade run them, the anonymous role holds none of the permissions that
+/// would let a visitor with no session read or search device data, or reach
+/// the AI provider: `view netgrasp devices` (013), `access content` (025), the
+/// kernel's `search content`, which its own migration grants to every role
+/// holding `access content` before 025 runs (026), and the kernel's `use ai`,
+/// which its own migration grants to every role holding `search content`
+/// before 026 runs (027).
 #[test]
 fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
     serial(async {
@@ -5156,8 +5158,8 @@ fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
         let held: Vec<String> = sqlx::query_scalar(
             "SELECT permission FROM role_permissions \
              WHERE role_id = '00000000-0000-0000-0000-000000000001' \
-             AND permission IN ('view netgrasp devices', 'access content', 'search content') \
-             ORDER BY 1",
+             AND permission IN ('view netgrasp devices', 'access content', 'search content', \
+             'use ai') ORDER BY 1",
         )
         .fetch_all(&pool)
         .await

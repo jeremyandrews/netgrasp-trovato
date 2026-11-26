@@ -110,7 +110,7 @@ services:
   # 0.107.0). Both are written from kernel-release.toml by
   # scripts/sync-kernel-release.sh, and a test asserts that pair.
   trovato:
-    image: ghcr.io/jeremyandrews/trovato:nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd
+    image: ghcr.io/jeremyandrews/trovato:nightly-79258e8@sha256:0eb0e8bbec064a18ddf1cfb4c53877d7be311854251ae5b96009c1b05ea1cebc
     command:
       - /bin/sh
       - -c

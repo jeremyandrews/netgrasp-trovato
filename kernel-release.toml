@@ -23,6 +23,6 @@
 #
 # Either rewrites every location. Then rebuild for wasm32-wasip1 and reinstall
 # against a kernel built from the same revision.
-version = "0.107.0"
-rev = "7815b39acbbac0e9f6d0c1fabfda961ad4e0658e"
-image = "nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd"
+version = "0.105.0"
+rev = "79258e8410771e2c09e4448ffaae44482a8ada1f"
+image = "nightly-79258e8@sha256:0eb0e8bbec064a18ddf1cfb4c53877d7be311854251ae5b96009c1b05ea1cebc"
