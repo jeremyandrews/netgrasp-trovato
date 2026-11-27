@@ -64,18 +64,23 @@ anyone holding `access content` before any plugin is asked), so run Netgrasp on
 a site of its own, as the overlay image and the demo do.
 
 `026_netgrasp_private_search.sql` takes `search content` from the anonymous
-role as well. The kernel gave search that permission of its own in 0.107, and
+role as well. The kernel gave search that permission of its own (B160), and
 its migration grants it to every role holding `access content`, which runs
-before 025 has taken that away.
+before 025 has taken that away. `027_netgrasp_private_ai_search.sql` does the
+same for `use ai`, the kernel's permission for AI search (B89b), which its
+migration grants to every role holding `search content` before 026 has taken
+that away.
 
-A wall screen or a trusted LAN that wants the old open view grants all three
-back. Run it once; the migrations never run a second time, so it will not be
-undone:
+A wall screen or a trusted LAN that wants the old open view grants all four
+back (`use ai` only if anonymous visitors may spend the site's AI provider
+tokens on AI search). Run it once; the migrations never run a second time, so
+it will not be undone:
 
 ```sql
 INSERT INTO role_permissions (role_id, permission)
 VALUES ('00000000-0000-0000-0000-000000000001', 'access content'),
        ('00000000-0000-0000-0000-000000000001', 'search content'),
+       ('00000000-0000-0000-0000-000000000001', 'use ai'),
        ('00000000-0000-0000-0000-000000000001', 'view netgrasp devices')
 ON CONFLICT DO NOTHING;
 ```
@@ -161,11 +166,11 @@ copy drifts.
 <!-- kernel-release:begin -->
 | | |
 |---|---|
-| pinned `rev` | `7815b39acbbac0e9f6d0c1fabfda961ad4e0658e` |
-| Trovato version | 0.107.0 |
-| `KERNEL_API_VERSION` | (0, 107) |
-| manifest `api_version` | `0.107` |
-| demo kernel image | `ghcr.io/jeremyandrews/trovato:nightly-7815b39@sha256:85ac4a03b9d165ac93fe7fb4dcfb5649de3e2259732d93252c6da8c83eb710dd` |
+| pinned `rev` | `10055f070a1a077d886f43525b88cc0bccac005f` |
+| Trovato version | 0.106.0 |
+| `KERNEL_API_VERSION` | (0, 106) |
+| manifest `api_version` | `0.106` |
+| demo kernel image | `ghcr.io/jeremyandrews/trovato:nightly-10055f0@sha256:28f3a61028fca026ebd57a065388cd3287bc0a339e144cfd4f0626bae99319e6` |
 <!-- kernel-release:end -->
 
 `api_version` is not chosen: it is the pinned version's major and minor, so it

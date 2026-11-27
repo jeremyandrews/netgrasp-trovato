@@ -5148,7 +5148,9 @@ fn whole_device_write_backs_with_and_without_a_presence_choice_share_a_connectio
 /// that would let a visitor with no session read or search device data:
 /// `view netgrasp devices` (013), `access content` (025) and the kernel's
 /// `search content`, which its own migration grants to every role holding
-/// `access content` before 025 runs (026).
+/// `access content` before 025 runs (026). Nor does it hold the kernel's
+/// `use ai`, which a later kernel migration grants to every role holding
+/// `search content` before 026 runs (027).
 #[test]
 fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
     serial(async {
@@ -5156,7 +5158,7 @@ fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
         let held: Vec<String> = sqlx::query_scalar(
             "SELECT permission FROM role_permissions \
              WHERE role_id = '00000000-0000-0000-0000-000000000001' \
-             AND permission IN ('view netgrasp devices', 'access content', 'search content') \
+             AND permission IN ('view netgrasp devices', 'access content', 'search content', 'use ai') \
              ORDER BY 1",
         )
         .fetch_all(&pool)
@@ -5167,12 +5169,15 @@ fn the_anonymous_role_can_neither_view_nor_read_nor_search() {
         let authenticated: Vec<String> = sqlx::query_scalar(
             "SELECT permission FROM role_permissions \
              WHERE role_id = '00000000-0000-0000-0000-000000000002' \
-             AND permission IN ('access content', 'search content') ORDER BY 1",
+             AND permission IN ('access content', 'search content', 'use ai') ORDER BY 1",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(authenticated, ["access content", "search content"]);
+        assert_eq!(
+            authenticated,
+            ["access content", "search content", "use ai"]
+        );
     });
 }
 

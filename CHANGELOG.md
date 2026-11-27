@@ -21,6 +21,19 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+### Changed
+
+- Built and tested against Trovato `main` at `10055f0` (0.106.0, plugin API `(0, 106)`), up from `7815b39`; the manifest declares `api_version = "0.106"` ([#44](https://github.com/jeremyandrews/netgrasp-trovato/pull/44)).
+- `first-run.sh` and `verify-demo.sh` accept the kernel's new answer to a visitor who is not signed in, a 403 page carrying the login form, as well as the old redirect ([#44](https://github.com/jeremyandrews/netgrasp-trovato/pull/44)).
+
+### Tests
+
+- `verify-demo.sh`'s anonymous check asks every path both as a script and as a browser, and every netgrasp gather's query endpoint rather than two. It fails on a 429 as well as a 5xx, and leaves the login form's echo of the requested address out of its scan ([#44](https://github.com/jeremyandrews/netgrasp-trovato/pull/44)).
+
+### Security
+
+- Migration `027` takes `use ai`, which a kernel migration now grants to every role holding `search content`, from the anonymous role ([#44](https://github.com/jeremyandrews/netgrasp-trovato/pull/44)).
+
 ## [1.3.0] - 2026-11-25
 
 Built against Trovato `main` at `7815b39` (0.107.0) instead of 0.102.0, with
