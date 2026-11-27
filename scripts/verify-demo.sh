@@ -53,24 +53,52 @@ echo "==> verifying the demo at $BASE"
 # A refusal may be a redirect, 401, 403 or 404, and a search may answer 200
 # with nothing in it, so the status alone proves nothing either way; what it
 # must never be is a server error, which would hide whatever the page would
-# have shown. The body must name none of the seeded people or devices and
-# carry no MAC address.
+# have shown, or a 429, whose empty body proves nothing about the page behind
+# it. The body must name none of the seeded people or devices and carry no MAC
+# address.
+#
+# Every path is asked for twice: as a script asks (no Accept header) and as a
+# browser asks (HTML). Since kernel B156 the two get different answers (a bare
+# 401, or a 403 page carrying the login form), and either body could carry what
+# the other does not.
+#
+# The login form carries the asked-for address back as its `destination`, so a
+# path whose query names a seeded word (the search below) would match itself.
+# That one value is the probe's own input, not the site's, and is left out of
+# the scan; nothing else in the body is.
+#
+# Every netgrasp gather is asked for through the query API, not a sample: a
+# gather has no permission of its own, so one whose rows escaped the field
+# decision would leak on its own endpoint and nowhere else.
 SEEDED='([0-9a-f]{2}:){5}[0-9a-f]{2}|Jamie|Aurora|Hallway smart plug|Chromecast|Arlo|motivo'
-for path in / /devices/online /item/5eed0000-0000-4000-8000-0000000000d1 \
-    /api/items/ng_device /api/v1/items/ng_device "/api/v1/search?q=motivo" \
-    "/api/v1/items/autocomplete?type=ng_device&q=a" \
-    /api/v1/query/ng_devices_new/execute /api/v1/query/ng_person_movements/execute; do
-    answer="$(curl -s -o "$PAGE" -w '%{http_code} %{redirect_url}' "$BASE$path" || true)"
-    case "$answer" in
-        5*|000*) fail "$path answered '$answer' to an anonymous visitor" ;;
-    esac
-    if grep -Eiq "$SEEDED" "$PAGE"; then
-        fail "an anonymous visitor can read device data on $path ($answer)"
-    fi
+GATHERS='ng_activity ng_device_by_owner ng_device_by_type ng_device_list
+    ng_device_online ng_devices_by_location ng_devices_hidden ng_devices_new
+    ng_devices_todo ng_event_by_device ng_event_log ng_event_new_devices
+    ng_event_security ng_overview ng_people_home ng_person_list
+    ng_person_movements ng_who_is_home'
+paths='/ /devices/online /item/5eed0000-0000-4000-8000-0000000000d1
+    /api/items/ng_device /api/v1/items/ng_device /api/v1/search?q=motivo
+    /api/v1/items/autocomplete?type=ng_device&q=a'
+for gather in $GATHERS; do
+    paths="$paths /api/v1/query/$gather/execute"
+done
+for path in $paths; do
+    for accept in '*/*' 'text/html'; do
+        answer="$(curl -s -o "$PAGE" -H "Accept: $accept" \
+            -w '%{http_code} %{redirect_url}' "$BASE$path" || true)"
+        case "$answer" in
+            5*|000*|429*)
+                fail "$path answered '$answer' to an anonymous visitor (Accept: $accept)" ;;
+        esac
+        if sed 's/name="destination" value="[^"]*"//g' "$PAGE" | grep -Eiq "$SEEDED"; then
+            fail "an anonymous visitor can read device data on $path ($answer, Accept: $accept)"
+        fi
+    done
 done
 # Asked for as a browser asks (HTML), the refusal is the login page: since
 # kernel B156 a 403 page with the login form in it, before it a redirect to
-# /user/login. A 403 without the form is not the login page.
+# /user/login. A 403 without the form is not the login page. The body was
+# scanned for device data above, with the same request.
 answer="$(curl -s -o "$PAGE" -H 'Accept: text/html' \
     -w '%{http_code} %{redirect_url}' "$BASE/devices/online")"
 case "$answer" in
@@ -81,6 +109,9 @@ case "$answer" in
         ;;
     *) fail "/devices/online answered '$answer' to an anonymous visitor, not the login page" ;;
 esac
+if sed 's/name="destination" value="[^"]*"//g' "$PAGE" | grep -Eiq "$SEEDED"; then
+    fail "an anonymous visitor can read device data on the login page for /devices/online"
+fi
 echo "    an anonymous visitor reads no device data anywhere, and is sent to sign in"
 
 # Sign in, through the kernel's own form and its token.

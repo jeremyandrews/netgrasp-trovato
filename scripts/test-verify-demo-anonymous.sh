@@ -5,8 +5,9 @@
 # A site that refuses a visitor everywhere, by a redirect to the login page or
 # by a 403 page carrying the login form, gets past the check (and then fails at
 # the sign-in, which the stand-in does not offer); a site that lists a seeded
-# device by name, answers with a server error, or refuses with a 403 that has no
-# login form in it, fails the check itself.
+# device by name (to a script, to a browser only, or on a single gather's
+# endpoint), answers with a server error or a 429, or refuses with a 403 that
+# has no login form in it, fails the check itself.
 #
 # Usage:
 #   scripts/test-verify-demo-anonymous.sh
@@ -44,8 +45,19 @@ class Site(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        html = "text/html" in self.headers.get("Accept", "")
         if path == "/user/login":
             return self.answer(200, "<form></form>")
+        # A refusal that is clean to a script and leaks to a browser.
+        if MODE == "htmlleak" and html:
+            return self.answer(
+                403, '<form action="/user/login" method="post"></form><p>Jamie\'s laptop</p>'
+            )
+        # A leak on one gather's endpoint and nowhere else.
+        if MODE == "gatherleak" and path == "/api/v1/query/ng_device_list/execute":
+            return self.answer(200, '{"rows":[{"title":"Hallway smart plug"}]}')
+        if MODE == "ratelimited" and path == "/api/v1/query/ng_event_log/execute":
+            return self.answer(429, "Too Many Requests")
         if path == LEAKY and MODE == "title":
             return self.answer(200, '{"data":[{"title":"Jamie\'s laptop"}]}')
         if path == LEAKY and MODE == "error":
@@ -56,6 +68,21 @@ class Site(http.server.BaseHTTPRequestHandler):
         # form on it, rather than a redirect to /user/login.
         if MODE == "login403":
             return self.answer(403, '<form action="/user/login" method="post"></form>')
+        # The login form hands the asked-for address back, query and all.
+        if MODE == "echo403":
+            return self.answer(
+                403,
+                '<form action="/user/login" method="post">'
+                f'<input type="hidden" name="destination" value="{self.path}"></form>',
+            )
+        # The same, with a seeded name in the page outside the destination.
+        if MODE == "echoleak":
+            return self.answer(
+                403,
+                '<form action="/user/login" method="post">'
+                f'<input type="hidden" name="destination" value="{self.path}"></form>'
+                "<p>Aurora</p>",
+            )
         if MODE == "bare403":
             return self.answer(403, "Access denied")
         return self.answer(303, "", "/user/login")
@@ -96,6 +123,11 @@ expect title "an anonymous visitor can read device data on /api/v1/items/ng_devi
 expect error "/api/v1/items/ng_device answered '500 ' to an anonymous visitor"
 expect login403 "the login form carries no token"
 expect bare403 "/devices/online answered 403 to an anonymous visitor with no login form in it"
+expect echo403 "the login form carries no token"
+expect echoleak "an anonymous visitor can read device data on / (403 , Accept: */*)"
+expect htmlleak "an anonymous visitor can read device data on / (403 , Accept: text/html)"
+expect gatherleak "an anonymous visitor can read device data on /api/v1/query/ng_device_list/execute"
+expect ratelimited "/api/v1/query/ng_event_log/execute answered '429 ' to an anonymous visitor"
 
 [ "$failures" -eq 0 ] || {
     echo "${failures} case(s) failed" >&2

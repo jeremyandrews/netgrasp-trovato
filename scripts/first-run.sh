@@ -68,23 +68,21 @@ echo "    site name: $SITE_NAME"
 # with the login form in it. A redirect anywhere else, or any other answer,
 # means the wizard, the plugin or its migrations did not finish.
 login_page="$(mktemp)"
+trap 'rm -f "$login_page"' EXIT
 answer="$(curl -s -o "$login_page" -H 'Accept: text/html' \
     -w '%{http_code} %{redirect_url}' "$BASE/overview")"
 case "$answer" in
     30[0-9]" "*/user/login*) ;;
     "403 ")
         grep -q 'action="/user/login' "$login_page" || {
-            rm -f "$login_page"
             echo "error: $BASE/overview answered 403 with no login form in it" >&2
             exit 1
         }
         ;;
     *)
-        rm -f "$login_page"
         echo "error: $BASE/overview answered '$answer', not the login page" >&2
         exit 1
         ;;
 esac
-rm -f "$login_page"
 
 echo "==> ready: $BASE/ is the overview, after signing in"
