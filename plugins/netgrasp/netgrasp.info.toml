@@ -6,7 +6,7 @@ description = "Network monitoring: devices, people, events and presence from the
 # major and minor of the Trovato version in kernel-release.toml. The kernel refuses to
 # load a module that disagrees, so this string and that `rev` move together; a
 # test in src/lib.rs asserts both against the workspace.
-version = "1.3.0"
+version = "1.4.0"
 api_version = "0.106"
 default_enabled = false
 dependencies = []

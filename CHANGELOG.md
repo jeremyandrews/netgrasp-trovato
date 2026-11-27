@@ -21,6 +21,23 @@ Compatibility section has the table.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-27
+
+Built against Trovato `main` at `10055f0` (0.106.0) instead of `7815b39`. Migration `027` keeps AI search from the anonymous role.
+
+| | |
+|---|---|
+| Pairs with | netgraspd 1.2.0, `ng_` schema version 7 (unchanged) |
+| Built against | Trovato `main` `10055f0` (0.106.0), `trovato-sdk` revision `10055f0`, `KERNEL_API_VERSION` (0, 106) |
+| Manifest | `version = "1.4.0"`, `api_version = "0.106"` |
+| Runs on | Trovato `main` at `10055f0` or a later 0.x; 0.105.0 refuses the module |
+
+Deploy it with the kernel image it names (`kernel-release.toml`), together: the
+kernel renumbered its unreleased 0.107 to 0.105, so `7815b39` and the 1.3.0
+module it ran do not pair with this release in either direction. The kernel
+migrates first, then `027` runs. Kernel migrations are forward only; keep a
+database dump from before the upgrade to roll back.
+
 ### Changed
 
 - Built and tested against Trovato `main` at `10055f0` (0.106.0, plugin API `(0, 106)`), up from `7815b39`; the manifest declares `api_version = "0.106"` ([#44](https://github.com/jeremyandrews/netgrasp-trovato/pull/44)).
