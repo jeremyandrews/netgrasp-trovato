@@ -2,9 +2,11 @@
 # Tests for the anonymous check at the top of scripts/verify-demo.sh, against a
 # stand-in site that answers each case's way. Needs bash, curl and python3.
 #
-# A site that refuses a visitor everywhere gets past the check (and then fails
-# at the sign-in, which the stand-in does not offer); a site that lists a seeded
-# device by name, or answers with a server error, fails the check itself.
+# A site that refuses a visitor everywhere, by a redirect to the login page or
+# by a 403 page carrying the login form, gets past the check (and then fails at
+# the sign-in, which the stand-in does not offer); a site that lists a seeded
+# device by name, answers with a server error, or refuses with a 403 that has no
+# login form in it, fails the check itself.
 #
 # Usage:
 #   scripts/test-verify-demo-anonymous.sh
@@ -50,6 +52,12 @@ class Site(http.server.BaseHTTPRequestHandler):
             return self.answer(500, "Internal Server Error")
         if path.startswith("/api/"):
             return self.answer(401, '{"error":"unauthorized"}')
+        # Kernel B156: a page that needs a sign in is a 403 with the login
+        # form on it, rather than a redirect to /user/login.
+        if MODE == "login403":
+            return self.answer(403, '<form action="/user/login" method="post"></form>')
+        if MODE == "bare403":
+            return self.answer(403, "Access denied")
         return self.answer(303, "", "/user/login")
 
     do_POST = do_GET
@@ -86,6 +94,8 @@ expect() {
 expect clean "the login form carries no token"
 expect title "an anonymous visitor can read device data on /api/v1/items/ng_device"
 expect error "/api/v1/items/ng_device answered '500 ' to an anonymous visitor"
+expect login403 "the login form carries no token"
+expect bare403 "/devices/online answered 403 to an anonymous visitor with no login form in it"
 
 [ "$failures" -eq 0 ] || {
     echo "${failures} case(s) failed" >&2

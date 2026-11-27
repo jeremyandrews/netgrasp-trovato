@@ -68,9 +68,17 @@ for path in / /devices/online /item/5eed0000-0000-4000-8000-0000000000d1 \
         fail "an anonymous visitor can read device data on $path ($answer)"
     fi
 done
-answer="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/devices/online")"
+# Asked for as a browser asks (HTML), the refusal is the login page: since
+# kernel B156 a 403 page with the login form in it, before it a redirect to
+# /user/login. A 403 without the form is not the login page.
+answer="$(curl -s -o "$PAGE" -H 'Accept: text/html' \
+    -w '%{http_code} %{redirect_url}' "$BASE/devices/online")"
 case "$answer" in
     30[0-9]" "*/user/login*) ;;
+    "403 ")
+        grep -q 'action="/user/login' "$PAGE" ||
+            fail "/devices/online answered 403 to an anonymous visitor with no login form in it"
+        ;;
     *) fail "/devices/online answered '$answer' to an anonymous visitor, not the login page" ;;
 esac
 echo "    an anonymous visitor reads no device data anywhere, and is sent to sign in"
